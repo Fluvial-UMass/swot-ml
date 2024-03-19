@@ -2,7 +2,7 @@
 name = "tssml"
 version = "0.1.0"
 description = "Environment for predicting TSS with ML models"
-authors = ["Kostas Andreadis <kandread@umass.edu>"]
+authors = ["Kostas Andreadis <kandread@umass.edu>", "Ted Langhorst <tmlanghorst@umass.edu>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
