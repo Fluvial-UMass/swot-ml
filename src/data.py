@@ -41,7 +41,7 @@ class DataLoader:
         for start in range(0, self.dataset_size, self.batch_size):
             end = min(start + self.batch_size, self.dataset_size)
             batch_indices = indices[start:end]
-            yield tuple(np.array([array[i:i + self.sequence_length] for i in batch_indices]) for array in self.arrays)
+            yield tuple(np.array([array[i:i+self.sequence_length] for i in batch_indices]) for array in self.arrays)
 
 def normalize_data(data: np.array, scale: dict[str, float] = None):
     """
@@ -62,20 +62,3 @@ def normalize_data(data: np.array, scale: dict[str, float] = None):
         scale['std'] = np.std(data, axis=0)
     normalized_data = (data - scale['mean']) / scale['std']
     return normalized_data, scale       
-    
-
-def sequencer(array, sequence_length):
-    """
-    Creates sequences from an array.
-
-    Args:
-        array (jnp.array): The data array to be converted into sequences.
-        sequence_length (int): The length of each sequence.
-
-    Returns:
-        jnp.array: An array of sequences.
-    """
-    # dataset_size = array.shape[0] - sequence_length + 1
-    # return jnp.array([array[i:i + sequence_length] for i in range(dataset_size)])
-    dataset_size = array.shape[0] - sequence_length + 1
-    return jnp.array([array[i:i + sequence_length] for i in range(dataset_size - 1, -1, -1)])
