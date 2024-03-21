@@ -7,6 +7,7 @@ class DataLoader:
                  arrays: tuple[np.ndarray, ...], 
                  batch_size: int, 
                  sequence_length: int,
+                 train: bool,
                  fill_and_weight: bool = False,
                  shuffle: bool = True):
         """
@@ -17,14 +18,24 @@ class DataLoader:
                 the same number of rows (samples).
             batch_size (int): The size of each batch.
             sequence_length (int): The length of each sequence.
+            train (bool): If true, only returns batches with a non-nan target value. 
+            fill_and_weight (bool, optional): If true, interpolates feature data and calculates observation weights. Defaults to True. 
             shuffle (bool, optional): Whether to shuffle the data before batching. Defaults to True.
         """
         self.arrays = arrays
         self.batch_size = batch_size
         self.sequence_length = sequence_length
+        self.train = train
         self.fill_and_weight = fill_and_weight
         self.shuffle = shuffle
-        self.dataset_size = arrays[0].shape[0] - sequence_length + 1
+
+        if train: 
+            self.indices =  np.where(~np.isnan(arrays[1][:-sequence_length+1]))[0]
+            self.indices = self.indices[self.indices >= sequence_length]
+        else: 
+            self.indices = np.arange(sequence_length, arrays[0].shape[0])
+        self.dataset_size = np.sum(self.indices != 0) # Number of valid samples
+        
         assert all(array.shape[0] == self.arrays[0].shape[0] for array in self.arrays), "All arrays must have the same number of rows."
 
     def __iter__(self) -> tuple[np.ndarray, ...]:
@@ -36,21 +47,29 @@ class DataLoader:
             SIA weights if 'sia_weights' is True. Each batch is a NumPy array with dimensions [batch_size, sequence_length, feature_size],
             where feature_size is the number of features in the corresponding input array.
         """
-        indices = np.arange(self.dataset_size)
         if self.shuffle:
-            np.random.shuffle(indices)
+            np.random.shuffle(self.indices)
 
         for start in range(0, self.dataset_size, self.batch_size):
             end = min(start + self.batch_size, self.dataset_size)
-            batch_indices = indices[start:end]
-            batches = tuple(np.array([array[i:i+self.sequence_length] for i in batch_indices]) for array in self.arrays)
+            batch_indices = self.indices[start:end]
+            
+            # batches = []
+            # for array in self.arrays:
+            #     batch_array = []
+            #     for i in batch_indices:
+            #         batch_array.append(array[i-self.sequence_length+1:i+1])
+            #     batches.append(np.array(batch_array))
+            # batches = tuple(batches)
+            batches = tuple(np.array([array[i-self.sequence_length+1:i+1] for i in batch_indices]) for array in self.arrays)
+            
             if self.fill_and_weight:
                 intervals = distance_to_closest_obs(batches[0])
-                weights = 1 / (1+intervals) #Quick weight stand in. Probably needs tuning?
+                weights = 1 / (1+intervals)**2 #Quick weight stand in. Probably needs tuning?
                 filled = fill_nan_obs(batches[0])
-                yield (filled, weights, batches[1])
+                yield (batch_indices, filled, weights, batches[1])
             else:
-                yield batches
+                yield (batch_indices,*batches)
 
     def __len__(self):
         """
