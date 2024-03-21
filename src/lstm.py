@@ -52,6 +52,33 @@ class LSTM(eqx.Module):
                       jnp.zeros(self.cell.hidden_size))
         (out, _), _ = jax.lax.scan(scan_fn, init_state, inp)
         return self.linear(out)
+
+
+class Gated_LSTM(eqx.Module):
+    hidden_size: int
+    cell: eqx.nn.LSTMCell
+    linear: eqx.nn.Linear
+    bias: jax.Array
+
+    def __init__(self, in_size, out_size, hidden_size, *, key):
+        ckey, lkey = jrandom.split(key)
+        self.hidden_size = hidden_size
+        self.cell = eqx.nn.LSTMCell(in_size, hidden_size, key=ckey)
+        self.linear = eqx.nn.Linear(hidden_size, out_size, key=lkey)
+        self.bias = jnp.zeros(out_size)
+
+    def __call__(self, input):
+        def scan_fn(state, inputs):
+            x, w = inputs
+            (h, c) = state
+            # Apply input gate using weights
+            input_gate = jax.nn.sigmoid(w)  # Convert weights to gate values between 0 and 1
+            gated_x = x * input_gate  # Apply the gate to the input features
+            return self.cell(gated_x, state), None  # Use gated input in LSTM cell
+
+        init_state = (jnp.zeros(self.cell.hidden_size), jnp.zeros(self.cell.hidden_size))
+        (out, _), _ = jax.lax.scan(scan_fn, init_state, input)
+        return self.linear(out)
         
 
 def lr_dict_scheduler(epoch, lr_dict):
@@ -105,7 +132,7 @@ def l2_regularization(params, l2_reg):
     
     
 @eqx.filter_value_and_grad
-def compute_loss(model, x, y):
+def compute_loss(model, x, w, y):
     """
     Computes the mean squared error loss between the model predictions and the targets.
 
@@ -117,12 +144,12 @@ def compute_loss(model, x, y):
     Returns:
         float: The mean squared error loss.
     """
-    pred_y = jax.vmap(model)(x)
+    pred_y = jax.vmap(model)((x,w))
     return jnp.mean(jnp.square(y - pred_y))
 
 
 @eqx.filter_jit
-def make_step(model, x, y, opt_state, optim, max_grad_norm=None, l2_reg=None):
+def make_step(model, x, w, y, opt_state, optim, max_grad_norm=None, l2_reg=None):
     """
     Performs a single optimization step, updating the model parameters.
 
@@ -138,7 +165,7 @@ def make_step(model, x, y, opt_state, optim, max_grad_norm=None, l2_reg=None):
     Returns:
         tuple: A tuple containing the loss, updated model, and updated optimizer state.
     """
-    loss, grads = compute_loss(model, x, y)
+    loss, grads = compute_loss(model, x, w, y)
     if max_grad_norm is not None:
         grads = clip_gradients(grads, max_grad_norm)
     if l2_reg is not None:
