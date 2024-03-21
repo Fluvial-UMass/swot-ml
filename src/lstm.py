@@ -132,7 +132,7 @@ def l2_regularization(params, l2_reg):
     
     
 @eqx.filter_value_and_grad
-def compute_loss(model, x, w, y):
+def compute_loss(model, x, y, weights=None):
     """
     Computes the mean squared error loss between the model predictions and the targets.
 
@@ -140,16 +140,20 @@ def compute_loss(model, x, w, y):
         model (LSTM): The LSTM model.
         x (jax.Array): The input data with shape [batch_size, sequence_length, in_size].
         y (jax.Array): The target data with shape [batch_size, out_size].
+        w (jax.Array, optional): Weights of the input data with shape [batch_size, sequence_length, in_size].
 
     Returns:
         float: The mean squared error loss.
     """
-    pred_y = jax.vmap(model)((x,w))
-    return jnp.mean(jnp.square(y - pred_y))
+    if weights is not None:
+        pred_y = jax.vmap(model)((x,weights))
+    else:
+        pred_y = jax.vmap(model)(x)
+    return jnp.mean(jnp.square(y[:,-1] - pred_y[:,-1]))
 
 
 @eqx.filter_jit
-def make_step(model, x, w, y, opt_state, optim, max_grad_norm=None, l2_reg=None):
+def make_step(model, x, y, opt_state, optim, weights=None, max_grad_norm=None, l2_reg=None):
     """
     Performs a single optimization step, updating the model parameters.
 
@@ -165,7 +169,7 @@ def make_step(model, x, w, y, opt_state, optim, max_grad_norm=None, l2_reg=None)
     Returns:
         tuple: A tuple containing the loss, updated model, and updated optimizer state.
     """
-    loss, grads = compute_loss(model, x, w, y)
+    loss, grads = compute_loss(model, x, y, weights=weights)
     if max_grad_norm is not None:
         grads = clip_gradients(grads, max_grad_norm)
     if l2_reg is not None:
