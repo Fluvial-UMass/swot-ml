@@ -52,9 +52,15 @@ class DataLoader:
             else:
                 yield batches
 
+    def __len__(self):
+        """
+        Returns the number of batches the DataLoader will generate.
+        """
+        return (self.dataset_size + self.batch_size - 1) // self.batch_size
+
 def distance_to_closest_obs(arr):
     nan_mask = np.isnan(arr)
-    distances = np.full(arr.shape, np.nan)
+    distances = np.full(arr.shape, np.inf) # All nan columns will be inf. Weights -> 0
     
     for batch_idx in range(arr.shape[0]):
         for feature_idx in range(arr.shape[2]):
@@ -65,14 +71,15 @@ def distance_to_closest_obs(arr):
 def fill_nan_obs(arr):
     for batch_idx in range(arr.shape[0]):
         for feature_idx in range(arr.shape[2]):
-            mask = jnp.isnan(arr[batch_idx,:,feature_idx])
-            if np.sum(~mask)==0:
-                # Can't interpolate with no observations.
+            is_nan = jnp.isnan(arr[batch_idx,:,feature_idx])
+            if np.sum(~is_nan)==0:
+                # Can't interpolate without observations, but distances will be inf and weights 0.
+                arr[batch_idx,:,feature_idx][is_nan] = 0
                 continue
-                
-            arr[batch_idx,mask,feature_idx] = np.interp(np.flatnonzero(mask), 
-                                                        np.flatnonzero(~mask), 
-                                                        arr[batch_idx,~mask,feature_idx])
+            #Interpolate based on closest measurement. 
+            arr[batch_idx,is_nan,feature_idx] = np.interp(np.flatnonzero(is_nan), 
+                                                        np.flatnonzero(~is_nan), 
+                                                        arr[batch_idx,~is_nan,feature_idx])
     return arr
 
 
