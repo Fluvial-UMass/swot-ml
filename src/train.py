@@ -11,21 +11,15 @@ def mse_loss(y, y_pred):
     return mse
 
 # Intermittent flow modified MSE
-def if_mse_loss(y, y_pred, unscaled_q, zero_target):
-    # y_pred = jnp.where(~jnp.isnan(y),y_pred,0)
-    # y = jnp.where(~jnp.isnan(y),y,0)
-    # masked_y_pred = jnp.where(~jnp.isnan(y_true),y_pred,0)
-    # masked_y_true = jnp.where(~jnp.isnan(y_true),y_true,0)
-    # mask_rescale = jnp.mean(jnp.where(~jnp.isnan(y_true),1,0))
-    # mse_term = jnp.mean(jnp.square(masked_y_pred[:,-1] - masked_y_true[:,-1]))/mask_rescale
-
-    # mse_term = jnp.mean(jnp.square(y_pred[:,-1] - y_true[:,-1]))
-    # if_term = jnp.mean((unscaled_q[:,-1]==0)*((y_pred[:,-1]-zero_target)**2))
-    # return mse_term + if_term
-    err = jnp.where(unscaled_q[:,-1]==0, 
-                    y_pred[:,-1]-zero_target, 
-                    y_pred[:,-1] - y[:,-1])
-    return jnp.mean(jnp.square(err))
+def if_mse_loss(y, y_pred, unscaled_q):
+    mse = mse_loss(y, y_pred)
+    if_err = jnp.where(unscaled_q==0,
+                       y_pred-0,
+                       jnp.nan)
+    if_mse = jnp.nanmean(jnp.square(if_err))
+    
+    loss = jnp.nansum(jnp.array([mse, if_mse*0.1]))
+    return loss
 
 @eqx.filter_value_and_grad
 def compute_loss(model, data, loss_name, **kwargs):
@@ -44,15 +38,13 @@ def compute_loss(model, data, loss_name, **kwargs):
     y_pred = jax.vmap(model)(data)
     if loss_name == "mse":
         return mse_loss(data['y'], y_pred)
-    if loss_name == "if_mse":
-        zero_target = kwargs.get('zero_target',None)
-        if zero_target is None:
-            raise ValueError('zero_target is required with if_mse loss')
-        return if_mse_loss(data['y'], y_pred, data['unscaled_q'], zero_target)
-
+    elif loss_name == "if_mse":
+        return if_mse_loss(data['y'], y_pred, data['unscaled_q'])
+    else:
+        raise ValueError("Invalid loss function name.")
 
 @eqx.filter_jit
-def make_step(model, data, opt_state, optim, loss_name="mse", max_grad_norm=None, l2_reg=None, **kwargs):
+def make_step(model, data, opt_state, optim, loss_name="mse", max_grad_norm=None, l2_weight=None):
     """
     Performs a single optimization step, updating the model parameters.
 
@@ -68,12 +60,12 @@ def make_step(model, data, opt_state, optim, loss_name="mse", max_grad_norm=None
     Returns:
         tuple: A tuple containing the loss, updated model, and updated optimizer state.
     """
-    loss, grads = compute_loss(model, data, loss_name, **kwargs)
+    loss, grads = compute_loss(model, data, loss_name)
     
     if max_grad_norm is not None:
         grads = clip_gradients(grads, max_grad_norm)
-    if l2_reg is not None:
-        loss += l2_regularization(model.params, l2_reg)
+    if l2_weight is not None:
+        loss += l2_regularization(model, l2_weight)
         
     updates, opt_state = optim.update(grads, opt_state)
     model = eqx.apply_updates(model, updates)
@@ -114,17 +106,21 @@ def clip_gradients(grads, max_norm):
     return jax.tree_map(lambda g: scale * g, grads)
 
 
-def l2_regularization(params, l2_reg):
+def l2_regularization(model, weight_decay):
     """
-    Computes the L2 regularization term.
+    Computes the L2 regularization term for the MTLSTM model.
 
     Args:
-        params: The parameters of the model.
-        l2_reg (float): The L2 regularization strength.
+        model (MTLSTM): The MTLSTM model.
+        weight_decay (float): The weight decay coefficient (lambda) for L2 regularization.
 
     Returns:
         float: The L2 regularization term.
     """
-    reg_term = 0.5 * sum(jnp.sum(jnp.square(p)) for p in jax.tree_leaves(params))
-    return reg_term * l2_reg
+    l2_reg = 0.0
+    # Iterate through all trainable parameters in the model
+    for param in model.yield_params():
+        l2_reg += jnp.sum(jnp.square(param))
+    return 0.5 * weight_decay * l2_reg
+
 
