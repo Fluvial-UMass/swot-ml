@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import numpy as np
 
+
 class MTLSTMCell(eqx.Module):
     """
     A Split Time-Aware LSTM (MTLSTM) cell implemented using Equinox. This cell can 
@@ -24,7 +25,6 @@ class MTLSTMCell(eqx.Module):
 
     hidden_size: int
     input_size: int
-    input_size: int
     weight_ih: jax.Array
     weight_hh: jax.Array
     bias: jax.Array
@@ -40,19 +40,19 @@ class MTLSTMCell(eqx.Module):
             hidden_size (int): The size of the hidden state in the MTLSTM cell.
             key (jax.random.PRNGKey): A random key for initializing the cell parameters.
         """
-        wkey, bkey, dkey = jrandom.split(key, 3)
         self.hidden_size = hidden_size
         self.input_size = input_size
         
-        self.weight_ih = jrandom.normal(wkey, (4 * hidden_size, input_size)) * 0.01
-        self.weight_hh = jrandom.normal(wkey, (4 * hidden_size, hidden_size)) * 0.01
-        self.bias = jrandom.normal(bkey, (4 * hidden_size,)) * 0.01
-        self.weight_decomp = jrandom.normal(dkey, (input_size, hidden_size, hidden_size)) * 0.01
-        self.bias_decomp = jrandom.normal(dkey, (input_size, hidden_size)) * 0.01
+        wkey, bkey, dkey, tkey = jrandom.split(key, 4)
+        self.weight_ih = jax.nn.initializers.glorot_normal()(wkey, (4 * hidden_size, input_size))
+        self.weight_hh = jax.nn.initializers.glorot_normal()(wkey, (4 * hidden_size, hidden_size))
+        self.bias = jax.nn.initializers.zeros(key, (4 * hidden_size,))
+        self.weight_decomp = jax.nn.initializers.glorot_normal()(dkey, (input_size, hidden_size, hidden_size))
+        self.bias_decomp = jax.nn.initializers.zeros(dkey, (input_size, hidden_size))
 
     def __call__(self, x, state, dt):
         """
-        Performs a single step of the MFITALSTM cell.
+        Performs a single step of the MTLSTM cell.
 
         Args:
             x (jax.Array): The input features at the current time step.
@@ -106,7 +106,6 @@ class MTLSTM(eqx.Module):
     hidden_size: int
     cell: MTLSTMCell
     linear: eqx.nn.Linear
-    bias: jax.Array
 
     def __init__(self, in_size, out_size, hidden_size, *, key):
         """
@@ -119,11 +118,20 @@ class MTLSTM(eqx.Module):
             input_size (int): The number of input features with different frequencies.
             key (jax.random.PRNGKey): A random key for initializing the model parameters.
         """
-        ckey, lkey = jrandom.split(key)
+        ckey, lkey, tkey = jrandom.split(key, 3)
         self.hidden_size = hidden_size
         self.cell = MTLSTMCell(in_size, hidden_size, key=ckey)
-        self.linear = eqx.nn.Linear(hidden_size, out_size, key=lkey)
-        self.bias = jnp.zeros(out_size)
+        self.linear = eqx.nn.Linear(hidden_size, out_size, use_bias=True, key=lkey)
+
+    def yield_params(self):
+        params = [self.cell.weight_ih, 
+                  self.cell.weight_hh, 
+                  self.cell.bias, 
+                  self.cell.weight_decomp, 
+                  self.cell.bias_decomp,
+                  self.linear.weight,
+                  self.linear.bias]
+        yield from params
 
     def __call__(self, data):
         """
@@ -143,9 +151,8 @@ class MTLSTM(eqx.Module):
         init_state = (jnp.zeros(self.cell.hidden_size),
                       jnp.zeros(self.cell.hidden_size))
 
-        (out, _), _ = jax.lax.scan(scan_fn, init_state, (data['xd'],data['dt']))
-        linear_out = self.linear(out) + self.bias
-        return linear_out
+        (out, _), _ = jax.lax.scan(scan_fn, init_state, (data['xd'],data['dt'])) 
+        return jax.nn.relu(self.linear(out))
 
 
 
@@ -153,14 +160,12 @@ class LSTM(eqx.Module):
     hidden_size: int
     cell: eqx.nn.LSTMCell
     linear: eqx.nn.Linear
-    bias: jax.Array
 
     def __init__(self, in_size, out_size, hidden_size, *, key):
         ckey, lkey = jrandom.split(key)
         self.hidden_size = hidden_size
         self.cell = eqx.nn.LSTMCell(in_size, hidden_size, key=ckey)
         self.linear = eqx.nn.Linear(hidden_size, out_size, key=lkey)
-        self.bias = jnp.zeros(out_size)
 
     def __call__(self, data):
         def scan_fn(state, xd):
@@ -168,7 +173,15 @@ class LSTM(eqx.Module):
         init_state = (jnp.zeros(self.cell.hidden_size),
                       jnp.zeros(self.cell.hidden_size))
         (out, _), _ = jax.lax.scan(scan_fn, init_state, data['xd'])
-        return self.linear(out)
+        return jax.nn.relu(self.linear(out))
+
+    def yield_params(self):
+        params = [self.cell.weight_ih, 
+                  self.cell.weight_hh, 
+                  self.cell.bias, 
+                  self.linear.weight,
+                  self.linear.bias]
+        yield from params
 
 
 class Gated_LSTM(eqx.Module):

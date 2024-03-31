@@ -25,9 +25,9 @@ class DataLoader:
         Initializes the DataLoader for batching and optionally shuffling data.
         """
         if train:
-            df_norm, scale = _normalize_data(df)
+            df_norm, scale = _normalize_data(df, None, [target])
         elif not train and scale:
-            df_norm, _ = _normalize_data(df, scale)
+            df_norm, _ = _normalize_data(df, scale, [target])
         else:
             raise ValueError("Scale must be provided when not training.")
             
@@ -43,7 +43,7 @@ class DataLoader:
         self.split_time = split_time
         
         if self.fill_and_weight and self.split_time:
-            raise ValueError("Both fill_and_weight and split_time cannot be True at the same time")
+            raise ValueError("Both fill_and_weight and split_time cannot be True at the same time.")
 
         self.w = None
         if self.fill_and_weight:
@@ -58,7 +58,6 @@ class DataLoader:
 
         # properties for loss funcs
         if train:
-            self.zero_target = (0 - scale['mean'][target])/scale['std'][target]
             self.unscaled_q = df[discharge_col].copy().values
         
         if train:
@@ -68,10 +67,7 @@ class DataLoader:
             self.indices = np.arange(sequence_length, self.xd.shape[0])
 
         self.dataset_size = np.sum(self.indices != 0)  # Number of valid samples
-        
-        
-    # def _get_sequence_slice(self, i):
-    #     return slice(i - self.sequence_length + 1, i + 1)
+
 
     def __iter__(self) -> tuple[np.ndarray, ...]:
         """
@@ -137,22 +133,43 @@ def _fill_nan_obs(arr):
     return arr
 
 
-def _normalize_data(df, scale = None):
+def _normalize_data(df, scale=None, min_max_columns=None):
     """
     Normalize the input data using the provided scale or calculate the scale if not provided.
+    Allows for min-max normalization of specified columns.
 
     Args:
-        df (np.array): The input data to be normalized.
-        scale (Dict[str, float], optional): A dictionary containing the mean ('mean') and standard deviation ('std')
-            to use for normalization. If not provided, the mean and standard deviation will be calculated from the data.
+        df (pd.DataFrame): The input data to be normalized.
+        scale (Dict[str, float], optional): A dictionary containing the 'offset' and 'scale'
+            for each column. For standard normalization, 'offset' is the mean and 'scale' is the standard deviation.
+            For min-max normalization, 'offset' is the minimum and 'scale' is the range (max - min).
+            If not provided, these values will be calculated from the data.
+        min_max_columns (List[str], optional): A list of column names to be normalized using min-max normalization.
+            Other columns will be normalized using standard normalization.
 
     Returns:
-        np.array: The normalized data.
-        Dict[str, float]: A dictionary containing the mean ('mean') and standard deviation ('std') used for normalization.
+        pd.DataFrame: The normalized data.
+        Dict[str, float]: A dictionary containing the 'offset' and 'scale' for each column.
     """
     if scale is None:
         scale = {}
-        scale['mean'] = np.mean(df, axis=0)
-        scale['std'] = np.std(df, axis=0)
-    normalized_df = (df - scale['mean']) / scale['std']
-    return normalized_df, scale       
+        scale['offset'] = {}
+        scale['scale'] = {}
+
+    normalized_df = df.copy()
+
+    if min_max_columns is not None:
+        for col in min_max_columns:
+            scale['offset'][col] = 0#df[col].min()
+            scale['scale'][col] = df[col].max() - df[col].min()
+            normalized_df[col] = (df[col] - scale['offset'][col]) / scale['scale'][col]
+
+    # Standard normalization for other columns
+    std_cols = [col for col in df.columns if col not in min_max_columns] if min_max_columns is not None else df.columns
+    for col in std_cols:
+        if col not in scale['offset']:
+            scale['offset'][col] = df[col].mean()
+            scale['scale'][col] = df[col].std()
+        normalized_df[col] = (df[col] - scale['offset'][col]) / scale['scale'][col]
+
+    return normalized_df, scale     
