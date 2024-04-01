@@ -6,6 +6,69 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import numpy as np
 
+class BaseLSTM(eqx.Module):
+    hidden_size: int
+    cell: eqx.Module
+    linear: eqx.nn.Linear
+
+    def __init__(self, in_size, out_size, hidden_size, *, key):
+        self.hidden_size = hidden_size
+        self.linear = eqx.nn.Linear(hidden_size, out_size, use_bias=True, key=key)
+
+    def __call__(self, data):
+        raise NotImplementedError("Subclasses should implement this method.")
+
+
+class LSTM(BaseLSTM):
+    def __init__(self, in_size, out_size, hidden_size, *, key):
+        super().__init__(in_size, out_size, hidden_size, key=key)
+        ckey, _ = jrandom.split(key)
+        self.cell = eqx.nn.LSTMCell(in_size, hidden_size, key=ckey)
+
+    def __call__(self, data):
+        def scan_fn(state, xd):
+            return self.cell(xd, state), None
+        init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
+        (out, _), _ = jax.lax.scan(scan_fn, init_state, data['xd'])
+        return jax.nn.relu(self.linear(out))
+
+
+class Gated_LSTM(BaseLSTM):
+    bias: jax.Array
+
+    def __init__(self, in_size, out_size, hidden_size, *, key):
+        super().__init__(in_size, out_size, hidden_size, key=key)
+        ckey, _ = jrandom.split(key)
+        self.cell = eqx.nn.LSTMCell(in_size, hidden_size, key=ckey)
+        self.bias = jnp.zeros(out_size)
+
+    def __call__(self, data):
+        def scan_fn(state, inputs):
+            x, w = inputs
+            input_gate = jax.nn.sigmoid(w)
+            gated_x = x * input_gate
+            return self.cell(gated_x, state), None
+
+        init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
+        (out, _), _ = jax.lax.scan(scan_fn, init_state, (data['xd'], data['w']))
+        return jax.nn.relu(self.linear(out))
+
+
+class MTLSTM(BaseLSTM):
+    def __init__(self, in_size, out_size, hidden_size, *, key):
+        super().__init__(in_size, out_size, hidden_size, key=key)
+        ckey, _ = jrandom.split(key)
+        self.cell = MTLSTMCell(in_size, hidden_size, key=ckey)
+
+    def __call__(self, data):
+        def scan_fn(state, inputs):
+            xd, dt = inputs
+            return self.cell(xd, state, dt), None
+
+        init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
+        (out, _), _ = jax.lax.scan(scan_fn, init_state, (data['xd'], data['dt']))
+        return jax.nn.relu(self.linear(out))
+
 
 class MTLSTMCell(eqx.Module):
     """
@@ -90,107 +153,6 @@ class MTLSTMCell(eqx.Module):
     def _time_decay(self, dt):
         # Time decay function to discount the short-term memory based on elapsed time.
         return 1.0 / jnp.log(jnp.e + dt)
-        
-
-class MTLSTM(eqx.Module):
-    """
-    A Multi Time-Aware LSTM (MTLSTM) model implemented using Equinox.
-
-    Attributes:
-        hidden_size (int): The size of the hidden state in the MTLSTM cell.
-        cell (MTLSTMCell): The MTLSTM cell used in the model.
-        linear (equinox.nn.Linear): A linear layer applied to the output of the MTLSTM cell.
-        bias (jax.Array): A bias term added to the output of the linear layer.
-    """
-
-    hidden_size: int
-    cell: MTLSTMCell
-    linear: eqx.nn.Linear
-
-    def __init__(self, in_size, out_size, hidden_size, *, key):
-        """
-        Initializes the MTLSTM model.
-
-        Args:
-            in_size (int): The size of the input features.
-            out_size (int): The size of the output.
-            hidden_size (int): The size of the hidden state in the MTLSTM cell.
-            input_size (int): The number of input features with different frequencies.
-            key (jax.random.PRNGKey): A random key for initializing the model parameters.
-        """
-        ckey, lkey, tkey = jrandom.split(key, 3)
-        self.hidden_size = hidden_size
-        self.cell = MTLSTMCell(in_size, hidden_size, key=ckey)
-        self.linear = eqx.nn.Linear(hidden_size, out_size, use_bias=True, key=lkey)
-
-    def __call__(self, data):
-        """
-        Forward pass through the MTLSTM model.
-
-        Args:
-            xd (jax.Array): The input sequence with shape [sequence_length, in_size].
-            dt (jax.Array): The elapsed times for each feature with shape [sequence_length, input_size].
-
-        Returns:
-            jax.Array: The output of the model with shape [sequence_length, out_size].
-        """
-        def scan_fn(state, inputs):
-            xd, dt = inputs
-            return self.cell(xd, state, dt), None
-
-        init_state = (jnp.zeros(self.cell.hidden_size),
-                      jnp.zeros(self.cell.hidden_size))
-
-        (out, _), _ = jax.lax.scan(scan_fn, init_state, (data['xd'],data['dt'])) 
-        return jax.nn.relu(self.linear(out))
-
-
-
-class LSTM(eqx.Module):
-    hidden_size: int
-    cell: eqx.nn.LSTMCell
-    linear: eqx.nn.Linear
-
-    def __init__(self, in_size, out_size, hidden_size, *, key):
-        ckey, lkey = jrandom.split(key)
-        self.hidden_size = hidden_size
-        self.cell = eqx.nn.LSTMCell(in_size, hidden_size, key=ckey)
-        self.linear = eqx.nn.Linear(hidden_size, out_size, key=lkey)
-
-    def __call__(self, data):
-        def scan_fn(state, xd):
-            return self.cell(xd, state), None
-        init_state = (jnp.zeros(self.cell.hidden_size),
-                      jnp.zeros(self.cell.hidden_size))
-        (out, _), _ = jax.lax.scan(scan_fn, init_state, data['xd'])
-        return jax.nn.relu(self.linear(out))
-
-
-class Gated_LSTM(eqx.Module):
-    hidden_size: int
-    cell: eqx.nn.LSTMCell
-    linear: eqx.nn.Linear
-    bias: jax.Array
-
-    def __init__(self, in_size, out_size, hidden_size, *, key):
-        ckey, lkey = jrandom.split(key)
-        self.hidden_size = hidden_size
-        self.cell = eqx.nn.LSTMCell(in_size, hidden_size, key=ckey)
-        self.linear = eqx.nn.Linear(hidden_size, out_size, key=lkey)
-        self.bias = jnp.zeros(out_size)
-
-    def __call__(self, data):
-        def scan_fn(state, inputs):
-            x, w = inputs
-            (h, c) = state
-            # Apply input gate using weights
-            input_gate = jax.nn.sigmoid(w)  # Convert weights to gate values between 0 and 1
-            gated_x = x * input_gate  # Apply the gate to the input features
-            return self.cell(gated_x, state), None  # Use gated input in LSTM cell
-
-        init_state = (jnp.zeros(self.cell.hidden_size), jnp.zeros(self.cell.hidden_size))
-        (out, _), _ = jax.lax.scan(scan_fn, init_state, (data['xd'],data['w']))
-        return self.linear(out)
-        
+    
     
     
