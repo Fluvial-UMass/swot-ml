@@ -56,6 +56,11 @@ class DataLoader:
             self.dt = _distance_to_closest_obs(self.xd)
             self.xd = _fill_nan_obs(self.xd)
 
+        #TESTING
+        n_basins = 1
+        n_basin_features = 1
+        self.xs = np.ones((n_basins, n_basin_features))
+
         # properties for loss funcs
         if train:
             self.unscaled_q = df[discharge_col].copy().values
@@ -89,8 +94,11 @@ class DataLoader:
             batch_dict = {
                 'ids': batch_indices,
                 'xd': self.xd[batch_sequences],
-                'y': self.y[batch_sequences]
+                'y': self.y[batch_sequences],
             }
+
+            if self.xs is not None:
+                batch_dict['xs'] = self.xs[,:]
     
             if self.w is not None:
                 batch_dict['w'] = self.w[batch_sequences]
