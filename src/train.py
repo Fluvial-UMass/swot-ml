@@ -108,19 +108,17 @@ def clip_gradients(grads, max_norm):
 
 def l2_regularization(model, weight_decay):
     """
-    Computes the L2 regularization term for the MTLSTM model.
+    Computes the L2 regularization term for a pytree model.
 
     Args:
-        model (MTLSTM): The MTLSTM model.
+        model: A pytree model where tunable parameters are inexact arrays
         weight_decay (float): The weight decay coefficient (lambda) for L2 regularization.
 
     Returns:
         float: The L2 regularization term.
     """
-    l2_reg = 0.0
-    # Iterate through all trainable parameters in the model
-    for param in model.yield_params():
-        l2_reg += jnp.sum(jnp.square(param))
-    return 0.5 * weight_decay * l2_reg
+    params = eqx.filter(model, eqx.is_inexact_array)
+    sum_l2 = jax.tree_util.tree_reduce(lambda x, y: x + jnp.sum(jnp.square(y)), params, 0)
+    return 0.5 * weight_decay * sum_l2
 
 

@@ -123,16 +123,6 @@ class MTLSTM(eqx.Module):
         self.cell = MTLSTMCell(in_size, hidden_size, key=ckey)
         self.linear = eqx.nn.Linear(hidden_size, out_size, use_bias=True, key=lkey)
 
-    def yield_params(self):
-        params = [self.cell.weight_ih, 
-                  self.cell.weight_hh, 
-                  self.cell.bias, 
-                  self.cell.weight_decomp, 
-                  self.cell.bias_decomp,
-                  self.linear.weight,
-                  self.linear.bias]
-        yield from params
-
     def __call__(self, data):
         """
         Forward pass through the MTLSTM model.
@@ -174,14 +164,6 @@ class LSTM(eqx.Module):
                       jnp.zeros(self.cell.hidden_size))
         (out, _), _ = jax.lax.scan(scan_fn, init_state, data['xd'])
         return jax.nn.relu(self.linear(out))
-
-    def yield_params(self):
-        params = [self.cell.weight_ih, 
-                  self.cell.weight_hh, 
-                  self.cell.bias, 
-                  self.linear.weight,
-                  self.linear.bias]
-        yield from params
 
 
 class Gated_LSTM(eqx.Module):
