@@ -29,6 +29,7 @@ class DataLoader:
                  sequence_length: int,
                  train: bool,
                  discharge_col: str = None,
+                 zero_min_cols: list = None,
                  scale: pd.Series = None,
                  fill_and_weight: bool = False,
                  calc_dt: bool = False):
@@ -42,15 +43,19 @@ class DataLoader:
         self.batch_size = batch_size
         self.sequence_length = sequence_length
         self.train = train
+        self.discharge_idx = features.index(discharge_col)
+        self.zero_min_cols = zero_min_cols
         self.fill_and_weight = fill_and_weight
         self.calc_dt = calc_dt
 
-        self.train_indices = {}
-        self.test_indices = {}
+        self.train_ids = {}
+        self.test_ids = {}
+        self.split_idx = {}
         self.xd = {}
         self.xs = {}
         self.dt = {}
         self.y = {}
+        self.scale = {}
         
         self._load_data()
 
@@ -61,19 +66,22 @@ class DataLoader:
     
     def _load_basin_data(self, basin):
         file_path = f"{self.data_dir}/time_series/{basin}.nc"
+        
         ds = xr.open_dataset(file_path).sel(date=self.time_slice)
+        self.split_idx[basin] = np.where(ds['date']==self.split_time)[0][0]
         df = ds.to_dataframe()[self.features+[self.target]]
 
+        # df_norm, scale = _normalize_data
         self.xd[basin] = df[self.features].values
         self.y[basin] = df[[self.target]].values
 
-        split_idx = np.where(ds['date']==self.split_time)[0][0]
-        train_ids = np.where(~np.isnan(self.y[basin][:split_idx]))[0]
-        self.train_indices[basin] = train_ids[train_ids >= self.sequence_length]
-        self.n_train_samples += len(self.train_indices[basin])
         
-        self.test_indices[basin] = np.arange(split_idx+self.sequence_length,len(df))
-        self.n_test_samples += len(self.test_indices[basin])
+        train_ids = np.where(~np.isnan(self.y[basin][:self.split_idx[basin]]))[0]
+        self.train_ids[basin] = train_ids[train_ids >= self.sequence_length]
+        self.n_train_samples += len(self.train_ids[basin])
+        
+        self.test_ids[basin] = np.arange(self.split_idx[basin]+self.sequence_length,len(df))
+        self.n_test_samples += len(self.test_ids[basin])
 
         ds.close()
         return 
@@ -90,15 +98,16 @@ class DataLoader:
         for basin in self.basins:
             self._load_basin_data(basin)
             
-            if basin in attributes_df.index:
-                self.xs[basin] = attributes_df.loc[basin].values
+            if basin not in attributes_df.index:
+                raise KeyError(f"Basin '{basin}' not found in attributes DataFrame.")
+            self.xs[basin] = attributes_df.loc[basin].values
     
     def __iter__(self):
         if self.train:
             np.random.shuffle(self.basins)
-            idx_list = self.train_indices
+            idx_list = self.train_ids
         else:
-            idx_list = self.test_indices
+            idx_list = self.test_ids
 
         xd, xs, y = [], [], []
         for basin in self.basins:
@@ -116,6 +125,40 @@ class DataLoader:
         #Yield the final partial batch 
         if len(xd)>0:
             yield _create_batch_dict(xd,xs,y)
+
+    def _normalize_data(self):
+    """
+    Normalize the input data using the provided scale or calculate the scale if not provided.
+    Allows for min-max normalization of specified columns.
+
+    Args:
+        df (pd.DataFrame): The input data to be normalized.
+        scale (Dict[str, float], optional): A dictionary containing the 'offset' and 'scale'
+            for each column. For standard normalization, 'offset' is the mean and 'scale' is the standard deviation.
+            For min-max normalization, 'offset' is the minimum and 'scale' is the range (max - min).
+            If not provided, these values will be calculated from the data.
+        min_max_columns (List[str], optional): A list of column names to be normalized using min-max normalization.
+            Other columns will be normalized using standard normalization.
+
+    Returns:
+        pd.DataFrame: The normalized data.
+        Dict[str, float]: A dictionary containing the 'offset' and 'scale' for each column.
+    """
+    scale['offset'] = {}
+    scale['scale'] = {}
+
+    normalized_df = df.copy()
+    for col in df.columns:
+        if col in self.zero_min_columns:
+            scale['offset'][col] = 0
+            scale['scale'][col] = df[col].max()
+        else:
+            scale['offset'][col] = df[col].mean()
+            scale['scale'][col] = df[col].std()
+                
+        normalized_df[col] = (df[col] - scale['offset'][col]) / scale['scale'][col]
+                
+    return
 
 
 def _create_batch_dict(xd, xs, y):
@@ -158,43 +201,10 @@ def _fill_nan_obs(arr):
     return arr
 
 
-def _normalize_data(df, scale=None, min_max_columns=None):
-    """
-    Normalize the input data using the provided scale or calculate the scale if not provided.
-    Allows for min-max normalization of specified columns.
+ 
 
-    Args:
-        df (pd.DataFrame): The input data to be normalized.
-        scale (Dict[str, float], optional): A dictionary containing the 'offset' and 'scale'
-            for each column. For standard normalization, 'offset' is the mean and 'scale' is the standard deviation.
-            For min-max normalization, 'offset' is the minimum and 'scale' is the range (max - min).
-            If not provided, these values will be calculated from the data.
-        min_max_columns (List[str], optional): A list of column names to be normalized using min-max normalization.
-            Other columns will be normalized using standard normalization.
 
-    Returns:
-        pd.DataFrame: The normalized data.
-        Dict[str, float]: A dictionary containing the 'offset' and 'scale' for each column.
-    """
-    if scale is None:
-        scale = {}
-        scale['offset'] = {}
-        scale['scale'] = {}
 
-    normalized_df = df.copy()
 
-    if min_max_columns is not None:
-        for col in min_max_columns:
-            scale['offset'][col] = 0#df[col].min()
-            scale['scale'][col] = df[col].max() - df[col].min()
-            normalized_df[col] = (df[col] - scale['offset'][col]) / scale['scale'][col]
 
-    # Standard normalization for other columns
-    std_cols = [col for col in df.columns if col not in min_max_columns] if min_max_columns is not None else df.columns
-    for col in std_cols:
-        if col not in scale['offset']:
-            scale['offset'][col] = df[col].mean()
-            scale['scale'][col] = df[col].std()
-        normalized_df[col] = (df[col] - scale['offset'][col]) / scale['scale'][col]
 
-    return normalized_df, scale   
