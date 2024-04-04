@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import numpy as np
 
+
 class BaseLSTM(eqx.Module):
     hidden_size: int
     cell: eqx.Module
@@ -30,7 +31,7 @@ class LSTM(BaseLSTM):
             return self.cell(xd, state), None
         init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
         (out, _), _ = jax.lax.scan(scan_fn, init_state, data['xd'])
-        return jax.nn.relu(self.linear(out))
+        return (self.linear(out))
 
 
 class Gated_LSTM(BaseLSTM):
@@ -48,10 +49,10 @@ class Gated_LSTM(BaseLSTM):
 
         init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
         (out, _), _ = jax.lax.scan(scan_fn, init_state, (data['xd'], data['w']))
-        return jax.nn.relu(self.linear(out))
+        return (self.linear(out))
 
 
-class MTLSTM(BaseLSTM):
+class TLSTM(BaseLSTM):
     def __init__(self, in_size, out_size, hidden_size, *, key):
         super().__init__(in_size, out_size, hidden_size, key=key)
         ckey, _ = jrandom.split(key)
@@ -66,7 +67,7 @@ class MTLSTM(BaseLSTM):
         (out, _), _ = jax.lax.scan(scan_fn, init_state, (data['xd'], data['dt']))
         return self.linear(out)
 
-class EAMTLSTM(BaseLSTM):
+class TEALSTM(BaseLSTM):
     def __init__(self, in_size, out_size, hidden_size, *, key):
         super().__init__(in_size, out_size, hidden_size, key=key)
         ckey, _ = jrandom.split(key)
@@ -79,15 +80,63 @@ class EAMTLSTM(BaseLSTM):
 
         init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
         (out, _), _ = jax.lax.scan(scan_fn, init_state, (data['xd'], data['dt']))
-        return jax.nn.relu(self.linear(out))
+        return (self.linear(out))
 
-class MTLSTMCell(eqx.Module):
+class TAPLSTM(eqx.Module):
     """
-    A Split Time-Aware LSTM (MTLSTM) cell implemented using Equinox. This cell can 
-    accomodate different observation frequencies for each data feature
+    A Time-Attentitive Parallel LSTM model structure
+    """
+    def __init__(self, d_in_size, i_in_size, out_size, d_hidden_size, i_hidden_size, *, key):
+        self.d_in_size = d_in_size
+        self.d_hidden_size = d_hidden_size
+        dkey, dlinkey = jrandom.split(key)
+        self.d_cell = TLSTMCell(d_in_size, d_hidden_size, key=dkey)
+        self.d_linear = eqx.nn.Linear(d_hidden_size, out_size, use_bias=True, key=dlinkey)
+    
+        self.i_in_size = i_in_size
+        self.i_hidden_size = i_hidden_size
+        ikey, ilinkey = jrandom.split(key)
+        self.i_cell = TEALSTMCell(i_in_size, i_hidden_size, key=ikey)
+        self.i_linear = eqx.nn.Linear(i_hidden_size, out_size, use_bias=True, key=ilinkey)
+    
+        self.out_size = out_size
+
+    def __call__(self, data):
+        def scan_fn(state, inputs):
+            d_state, i_state = state
+            x_d, x_di, x_di_dt, x_s = inputs
+    
+            d_hidden, d_cell = self.d_cell(x_d, d_state)
+            i_hidden, i_cell = self.i_cell(x_d, i_state, dt, x_s)
+    
+            d_out = self.d_linear(d_hidden)
+            i_out = self.i_linear(i_hidden)
+    
+            return (d_hidden, d_cell), (i_hidden, i_cell), (d_out, i_out)
+    
+        d_init_state = (jnp.zeros(self.d_hidden_size), jnp.zeros(self.d_hidden_size))
+        i_init_state = (jnp.zeros(self.i_hidden_size), jnp.zeros(self.i_hidden_size))
+    
+        (_, _), (_, _), (d_outs, i_outs) = jax.lax.scan(
+            scan_fn, (d_init_state, i_init_state), (data['x_d'], data['x_di'], data['x_di_dt'], data['x_s'])
+        )
+    
+        # Combine the outputs from both LSTM branches using attention
+        a_d = jnp.exp(-data['lambda'] * data['dt'])
+        a_s = jnp.ones_like(a_d)
+        a_normalized = jax.nn.softmax(jnp.stack([a_d, a_s], axis=-1), axis=-1)
+    
+        combined_outs = a_normalized[..., 0] * d_outs + a_normalized[..., 1] * i_outs
+    
+        return combined_outs
+
+
+class TLSTMCell(eqx.Module):
+    """
+    A Time-Aware LSTM (TLSTM) cell implemented using Equinox.
 
     Attributes:
-        hidden_size (int): The size of the hidden state in the MTLSTM cell.
+        hidden_size (int): The size of the hidden state in the TLSTM cell.
         input_size (int): The size of the input features.
         input_size (int): The number of input features with different frequencies.
         weight_ih (jax.Array): Input weights for input, forget, cell, and output gates.
@@ -137,6 +186,8 @@ class MTLSTMCell(eqx.Module):
             tuple: A tuple of (hidden_state, cell_state) representing the updated state.
         """
         hidden, cell = state
+
+        c_star = self._decomp_and_discount(cell, dt)
         
         gates = jnp.dot(x_d, self.weight_ih.T) + jnp.dot(hidden, self.weight_hh.T) + self.bias
         i, f, g, o = jnp.split(gates, 4, axis=-1)
@@ -144,8 +195,6 @@ class MTLSTMCell(eqx.Module):
         f = jax.nn.sigmoid(f)
         g = jnp.tanh(g)
         o = jax.nn.sigmoid(o)
-
-        c_star = self._decomp_and_discount(cell, dt)
 
         cell = f * c_star + i * g
         hidden = o * jnp.tanh(cell)
@@ -163,16 +212,21 @@ class MTLSTMCell(eqx.Module):
         Returns:
             jax.Array: The updated cell state after subspace decomposition and discounting.
         """
-        cs_list = []
-        c_list = []
-        for i in range(self.input_size):
-            cs = jnp.tanh(jnp.dot(cell, self.weight_decomp[i].T) + self.bias_decomp[i])
-            c = cs * self._time_decay(dt[i]) 
-            cs_list.append(cs)
-            c_list.append(c)
 
-        ct = cell - jnp.sum(jnp.stack(cs_list, axis=0), axis=0)
-        c_star = ct + jnp.sum(jnp.stack(c_list, axis=0), axis=0)
+        # Subspace decomposition and elapsed time discounting for each feature
+        cs_hat_0_list = []
+        ct_0_list = []
+        for i in range(self.input_size):
+            cs_0 = jnp.tanh(jnp.dot(cell, self.weight_decomp[i].T) + self.bias_decomp[i])
+            cs_hat_0 = cs_0 * self._time_decay(dt[i]) 
+            cs_hat_0_list.append(cs_hat_0)
+
+            ct_0 = cell - cs_0
+            ct_0_list.append(ct_0)
+        
+        ct_0 = jnp.sum(jnp.stack(ct_0_list, axis=0), axis=0)
+        cs_hat_0 = jnp.sum(jnp.stack(cs_hat_0_list, axis=0), axis=0)
+        c_star = ct_0 + cs_hat_0
 
         return c_star
     
@@ -181,9 +235,9 @@ class MTLSTMCell(eqx.Module):
         return 1.0 / jnp.log(jnp.e + dt)
     
     
-class EAMTLSTMCell(MTLSTMCell):
+class TEALSTMCell(MTLSTMCell):
     """
-    An Entity-Aware Multi-Timescale LSTM (EA-MTLSTM) cell that extends the MTLSTMCell.
+    A Time- and Entity-Aware LSTM (TEALSTM) cell that extends the TLSTMCell.
     
     Attributes:
         weight_is (jax.Array): Weight matrix for the static input gate.

@@ -21,7 +21,7 @@ class DataLoader:
     def __init__(self, 
                  data_dir: Path, 
                  basins: list,
-                 features: list,
+                 features_dict: dict,
                  target: str,
                  time_slice: slice,
                  split_time: np.datetime64,
@@ -29,31 +29,32 @@ class DataLoader:
                  sequence_length: int,
                  train: bool,
                  discharge_col: str = None,
-                 zero_min_cols: list = None,
-                 scale: pd.Series = None,
-                 fill_and_weight: bool = False,
-                 calc_dt: bool = False):
+                 zero_min_cols: list = None):
         
         self.data_dir = data_dir
         self.basins = basins
-        self.features = features
         self.target = target
         self.time_slice = time_slice
         self.split_time = split_time
         self.batch_size = batch_size
         self.sequence_length = sequence_length
         self.train = train
-        self.discharge_idx = features.index(discharge_col)
         self.zero_min_cols = zero_min_cols
-        self.fill_and_weight = fill_and_weight
-        self.calc_dt = calc_dt
+
+        self.all_features =  [value for sublist in features_dict.values() for value in sublist]
+        self.daily_features = features_dict['daily']
+        self.discharge_idx = features_dict['daily'].index(discharge_col)
+        if len(features_dict)>1:
+            self.irregular_features = features_dict['irregular']
 
         self.train_ids = {}
         self.test_ids = {}
         self.split_idx = {}
-        self.xd = {}
-        self.xs = {}
-        self.dt = {}
+        self.x_dd = {}
+        self.x_di = {}
+        self.x_di_ids = {}
+        self.x_di_attn_dt = {}
+        self.x_s = {}
         self.y = {}
         self.scale = {}
         
@@ -69,12 +70,17 @@ class DataLoader:
         
         ds = xr.open_dataset(file_path).sel(date=self.time_slice)
         self.split_idx[basin] = np.where(ds['date']==self.split_time)[0][0]
-        df = ds.to_dataframe()[self.features+[self.target]]
+        df = ds.to_dataframe()[self.all_features+[self.target]]
 
         # df_norm, scale = _normalize_data
-        self.xd[basin] = df[self.features].values
+        self.x_dd[basin] = df[self.daily_features].values
         self.y[basin] = df[[self.target]].values
 
+        if self.irregular_features is not None:
+            df_di = df[self.irregular_features].dropna()
+            self.x_di[basin] = df_di.values
+            self.x_di_ids[basin] = df_di.reset_index().index.values
+            self.x_di_attn_dt[basin] = self._calc_attn_dt(basin)
         
         train_ids = np.where(~np.isnan(self.y[basin][:self.split_idx[basin]]))[0]
         self.train_ids[basin] = train_ids[train_ids >= self.sequence_length]
@@ -84,7 +90,6 @@ class DataLoader:
         self.n_test_samples += len(self.test_ids[basin])
 
         ds.close()
-        return 
     
     def _load_attributes(self):
         file_path = f"{self.data_dir}/attributes/attributes.csv"
@@ -100,7 +105,7 @@ class DataLoader:
             
             if basin not in attributes_df.index:
                 raise KeyError(f"Basin '{basin}' not found in attributes DataFrame.")
-            self.xs[basin] = attributes_df.loc[basin].values
+            self.x_s[basin] = attributes_df.loc[basin].values
     
     def __iter__(self):
         if self.train:
@@ -109,63 +114,95 @@ class DataLoader:
         else:
             idx_list = self.test_ids
 
-        xd, xs, y = [], [], []
+        def init_batch_dict():
+            batch = {'x_dd': [],
+                     'x_di': [],
+                     'x_di_attn_dt': [],
+                     'x_di_ids': [],
+                     'x_di_decay_dt': [],
+                     'x_s': [],
+                     'y': []}
+            return batch
+
+        def stack_batch(batch):
+            stacked = {}
+            for key, value in batch.items():
+                stacked[key] = jnp.stack(value)
+            return stacked
+
+        batch = init_batch_dict()
         for basin in self.basins:
             for idx in idx_list[basin]:
-                sequence_ids =  np.array(np.arange(idx - self.sequence_length + 1, idx + 1))
+                seq_daily_ids = jnp.array(jnp.arange(idx - self.sequence_length + 1, idx + 1))
+                batch['x_dd'].append(self.x_dd[basin][seq_daily_ids])
+                batch['x_di_attn_dt'].append(self.x_di_attn_dt[basin][seq_daily_ids])
+                 
+                irregular_ids_mask = jnp.isin(self.x_di_ids[basin], seq_daily_ids)
+                batch['x_di'].append(self.x_di[basin][irregular_ids_mask])
+                x_di_ids = self.x_di_ids[basin][irregular_ids_mask]
+                batch['x_di_ids'].append(x_di_ids)
+                batch['x_di_decay_dt'].append(np.diff(x_di_ids, prepend=1))
 
-                xd.append(self.xd[basin][sequence_ids])
-                y.append(self.y[basin][sequence_ids])
-                xs.append(self.xs[basin])
-
-                if len(xd) == self.batch_size:
-                    yield _create_batch_dict(xd,xs,y)
-                    xd, xs, y = [], [], []
+                batch['x_s'].append(self.x_s[basin])
+                batch['y'].append(self.y[basin][seq_daily_ids])
+                
+                if len(batch['x_dd']) == self.batch_size:
+                    yield stack_batch(batch)
+                    batch = init_batch_dict()
                     
         #Yield the final partial batch 
         if len(xd)>0:
-            yield _create_batch_dict(xd,xs,y)
+            yield stack_batch(batch)
 
     def _normalize_data(self):
-    """
-    Normalize the input data using the provided scale or calculate the scale if not provided.
-    Allows for min-max normalization of specified columns.
+        """
+        Normalize the input data using the provided scale or calculate the scale if not provided.
+        Allows for min-max normalization of specified columns.
+    
+        Args:
+            df (pd.DataFrame): The input data to be normalized.
+            scale (Dict[str, float], optional): A dictionary containing the 'offset' and 'scale'
+                for each column. For standard normalization, 'offset' is the mean and 'scale' is the standard deviation.
+                For min-max normalization, 'offset' is the minimum and 'scale' is the range (max - min).
+                If not provided, these values will be calculated from the data.
+            min_max_columns (List[str], optional): A list of column names to be normalized using min-max normalization.
+                Other columns will be normalized using standard normalization.
+    
+        Returns:
+            pd.DataFrame: The normalized data.
+            Dict[str, float]: A dictionary containing the 'offset' and 'scale' for each column.
+        """
+        scale['offset'] = {}
+        scale['scale'] = {}
+    
+        normalized_df = df.copy()
+        for col in df.columns:
+            if col in self.zero_min_columns:
+                scale['offset'][col] = 0
+                scale['scale'][col] = df[col].max()
+            else:
+                scale['offset'][col] = df[col].mean()
+                scale['scale'][col] = df[col].std()
+                    
+            normalized_df[col] = (df[col] - scale['offset'][col]) / scale['scale'][col]
+                    
+        return
 
-    Args:
-        df (pd.DataFrame): The input data to be normalized.
-        scale (Dict[str, float], optional): A dictionary containing the 'offset' and 'scale'
-            for each column. For standard normalization, 'offset' is the mean and 'scale' is the standard deviation.
-            For min-max normalization, 'offset' is the minimum and 'scale' is the range (max - min).
-            If not provided, these values will be calculated from the data.
-        min_max_columns (List[str], optional): A list of column names to be normalized using min-max normalization.
-            Other columns will be normalized using standard normalization.
+    def _calc_attn_dt(self, basin):
+        # Initialize with 0s and leading Infs before first observation.
+        # Infinite forces the attn mechanism to 0 for the irregular data
+        attn_dt = np.zeros(len(self.x_dd[basin]), dtype=float)
+        if self.x_di_ids[basin][0] > 0:
+            attn_dt[:self.x_di_ids[basin][0]] = np.inf
+        
+        # Loop through the non-NaN indices and fill in the result array
+        for i in range(len(self.x_di_ids[basin]) - 1):
+            start = self.x_di_ids[basin][i]
+            end = self.x_di_ids[basin][i + 1]
+            attn_dt[start + 1:end] = np.arange(1, end - start)
 
-    Returns:
-        pd.DataFrame: The normalized data.
-        Dict[str, float]: A dictionary containing the 'offset' and 'scale' for each column.
-    """
-    scale['offset'] = {}
-    scale['scale'] = {}
+        return attn_dt
 
-    normalized_df = df.copy()
-    for col in df.columns:
-        if col in self.zero_min_columns:
-            scale['offset'][col] = 0
-            scale['scale'][col] = df[col].max()
-        else:
-            scale['offset'][col] = df[col].mean()
-            scale['scale'][col] = df[col].std()
-                
-        normalized_df[col] = (df[col] - scale['offset'][col]) / scale['scale'][col]
-                
-    return
-
-
-def _create_batch_dict(xd, xs, y):
-    batch_dict = {'xd': np.stack(xd),
-                  'y': np.stack(y),
-                  'xs': np.stack(xs)}
-    return batch_dict
 
 def _combine_slices(slice_list):
         start_list = [s.start for s in slice_list]
