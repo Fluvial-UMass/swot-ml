@@ -52,245 +52,143 @@ class Gated_LSTM(BaseLSTM):
         return (self.linear(out))
 
 
-class TLSTM(BaseLSTM):
-    def __init__(self, in_size, out_size, hidden_size, *, key):
-        super().__init__(in_size, out_size, hidden_size, key=key)
-        ckey, _ = jrandom.split(key)
-        self.cell = MTLSTMCell(in_size, hidden_size, key=ckey)
+class TEALSTMCell(eqx.Module):
+    """
+    A Time- and Entity-Aware LSTM (EALSTM) cell .
+    
+    Attributes:
+        hidden_size (int): The size of the hidden state in the EALSTM cell.
+        input_size (int): The size of the input features.
+        weight_ih (jax.Array): Input weights for input, forget, cell, and output gates.
+        weight_hh (jax.Array): Hidden weights for input, forget, cell, and output gates.
+        bias (jax.Array): Bias terms for forget, cell, and output gates.
+        input_linear (eqx.nn.Linear): Linear transformation for static input features.
+    """
+    weight_ih: jax.Array
+    weight_hh: jax.Array
+    bias: jax.Array
+    input_linear: eqx.nn.Linear
+    weight_decomp: jax.Array
+    bias_decomp: jax.Array
+    
+    def __init__(self, dynamic_input_size, static_input_size, hidden_size, out_size, *, key):
+        """
+        Initializes the EALSTM cell.
 
-    def __call__(self, data):
-        def scan_fn(state, inputs):
-            xd, dt = inputs
-            return self.cell(xd, dt, state), None
+        Args:
+            dynamic_input_size (int): The size of the dynamic input features.
+            static_input_size (int): The size of the static input features.
+            hidden_size (int): The size of the hidden state in the EALSTM cell.
+            out_size (int): The size of the output features.
+            key (jax.random.PRNGKey): A random key for initializing the cell parameters.
+        """
+        wkey, bkey, ikey, dkey = jrandom.split(key, 4)
+        self.weight_ih = jax.nn.initializers.glorot_normal()(wkey, (3 * hidden_size, dynamic_input_size))
+        self.weight_hh = jax.nn.initializers.glorot_normal()(wkey, (3 * hidden_size, hidden_size))
+        self.bias = jax.nn.initializers.zeros(bkey, (3 * hidden_size,))
+        self.input_linear = eqx.nn.Linear(static_input_size, hidden_size, use_bias=True, key=ikey)
+        self.weight_decomp = jax.nn.initializers.glorot_normal()(dkey, (hidden_size, hidden_size))
+        self.bias_decomp = jax.nn.initializers.zeros(dkey, (hidden_size))
+        
+    def _decomp_and_decay(self, c_0, skip_count):
+        cs_0 = jnp.tanh(jnp.dot(c_0, self.weight_decomp.T) + self.bias_decomp)
+        ct_0 = c_0 - cs_0
+        cs_hat_0 = cs_0 / (1 + skip_count)
+        c_star = ct_0 + cs_hat_0
 
-        init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
-        (out, _), _ = jax.lax.scan(scan_fn, init_state, (data['xd'], data['dt']))
-        return self.linear(out)
+        return c_star
+
+    def _skip_update(self, operand):
+        state, _, _, skip_count = operand
+        skip_count += 1
+        return state, skip_count
+
+    def _update_cell(self, operand):
+        state, x_d, x_s, skip_count = operand
+        h_0, c_0 = state
+
+        # Apply time decay if we have skipped any updates.
+        c_0 = lax.cond(skip_count>0,
+                       lambda _: self._decomp_and_decay(c_0, skip_count),  # Pass c_0 to the decay function
+                       lambda _: c_0,  # Return c_0 as is
+                       operand=None)  # The operand is not used in the functions
+
+        # Compute the gates
+        i = jax.nn.sigmoid(self.input_linear(x_s))  # Static input gate
+        gates = jnp.dot(x_d, self.weight_ih.T) + jnp.dot(h_0, self.weight_hh.T) + self.bias
+        f, g, o = jnp.split(gates, 3, axis=-1)
+        f = jax.nn.sigmoid(f)
+        g = jnp.tanh(g)
+        o = jax.nn.sigmoid(o)
+
+        # Update the state
+        c_1 = f * c_0 + i * g
+        h_1 = o * jnp.tanh(c_1)
+
+        #return state and 0 for skip_count
+        return (h_1, c_1), 0
+        
+    def _is_input_nan(self, x_d):
+        # Create a dummy array with the same shape as x_d, filled with NaNs
+        nan_array = jnp.full_like(x_d, jnp.nan)
+        # Check if x_d is equal to the dummy NaN array
+        return jnp.all(jnp.isnan(x_d) == jnp.isnan(nan_array))
+        
+    def __call__(self, state, x_d, x_s, skip_count):
+        # is_nan = jnp.isnan(x_d).any()
+        is_nan = self._is_input_nan(x_d)
+
+        state = lax.cond(is_nan,
+                         self._skip_update,
+                         self._update_cell,
+                         operand=(state, x_d, x_s, skip_count))
+        
+        return state
+
 
 class TEALSTM(BaseLSTM):
-    def __init__(self, in_size, out_size, hidden_size, *, key):
-        super().__init__(in_size, out_size, hidden_size, key=key)
-        ckey, _ = jrandom.split(key)
-        self.cell = MTLSTMCell(in_size, hidden_size, key=ckey)
+    def __init__(self, dynamic_in_size, static_in_size, out_size, hidden_size, *, key):
+        lkey, ckey = jrandom.split(key)
+        super().__init__(dynamic_in_size, out_size, hidden_size, key=lkey)
+        self.cell = TEALSTMCell(dynamic_in_size, static_in_size, hidden_size, out_size, key=ckey)
 
-    def __call__(self, data):
-        def scan_fn(state, inputs):
-            xd, dt = inputs
-            return self.cell(xd, state, dt), None
+    def __call__(self, x_d, x_s):
+        def scan_fn(state, x_d):
+            skip_count = state[2]
+            new_state, skip_count = self.cell(state[:2], x_d, x_s, skip_count)
+            return (*new_state, skip_count), None
 
-        init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
-        (out, _), _ = jax.lax.scan(scan_fn, init_state, (data['xd'], data['dt']))
-        return (self.linear(out))
+        init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size), 0)
+        (out, _, _), _ = jax.lax.scan(scan_fn, init_state, x_d)
+        return out
+
 
 class TAPLSTM(eqx.Module):
     """
     A Time-Attentitive Parallel LSTM model structure
     """
-    def __init__(self, d_in_size, i_in_size, out_size, d_hidden_size, i_hidden_size, *, key):
-        self.d_in_size = d_in_size
-        self.d_hidden_size = d_hidden_size
-        dkey, dlinkey = jrandom.split(key)
-        self.d_cell = TLSTMCell(d_in_size, d_hidden_size, key=dkey)
-        self.d_linear = eqx.nn.Linear(d_hidden_size, out_size, use_bias=True, key=dlinkey)
-    
-        self.i_in_size = i_in_size
-        self.i_hidden_size = i_hidden_size
-        ikey, ilinkey = jrandom.split(key)
-        self.i_cell = TEALSTMCell(i_in_size, i_hidden_size, key=ikey)
-        self.i_linear = eqx.nn.Linear(i_hidden_size, out_size, use_bias=True, key=ilinkey)
-    
-        self.out_size = out_size
+    tealstm_d: TEALSTM
+    tealstm_i: TEALSTM
+    attention_lambda: jnp.ndarray
+    linear: eqx.nn.Linear
+
+    def __init__(self, daily_in_size, irregular_in_size, static_in_size, out_size, hidden_size, *, key):
+        dkey, ikey, lkey = jrandom.split(key, 3)
+        self.tealstm_d = TEALSTM(daily_in_size, static_in_size, out_size, hidden_size, key=dkey)
+        self.tealstm_i = TEALSTM(irregular_in_size, static_in_size, out_size, hidden_size, key=ikey)
+        self.attention_lambda = jnp.array([0.1])
+        self.linear = eqx.nn.Linear(hidden_size, out_size, use_bias=True, key=lkey)
 
     def __call__(self, data):
-        def scan_fn(state, inputs):
-            d_state, i_state = state
-            x_d, x_di, x_di_dt, x_s = inputs
-    
-            d_hidden, d_cell = self.d_cell(x_d, d_state)
-            i_hidden, i_cell = self.i_cell(x_d, i_state, dt, x_s)
-    
-            d_out = self.d_linear(d_hidden)
-            i_out = self.i_linear(i_hidden)
-    
-            return (d_hidden, d_cell), (i_hidden, i_cell), (d_out, i_out)
-    
-        d_init_state = (jnp.zeros(self.d_hidden_size), jnp.zeros(self.d_hidden_size))
-        i_init_state = (jnp.zeros(self.i_hidden_size), jnp.zeros(self.i_hidden_size))
-    
-        (_, _), (_, _), (d_outs, i_outs) = jax.lax.scan(
-            scan_fn, (d_init_state, i_init_state), (data['x_d'], data['x_di'], data['x_di_dt'], data['x_s'])
-        )
-    
+        d_out = self.tealstm_d(data['x_dd'], data['x_s'])
+        i_out = self.tealstm_i(data['x_di'], data['x_s'])
+
         # Combine the outputs from both LSTM branches using attention
-        a_d = jnp.exp(-data['lambda'] * data['dt'])
-        a_s = jnp.ones_like(a_d)
-        a_normalized = jax.nn.softmax(jnp.stack([a_d, a_s], axis=-1), axis=-1)
+        a_i = jnp.exp(-self.attention_lambda * data['attn_dt'][-1])
+        a_d = jnp.ones_like(a_i)
+        a_normalized = jax.nn.softmax(jnp.stack([a_d, a_i], axis=-1), axis=-1)
+
+        combined_outs = a_normalized[..., 0] * d_out + a_normalized[..., 1] * i_out
+
+        return self.linear(combined_outs)
     
-        combined_outs = a_normalized[..., 0] * d_outs + a_normalized[..., 1] * i_outs
-    
-        return combined_outs
-
-
-class TLSTMCell(eqx.Module):
-    """
-    A Time-Aware LSTM (TLSTM) cell implemented using Equinox.
-
-    Attributes:
-        hidden_size (int): The size of the hidden state in the TLSTM cell.
-        input_size (int): The size of the input features.
-        input_size (int): The number of input features with different frequencies.
-        weight_ih (jax.Array): Input weights for input, forget, cell, and output gates.
-        weight_hh (jax.Array): Hidden weights for input, forget, cell, and output gates.
-        bias (jax.Array): Bias terms for input, forget, cell, and output gates.
-        weight_decomp (jax.Array): Weights for subspace decomposition of each feature.
-        bias_decomp (jax.Array): Biases for subspace decomposition of each feature.
-    """
-
-    hidden_size: int
-    input_size: int
-    weight_ih: jax.Array
-    weight_hh: jax.Array
-    bias: jax.Array
-    weight_decomp: jax.Array
-    bias_decomp: jax.Array
-
-    def __init__(self, input_size, hidden_size, *, key):
-        """
-        Initializes the MTLSTM cell.
-
-        Args:
-            input_size (int): The size of the input features.
-            hidden_size (int): The size of the hidden state in the MTLSTM cell.
-            key (jax.random.PRNGKey): A random key for initializing the cell parameters.
-        """
-        self.hidden_size = hidden_size
-        self.input_size = input_size
-        
-        wkey, bkey, dkey, tkey = jrandom.split(key, 4)
-        self.weight_ih = jax.nn.initializers.glorot_normal()(wkey, (4 * hidden_size, input_size))
-        self.weight_hh = jax.nn.initializers.glorot_normal()(wkey, (4 * hidden_size, hidden_size))
-        self.bias = jax.nn.initializers.zeros(key, (4 * hidden_size,))
-        self.weight_decomp = jax.nn.initializers.glorot_normal()(dkey, (input_size, hidden_size, hidden_size))
-        self.bias_decomp = jax.nn.initializers.zeros(dkey, (input_size, hidden_size))
-
-    def __call__(self, x_d, dt, state):
-        """
-        Performs a single step of the MTLSTM cell.
-
-        Args:
-            x_d (jax.Array): The dynamic input features at the current time step.
-            state (tuple): A tuple of (hidden_state, cell_state) representing the previous state.
-            dt (jax.Array): The elapsed times for each feature since the last observation.
-
-        Returns:
-            tuple: A tuple of (hidden_state, cell_state) representing the updated state.
-        """
-        hidden, cell = state
-
-        c_star = self._decomp_and_discount(cell, dt)
-        
-        gates = jnp.dot(x_d, self.weight_ih.T) + jnp.dot(hidden, self.weight_hh.T) + self.bias
-        i, f, g, o = jnp.split(gates, 4, axis=-1)
-        i = jax.nn.sigmoid(i)
-        f = jax.nn.sigmoid(f)
-        g = jnp.tanh(g)
-        o = jax.nn.sigmoid(o)
-
-        cell = f * c_star + i * g
-        hidden = o * jnp.tanh(cell)
-
-        return hidden, cell
-  
-    def _decomp_and_discount(self, cell, dt):
-        """
-        Performs subspace decomposition and elapsed time discounting for each feature.
-
-        Args:
-            cell (jax.Array): The cell state.
-            dt (jax.Array): The elapsed times for each feature since the last observation.
-
-        Returns:
-            jax.Array: The updated cell state after subspace decomposition and discounting.
-        """
-
-        # Subspace decomposition and elapsed time discounting for each feature
-        cs_hat_0_list = []
-        ct_0_list = []
-        for i in range(self.input_size):
-            cs_0 = jnp.tanh(jnp.dot(cell, self.weight_decomp[i].T) + self.bias_decomp[i])
-            cs_hat_0 = cs_0 * self._time_decay(dt[i]) 
-            cs_hat_0_list.append(cs_hat_0)
-
-            ct_0 = cell - cs_0
-            ct_0_list.append(ct_0)
-        
-        ct_0 = jnp.sum(jnp.stack(ct_0_list, axis=0), axis=0)
-        cs_hat_0 = jnp.sum(jnp.stack(cs_hat_0_list, axis=0), axis=0)
-        c_star = ct_0 + cs_hat_0
-
-        return c_star
-    
-    def _time_decay(self, dt):
-        # Time decay function to discount the short-term memory based on elapsed time.
-        return 1.0 / jnp.log(jnp.e + dt)
-    
-    
-class TEALSTMCell(MTLSTMCell):
-    """
-    A Time- and Entity-Aware LSTM (TEALSTM) cell that extends the TLSTMCell.
-    
-    Attributes:
-        weight_is (jax.Array): Weight matrix for the static input gate.
-        bias_is (jax.Array): Bias vector for the static input gate.
-    """
-
-    weight_is: jax.Array
-    bias_is: jax.Array
-
-    def __init__(self, input_size, hidden_size, *, key):
-        """
-        Initializes the EA-MTLSTM cell.
-
-        Args:
-            input_size (int): The size of the input features.
-            hidden_size (int): The size of the hidden state in the EA-MTLSTM cell.
-            key (jax.random.PRNGKey): A random key for initializing the cell parameters.
-        """
-        super().__init__(input_size, hidden_size, key=key)
-        
-        iskey, _ = jrandom.split(key)
-        self.weight_is = jax.nn.initializers.glorot_normal()(iskey, (hidden_size, input_size))
-        self.bias_is = jax.nn.initializers.zeros(iskey, (hidden_size,))
-
-    def __call__(self, x_d, state, dt, x_s):
-        """
-        Performs a single step of the EA-MTLSTM cell.
-
-        Args:
-            x_d (jax.Array): The dynamic input features at the current time step.
-            state (tuple): A tuple of (hidden_state, cell_state) representing the previous state.
-            dt (jax.Array): The elapsed times for each feature since the last observation.
-            x_s (jax.Array): The static input features.
-
-        Returns:
-            tuple: A tuple of (hidden_state, cell_state) representing the updated state.
-        """
-        hidden, cell = state
-        
-        # Calculate the static input gate
-        i_s = jax.nn.sigmoid(jnp.dot(x_s, self.weight_is.T) + self.bias_is)
-        
-        gates = jnp.dot(x_d, self.weight_ih.T) + jnp.dot(hidden, self.weight_hh.T) + self.bias
-        i, f, g, o = jnp.split(gates, 4, axis=-1)
-        i = jax.nn.sigmoid(i)
-        f = jax.nn.sigmoid(f)
-        g = jnp.tanh(g)
-        o = jax.nn.sigmoid(o)
-
-        c_star = self._decomp_and_discount(cell, dt)
-
-        # Modify the cell state update to use the static input gate
-        cell = f * c_star + i * g * i_s 
-        hidden = o * jnp.tanh(cell)
-
-        return hidden, cell

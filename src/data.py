@@ -27,7 +27,7 @@ class DataLoader:
                  split_time: np.datetime64,
                  batch_size: int,
                  sequence_length: int,
-                 train: bool,
+                 train: bool = True,
                  discharge_col: str = None,
                  zero_min_cols: list = None):
         
@@ -52,8 +52,8 @@ class DataLoader:
         self.split_idx = {}
         self.x_dd = {}
         self.x_di = {}
-        self.x_di_ids = {}
-        self.x_di_attn_dt = {}
+        self.attn_dt = {}
+        self.decay_dt = {}
         self.x_s = {}
         self.y = {}
         self.scale = {}
@@ -63,7 +63,8 @@ class DataLoader:
     def __len__(self):
         if self.train:
             return (self.n_train_samples + self.batch_size - 1) // self.batch_size
-        return
+        else: 
+            return (self.n_test_samples + self.batch_size - 1) // self.batch_size
     
     def _load_basin_data(self, basin):
         file_path = f"{self.data_dir}/time_series/{basin}.nc"
@@ -77,10 +78,10 @@ class DataLoader:
         self.y[basin] = df[[self.target]].values
 
         if self.irregular_features is not None:
-            df_di = df[self.irregular_features].dropna()
+            df_di = df[self.irregular_features]
             self.x_di[basin] = df_di.values
-            self.x_di_ids[basin] = df_di.reset_index().index.values
-            self.x_di_attn_dt[basin] = self._calc_attn_dt(basin)
+            non_nan_ids = df_di.reset_index().dropna().index.values
+            self.attn_dt[basin], self.decay_dt[basin]= _calc_attn_decay_dt(len(df_di), non_nan_ids)
         
         train_ids = np.where(~np.isnan(self.y[basin][:self.split_idx[basin]]))[0]
         self.train_ids[basin] = train_ids[train_ids >= self.sequence_length]
@@ -117,14 +118,13 @@ class DataLoader:
         def init_batch_dict():
             batch = {'x_dd': [],
                      'x_di': [],
-                     'x_di_attn_dt': [],
-                     'x_di_ids': [],
-                     'x_di_decay_dt': [],
+                     'attn_dt': [],
+                     'decay_dt': [],
                      'x_s': [],
                      'y': []}
             return batch
 
-        def stack_batch(batch):
+        def stack_batch_dict(batch):
             stacked = {}
             for key, value in batch.items():
                 stacked[key] = jnp.stack(value)
@@ -133,26 +133,21 @@ class DataLoader:
         batch = init_batch_dict()
         for basin in self.basins:
             for idx in idx_list[basin]:
-                seq_daily_ids = jnp.array(jnp.arange(idx - self.sequence_length + 1, idx + 1))
-                batch['x_dd'].append(self.x_dd[basin][seq_daily_ids])
-                batch['x_di_attn_dt'].append(self.x_di_attn_dt[basin][seq_daily_ids])
-                 
-                irregular_ids_mask = jnp.isin(self.x_di_ids[basin], seq_daily_ids)
-                batch['x_di'].append(self.x_di[basin][irregular_ids_mask])
-                x_di_ids = self.x_di_ids[basin][irregular_ids_mask]
-                batch['x_di_ids'].append(x_di_ids)
-                batch['x_di_decay_dt'].append(np.diff(x_di_ids, prepend=1))
-
+                sequence_ids = jnp.array(jnp.arange(idx - self.sequence_length + 1, idx + 1))
+                batch['x_dd'].append(self.x_dd[basin][sequence_ids])
+                batch['x_di'].append(self.x_di[basin][sequence_ids])
+                batch['attn_dt'].append(self.attn_dt[basin][sequence_ids])
+                batch['decay_dt'].append(self.decay_dt[basin][sequence_ids])
                 batch['x_s'].append(self.x_s[basin])
-                batch['y'].append(self.y[basin][seq_daily_ids])
+                batch['y'].append(self.y[basin][sequence_ids])
                 
                 if len(batch['x_dd']) == self.batch_size:
-                    yield stack_batch(batch)
+                    yield stack_batch_dict(batch)
                     batch = init_batch_dict()
                     
         #Yield the final partial batch 
-        if len(xd)>0:
-            yield stack_batch(batch)
+        if len(batch['x_dd'])>0:
+            yield stack_batch_dict(batch)
 
     def _normalize_data(self):
         """
@@ -188,32 +183,38 @@ class DataLoader:
                     
         return
 
-    def _calc_attn_dt(self, basin):
-        # Initialize with 0s and leading Infs before first observation.
-        # Infinite forces the attn mechanism to 0 for the irregular data
-        attn_dt = np.zeros(len(self.x_dd[basin]), dtype=float)
-        if self.x_di_ids[basin][0] > 0:
-            attn_dt[:self.x_di_ids[basin][0]] = np.inf
+def _calc_attn_decay_dt(data_len, non_nan_ids):
+    # Initialize attention and decay dts.
+    attn = np.zeros(data_len)
+    decay = np.full(data_len, np.nan)
+    if len(non_nan_ids) == 0:
+        return attn, decay
+
+    # Special treatment when there are leading missing values.
+    # Infinite forces the attn mechanism to 0 for the irregular data.
+    # 1 causes no decay for first obs. 
+    if non_nan_ids[0] > 0:
+        attn[:non_nan_ids[0]] = np.inf
+        decay[non_nan_ids[0]] = 1
+    # Loop through the non-NaN indices and fill in the result array
+    for i in range(len(non_nan_ids) - 1):
+        start = non_nan_ids[i]
+        end = non_nan_ids[i + 1]
+        attn[start + 1:end] = np.arange(1, end - start)
+        decay[end] = end-start
         
-        # Loop through the non-NaN indices and fill in the result array
-        for i in range(len(self.x_di_ids[basin]) - 1):
-            start = self.x_di_ids[basin][i]
-            end = self.x_di_ids[basin][i + 1]
-            attn_dt[start + 1:end] = np.arange(1, end - start)
-
-        return attn_dt
-
+    return attn, decay
 
 def _combine_slices(slice_list):
-        start_list = [s.start for s in slice_list]
-        if None in start_list: start = None
-        else: start = min(start_list)
-            
-        stop_list = [s.stop for s in slice_list]
-        if None in stop_list: stop = None
-        else: stop = min(stop_list)
+    start_list = [s.start for s in slice_list]
+    if None in start_list: start = None
+    else: start = min(start_list)
+        
+    stop_list = [s.stop for s in slice_list]
+    if None in stop_list: stop = None
+    else: stop = min(stop_list)
 
-        return slice(start, stop)
+    return slice(start, stop)
 
 def _distance_to_closest_obs(arr):
     nan_mask = np.isnan(arr)

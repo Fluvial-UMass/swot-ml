@@ -11,9 +11,9 @@ def mse_loss(y, y_pred):
     return mse
 
 # Intermittent flow modified MSE
-def if_mse_loss(y, y_pred, unscaled_q):
+def if_mse_loss(y, y_pred, q):
     mse = mse_loss(y, y_pred)
-    if_err = jnp.where(unscaled_q==0,
+    if_err = jnp.where(q==0,
                        y_pred-0,
                        jnp.nan)
     if_mse = jnp.nanmean(jnp.square(if_err))
@@ -39,7 +39,7 @@ def compute_loss(model, data, loss_name, **kwargs):
     if loss_name == "mse":
         return mse_loss(data['y'], y_pred)
     elif loss_name == "if_mse":
-        return if_mse_loss(data['y'], y_pred, data['unscaled_q'])
+        return if_mse_loss(data['y'], y_pred, data['x_dd'][:,-1])
     else:
         raise ValueError("Invalid loss function name.")
 
