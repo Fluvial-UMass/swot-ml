@@ -18,7 +18,8 @@ class DataLoader:
                  sequence_length: int,
                  train: bool = True,
                  discharge_col: str = None,
-                 zero_min_cols: list = None):
+                 log_norm_cols: list = [],
+                 range_norm_cols: list = []):
 
         # Validate the feature dict
         if not isinstance(features_dict.get('daily'), list):
@@ -32,25 +33,24 @@ class DataLoader:
         self.batch_size = batch_size
         self.sequence_length = sequence_length
         self.train = train
-        self.zero_min_cols = zero_min_cols
+        self.log_norm_cols = log_norm_cols
+        self.range_norm_cols = range_norm_cols
             
         self.all_features =  [value for sublist in features_dict.values() for value in sublist] # Unpack all features
         self.daily_features = features_dict['daily']
         self.discharge_idx = features_dict['daily'].index(discharge_col)
         self.irregular_features = features_dict.get('irregular') # is None if key doesn't exist. 
 
+        # Create an xarray dataset with 'basin' and 'time' dimensions
+        # time_range = pd.date_range(start=self.time_slice.start, end=self.time_slice.stop, freq='D')
+        # self.ds = xr.Dataset(coords={'basin': basins, 'date': time_range}) 
+        
         self.train_ids = {}
         self.test_ids = {}
-        self.split_idx = {}
-        self.x_dd = {}
-        self.x_di = {}
-        self.attn_dt = {}
-        self.decay_dt = {}
-        self.x_s = {}
-        self.y = {}
-        self.scale = {}
-        
-        self._load_data()
+
+        self.x_s = self._load_attributes()
+        self.x_d = self._load_basin_data()
+        self.scale = self._normalize_data()
 
     def __len__(self):
         if self.train:
@@ -58,60 +58,57 @@ class DataLoader:
         else: 
             return (self.n_test_samples + self.batch_size - 1) // self.batch_size
     
-    def _load_basin_data(self, basin):
-        file_path = f"{self.data_dir}/time_series/{basin}.nc"
-        
-        ds = xr.open_dataset(file_path).sel(date=self.time_slice)
-        self.split_idx[basin] = np.where(ds['date']==self.split_time)[0][0]
-        df = ds.to_dataframe()[self.all_features+[self.target]]
-
-        self.x_dd[basin] = df[self.daily_features].values
-        self.y[basin] = df[[self.target]].values
-
-        if self.irregular_features is not None:
-            df_di = df[self.irregular_features]
-            self.x_di[basin] = df_di.values
-            non_nan_ids = df_di.reset_index().dropna().index.values
-            self.attn_dt[basin], self.decay_dt[basin]= _calc_attn_decay_dt(len(df_di), non_nan_ids)
-        
-        train_ids = np.where(~np.isnan(self.y[basin][:self.split_idx[basin]]))[0]
-        self.train_ids[basin] = train_ids[train_ids >= self.sequence_length]
-        self.n_train_samples += len(self.train_ids[basin])
-        
-        self.test_ids[basin] = np.arange(self.split_idx[basin]+self.sequence_length,len(df))
-        self.n_test_samples += len(self.test_ids[basin])
-
-        ds.close()
-    
-    def _load_attributes(self):
-        file_path = f"{self.data_dir}/attributes/attributes.csv"
-        return pd.read_csv(file_path, index_col="index")
-    
-    def _load_data(self):
-        attributes_df = self._load_attributes()
-
+    def _load_basin_data(self):
         self.n_train_samples = 0
         self.n_test_samples = 0
+        ds_list = []
         for basin in self.basins:
-            self._load_basin_data(basin)
-            
+            file_path = f"{self.data_dir}/time_series/{basin}.nc"
+            ds = xr.open_dataset(file_path).sel(date=self.time_slice)
+    
+            # Filter to keep only the necessary features and the target variable
+            ds = ds[[*self.all_features, self.target]]
+    
+            # Create dict of train and test dates
+            train_mask = (ds['date'] < self.split_time) & (~np.isnan(ds[self.target]))
+            train_dates = ds['date'].where(train_mask, drop=True).values
+            self.train_ids[basin] = train_dates
+            self.n_train_samples += len(train_dates)
+    
+            test_mask = ds['date'] >= self.split_time
+            test_dates = ds['date'].where(test_mask, drop=True).values
+            self.test_ids[basin] = test_dates
+            self.n_test_samples += len(test_dates)
+    
+            ds = ds.assign_coords({'basin': basin})
+            ds_list.append(ds)
+    
+        return xr.concat(ds_list, dim="basin")
+
+    def _load_attributes(self):
+        file_path = f"{self.data_dir}/attributes/attributes.csv"
+        attributes_df = pd.read_csv(file_path, index_col="index")
+        x_s = {}
+        for basin in self.basins:
             if basin not in attributes_df.index:
                 raise KeyError(f"Basin '{basin}' not found in attributes DataFrame.")
-            self.x_s[basin] = attributes_df.loc[basin].values
+            x_s[basin] = attributes_df.loc[basin].values
+        return x_s
+ 
     
     def __iter__(self):
+        # Create a list of (basin, index) pairs
         if self.train:
-            np.random.shuffle(self.basins)
-            idx_list = self.train_ids
+            basin_index_pairs = [(basin, date) for basin, dates in self.train_ids.items() for date in dates]
+            np.random.shuffle(basin_index_pairs)
         else:
-            idx_list = self.test_ids
+            basin_index_pairs = [(basin, date) for basin, dates in self.test_ids.items() for date in dates]
 
         def init_batch_dict():
             batch = {'x_dd': [],
                      'x_di': [],
-                     'attn_dt': [],
-                     'x_s': [],
-                     'y': []}
+                     'y': [],
+                     'x_s': []}
             return batch
 
         def stack_batch_dict(batch):
@@ -119,90 +116,61 @@ class DataLoader:
                 batch[key] = jnp.stack(value)
             return batch
 
+        basins = []
+        dates = []
         batch = init_batch_dict()
-        for basin in self.basins:
-            for idx in idx_list[basin]:
-                sequence_ids = jnp.array(jnp.arange(idx - self.sequence_length + 1, idx + 1))
-                batch['x_dd'].append(self.x_dd[basin][sequence_ids])
-                batch['x_di'].append(self.x_di[basin][sequence_ids])
-                batch['attn_dt'].append(self.attn_dt[basin][sequence_ids])
-                batch['x_s'].append(self.x_s[basin])
-                batch['y'].append(self.y[basin][sequence_ids])
-                
-                if len(batch['x_dd']) == self.batch_size:
-                    yield stack_batch_dict(batch)
-                    batch = init_batch_dict()
+        for basin, date in basin_index_pairs:
+            basins.append(basin)
+            dates.append(date)
+            sequence_dates = pd.date_range(end=date, periods=self.sequence_length, freq='D')
+            batch['x_dd'].append(self.x_d.sel(basin=basin, date=sequence_dates)[self.daily_features].to_array().values.T)
+            batch['x_di'].append(self.x_d.sel(basin=basin, date=sequence_dates)[self.irregular_features].to_array().values.T)
+            batch['y'].append(self.x_d.sel(basin=basin, date=sequence_dates)[self.target].values)
+            batch['x_s'].append(self.x_s[basin])
+            
+            if len(batch['x_dd']) == self.batch_size:
+                yield (basins, dates, stack_batch_dict(batch))
+                batch = init_batch_dict()
+                basins = []
+                dates = []
                     
         #Yield the final partial batch 
         if len(batch['x_dd'])>0:
-            yield stack_batch_dict(batch)
+            yield (basins, dates, stack_batch_dict(batch))
 
     def _normalize_data(self):
         """
-        Normalize the input data using the provided scale or calculate the scale if not provided.
-        Allows for min-max normalization of specified columns.
-    
-        Args:
-            df (pd.DataFrame): The input data to be normalized.
-            scale (Dict[str, float], optional): A dictionary containing the 'offset' and 'scale'
-                for each column. For standard normalization, 'offset' is the mean and 'scale' is the standard deviation.
-                For min-max normalization, 'offset' is the minimum and 'scale' is the range (max - min).
-                If not provided, these values will be calculated from the data.
-            min_max_columns (List[str], optional): A list of column names to be normalized using min-max normalization.
-                Other columns will be normalized using standard normalization.
-    
+        Normalize the input data using log normalization for specified variables and standard normalization for others.
+        Updates the self.x_d dataset in place with the normalized data.
+        
         Returns:
-            pd.DataFrame: The normalized data.
-            Dict[str, float]: A dictionary containing the 'offset' and 'scale' for each column.
+            Dict[str, Dict[str, float]]: A dictionary containing the 'offset', 'scale', and 'log_norm' for each variable.
         """
-        scale['offset'] = {}
-        scale['scale'] = {}
+        # Initialize
+        scale = {k: {'offset': 0, 'scale': 1, 'log_norm': False} for k in self.x_d.data_vars}
     
-        normalized_df = df.copy()
-        for col in df.columns:
-            if col in self.zero_min_columns:
-                scale['offset'][col] = 0
-                scale['scale'][col] = df[col].max()
+        # Subset the dataset to the training time period
+        training_ds = self.x_d.sel(date=slice(None, self.split_time))
+    
+        # Iterate over each variable in the dataset
+        for var in self.x_d.data_vars:
+            if var in self.log_norm_cols:
+                # Perform log normalization
+                scale[var]['log_norm'] = True
+                self.x_d[var] = np.log(self.x_d[var] + 0.001)
+            elif var in self.range_norm_cols:
+                # Perform min-max scaling
+                scale[var]['scale'] = training_ds[var].max().values.item()
+                self.x_d[var] = self.x_d[var] / scale[var]['scale']
             else:
-                scale['offset'][col] = df[col].mean()
-                scale['scale'][col] = df[col].std()
-                    
-            normalized_df[col] = (df[col] - scale['offset'][col]) / scale['scale'][col]
-                    
-        return
+                # Perform standard normalization
+                scale[var]['offset'] = training_ds[var].mean().values.item()
+                scale[var]['scale'] = training_ds[var].std().values.item()
+                self.x_d[var] = (self.x_d[var] - scale[var]['offset']) / scale[var]['scale']
+                
+        return scale
 
-def _calc_attn_decay_dt(data_len, non_nan_ids):
-    # Initialize attention and decay dts.
-    attn = np.zeros(data_len)
-    decay = np.full(data_len, np.nan)
-    if len(non_nan_ids) == 0:
-        return attn, decay
 
-    # Special treatment when there are leading missing values.
-    # Infinite forces the attn mechanism to 0 for the irregular data.
-    # 1 causes no decay for first obs. 
-    if non_nan_ids[0] > 0:
-        attn[:non_nan_ids[0]] = np.inf
-        decay[non_nan_ids[0]] = 1
-    # Loop through the non-NaN indices and fill in the result array
-    for i in range(len(non_nan_ids) - 1):
-        start = non_nan_ids[i]
-        end = non_nan_ids[i + 1]
-        attn[start + 1:end] = np.arange(1, end - start)
-        decay[end] = end-start
-        
-    return attn, decay
-
-def _combine_slices(slice_list):
-    start_list = [s.start for s in slice_list]
-    if None in start_list: start = None
-    else: start = min(start_list)
-        
-    stop_list = [s.stop for s in slice_list]
-    if None in stop_list: stop = None
-    else: stop = min(stop_list)
-
-    return slice(start, stop)
 
 def _distance_to_closest_obs(arr):
     nan_mask = np.isnan(arr)

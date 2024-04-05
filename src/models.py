@@ -135,8 +135,8 @@ class TEALSTMCell(eqx.Module):
         return jnp.all(jnp.isnan(x_d) == jnp.isnan(nan_array))
         
     def __call__(self, state, x_d, x_s, skip_count):
-        # is_nan = jnp.isnan(x_d).any()
-        is_nan = self._is_input_nan(x_d)
+        is_nan = jnp.isnan(x_d).any()
+        # is_nan = self._is_input_nan(x_d)
 
         state = lax.cond(is_nan,
                          self._skip_update,
@@ -159,8 +159,8 @@ class TEALSTM(BaseLSTM):
             return (*new_state, skip_count), None
 
         init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size), 0)
-        (out, _, _), _ = jax.lax.scan(scan_fn, init_state, x_d)
-        return out
+        (out, _, skip_count), _ = jax.lax.scan(scan_fn, init_state, x_d)
+        return out, skip_count
 
 
 class TAPLSTM(eqx.Module):
@@ -180,15 +180,17 @@ class TAPLSTM(eqx.Module):
         self.linear = eqx.nn.Linear(hidden_size, out_size, use_bias=True, key=lkey)
 
     def __call__(self, data):
-        d_out = self.tealstm_d(data['x_dd'], data['x_s'])
-        i_out = self.tealstm_i(data['x_di'], data['x_s'])
+        d_out, _ = self.tealstm_d(data['x_dd'], data['x_s'])
+        i_out, dt = self.tealstm_i(data['x_di'], data['x_s'])
 
         # Combine the outputs from both LSTM branches using attention
-        a_i = jnp.exp(-self.attention_lambda * data['attn_dt'][-1])
+        a_i = jnp.exp(-self.attention_lambda * dt)
         a_d = jnp.ones_like(a_i)
         a_normalized = jax.nn.softmax(jnp.stack([a_d, a_i], axis=-1), axis=-1)
 
         combined_outs = a_normalized[..., 0] * d_out + a_normalized[..., 1] * i_out
 
         return self.linear(combined_outs)
-    
+
+
+
