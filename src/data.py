@@ -6,17 +6,6 @@ import xarray as xr
 import os
 from pathlib import Path
 
-
-def get_dataloaders(train_df, test_df, **kwargs):
-    train = DataLoader(train_df, train=True, shuffle=True, **kwargs)
-    test = DataLoader(test_df, train=False, scale=train.scale, **kwargs)
-    return train, test
-
-import pandas as pd
-import xarray as xr
-import numpy as np
-
-
 class DataLoader:
     def __init__(self, 
                  data_dir: Path, 
@@ -30,7 +19,11 @@ class DataLoader:
                  train: bool = True,
                  discharge_col: str = None,
                  zero_min_cols: list = None):
-        
+
+        # Validate the feature dict
+        if not isinstance(features_dict.get('daily'), list):
+            raise ValueError("features_dict must contain a list of daily features at a minimum.")
+
         self.data_dir = data_dir
         self.basins = basins
         self.target = target
@@ -40,12 +33,11 @@ class DataLoader:
         self.sequence_length = sequence_length
         self.train = train
         self.zero_min_cols = zero_min_cols
-
-        self.all_features =  [value for sublist in features_dict.values() for value in sublist]
+            
+        self.all_features =  [value for sublist in features_dict.values() for value in sublist] # Unpack all features
         self.daily_features = features_dict['daily']
         self.discharge_idx = features_dict['daily'].index(discharge_col)
-        if len(features_dict)>1:
-            self.irregular_features = features_dict['irregular']
+        self.irregular_features = features_dict.get('irregular') # is None if key doesn't exist. 
 
         self.train_ids = {}
         self.test_ids = {}
@@ -73,7 +65,6 @@ class DataLoader:
         self.split_idx[basin] = np.where(ds['date']==self.split_time)[0][0]
         df = ds.to_dataframe()[self.all_features+[self.target]]
 
-        # df_norm, scale = _normalize_data
         self.x_dd[basin] = df[self.daily_features].values
         self.y[basin] = df[[self.target]].values
 
@@ -119,16 +110,14 @@ class DataLoader:
             batch = {'x_dd': [],
                      'x_di': [],
                      'attn_dt': [],
-                     'decay_dt': [],
                      'x_s': [],
                      'y': []}
             return batch
 
         def stack_batch_dict(batch):
-            stacked = {}
             for key, value in batch.items():
-                stacked[key] = jnp.stack(value)
-            return stacked
+                batch[key] = jnp.stack(value)
+            return batch
 
         batch = init_batch_dict()
         for basin in self.basins:
@@ -137,7 +126,6 @@ class DataLoader:
                 batch['x_dd'].append(self.x_dd[basin][sequence_ids])
                 batch['x_di'].append(self.x_di[basin][sequence_ids])
                 batch['attn_dt'].append(self.attn_dt[basin][sequence_ids])
-                batch['decay_dt'].append(self.decay_dt[basin][sequence_ids])
                 batch['x_s'].append(self.x_s[basin])
                 batch['y'].append(self.y[basin][sequence_ids])
                 
