@@ -12,6 +12,17 @@ def mse_loss(y, y_pred):
 
 # Intermittent flow modified MSE
 def if_mse_loss(y, y_pred, q):
+    """
+    Computes the intermittent flow modified mean squared error loss.
+
+    Args:
+        y (jax.Array): The true target values.
+        y_pred (jax.Array): The predicted target values.
+        q (jax.Array): The flow rate values.
+
+    Returns:
+        jax.Array: The intermittent flow modified mean squared error loss.
+    """
     mse = mse_loss(y, y_pred)
     if_err = jnp.where(q==0,
                        y_pred-0,
@@ -22,7 +33,7 @@ def if_mse_loss(y, y_pred, q):
     return loss
 
 @eqx.filter_value_and_grad
-def compute_loss(model, data, loss_name, **kwargs):
+def compute_loss(model, data, loss_name):
     """
     Computes the loss between the model predictions and the targets using the specified loss function.
 
@@ -30,7 +41,6 @@ def compute_loss(model, data, loss_name, **kwargs):
         model (LSTM): The LSTM model.
         data (dict): Dictionary containing all input data.
         loss_name (str): The name of the loss function to use.
-        **kwargs: Additional keyword arguments to pass to the loss function.
 
     Returns:
         float: The computed loss.
@@ -49,9 +59,8 @@ def make_step(model, data, opt_state, optim, loss_name="mse", max_grad_norm=None
     Performs a single optimization step, updating the model parameters.
 
     Args:
-        model (LSTM): The LSTM model.
-        x tuple(jax.Array): The input data.
-        y (jax.Array): The target data with shape [batch_size, out_size].
+        model (equinox.Module): Equinox model that takes in single dict of data arrays
+        data (dict): Dictionary of batched data arrays for model input
         opt_state: The state of the optimizer.
         optim: The optimizer.
         max_grad_norm (float, optional): The maximum norm for clipping gradients. Defaults to None.
@@ -70,24 +79,7 @@ def make_step(model, data, opt_state, optim, loss_name="mse", max_grad_norm=None
     updates, opt_state = optim.update(grads, opt_state)
     model = eqx.apply_updates(model, updates)
     return loss, model, opt_state
-
-def lr_dict_scheduler(epoch, lr_dict):
-    """
-    Returns the learning rate for a given epoch based on a multi-step schedule.
-
-    Args:
-        epoch (int): The current epoch.
-        lr_dict (dict): A dictionary mapping epochs to learning rates.
-
-    Returns:
-        float: The learning rate for the given epoch.
-    """
-    current_lr = None
-    for milestone_epoch in sorted(lr_dict.keys(), reverse=True):
-        if epoch >= milestone_epoch:
-            current_lr = lr_dict[milestone_epoch]
-            break
-    return current_lr if current_lr is not None else lr_dict[0]
+    
 
 def clip_gradients(grads, max_norm):
     """

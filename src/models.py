@@ -8,37 +8,70 @@ import numpy as np
 
 
 class BaseLSTM(eqx.Module):
+    """
+    Base class for LSTM models in the Equinox framework.
+
+    Attributes:
+        hidden_size (int): Size of the hidden state.
+        cell (eqx.Module): LSTM cell module.
+        dense (eqx.nn.Linear or function): Linear layer for output transformation if `dense=True`,
+                                            otherwise a lambda function that returns its input.
+    """
     hidden_size: int
     cell: eqx.Module
-    linear: eqx.nn.Linear
+    dropout: eqx.nn.Dropout
+    dense: eqx.nn.Linear = None
 
-    def __init__(self, in_size, out_size, hidden_size, *, key):
+    def __init__(self, in_size, out_size, hidden_size, *, key, **kwargs):
+        """
+        Initializes the BaseLSTM model.
+    
+        Args:
+            in_size (int): Size of the input features.
+            out_size (int): Size of the output features.
+            hidden_size (int): Size of the hidden state in the LSTM cell.
+            key (jax.random.PRNGKey): Random key for parameter initialization.
+            dropout (float, default 0): Fraction of neurons to reset to 0 during training. 
+            dense (bool, default True): If True, a linear (dense) layer is added for output transformation.
+        """
+        dropout = kwargs.get('dropout', 0)
+        dense = kwargs.get('dense', True)
+        
+        ckey, lkey = jrandom.split(key,2)
         self.hidden_size = hidden_size
-        self.linear = eqx.nn.Linear(hidden_size, out_size, use_bias=True, key=key)
+        self.cell = eqx.nn.LSTMCell(in_size, hidden_size, key=ckey)
+        self.dropout = eqx.nn.Dropout(dropout)
+        if dense:
+            self.dense = eqx.nn.Linear(hidden_size, out_size, key=lkey)
 
     def __call__(self, data):
         raise NotImplementedError("Subclasses must implement this method.")
 
 
 class LSTM(BaseLSTM):
-    def __init__(self, in_size, out_size, hidden_size, *, key):
-        super().__init__(in_size, out_size, hidden_size, key=key)
-        ckey, _ = jrandom.split(key)
-        self.cell = eqx.nn.LSTMCell(in_size, hidden_size, key=ckey)
+    """
+    Standard LSTM model built on the BaseLSTM class.
+    """
+    def __init__(self, in_size, out_size, hidden_size, *, key, **kwargs):
+        super().__init__(in_size, out_size, hidden_size, key=key, **kwargs)
 
     def __call__(self, data):
         def scan_fn(state, xd):
             return self.cell(xd, state), None
         init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
-        (out, _), _ = jax.lax.scan(scan_fn, init_state, data['xd'])
-        return (self.linear(out))
+        (out, _), _ = jax.lax.scan(scan_fn, init_state, data['x_dd'])
+
+        if self.dense is not None:
+            out = self.dense(out)
+        return out
 
 
 class Gated_LSTM(BaseLSTM):
-    def __init__(self, in_size, out_size, hidden_size, *, key):
-        super().__init__(in_size, out_size, hidden_size, key=key)
-        ckey, _ = jrandom.split(key)
-        self.cell = eqx.nn.LSTMCell(in_size, hidden_size, key=ckey)
+    """
+    Gated LSTM model with an additional input gate to control information flow.
+    """
+    def __init__(self, in_size, out_size, hidden_size, *, key, **kwargs):
+        super().__init__(in_size, out_size, hidden_size, key=key, **kwargs)
 
     def __call__(self, data):
         def scan_fn(state, inputs):
@@ -49,20 +82,115 @@ class Gated_LSTM(BaseLSTM):
 
         init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
         (out, _), _ = jax.lax.scan(scan_fn, init_state, (data['xd'], data['w']))
-        return (self.linear(out))
+        
+        if self.dense is not None:
+            out = self.dense(out)
+        return out
 
+class EALSTMCell(eqx.Module):
+    """
+    Am Entity-Aware LSTM (TEALSTM) cell for processing time series data with
+    dynamic and static features. This cell modified the classic LSTM cell by:
+    1. Controlling the input gate with an array of static entity features.
 
+    Attributes:
+        weight_ih (jax.Array): Input weights for input, forget, and output gates.
+        weight_hh (jax.Array): Hidden weights for input, forget, and output gates.
+        bias (jax.Array): Bias terms for input, forget, and output gates.
+        input_linear (eqx.nn.Linear): Linear transformation for static input features.
+    """
+    weight_ih: jax.Array
+    weight_hh: jax.Array
+    bias: jax.Array
+    input_linear: eqx.nn.Linear
+    
+    def __init__(self, dynamic_input_size, static_input_size, out_size, hidden_size, *, key):
+        wkey, bkey, ikey, dkey = jrandom.split(key, 4)
+        self.weight_ih = jax.nn.initializers.glorot_normal()(wkey, (3 * hidden_size, dynamic_input_size))
+        self.weight_hh = jax.nn.initializers.glorot_normal()(wkey, (3 * hidden_size, hidden_size))
+        self.bias = jax.nn.initializers.zeros(bkey, (3 * hidden_size,))
+        self.input_linear = eqx.nn.Linear(static_input_size, hidden_size, use_bias=True, key=ikey)
+        
+    def __call__(self, state, x_d, i):
+        """
+        Forward pass of the TEALSTMCell module.
+
+        Args:
+            state (tuple): Tuple containing the hidden and cell states.
+            x_d (jax.Array): Dynamic input features.
+            i (jax.Array): Static feature input gate
+
+        Returns:
+            Tuple of updated hidden and cell states.
+        """
+        h_0, c_0 = state
+
+        # Compute the gates
+        gates = jnp.dot(x_d, self.weight_ih.T) + jnp.dot(h_0, self.weight_hh.T) + self.bias
+        f, g, o = jnp.split(gates, 3, axis=-1)
+        f = jax.nn.sigmoid(f)
+        g = jnp.tanh(g)
+        o = jax.nn.sigmoid(o)
+
+        # Update the state
+        c_1 = f * c_0 + i * g
+        h_1 = o * jnp.tanh(c_1)
+
+        #return state and 0 for skip_count
+        return (h_1, c_1)
+
+class EALSTM(BaseLSTM):
+    """
+    Entity-Aware LSTM (TEALSTM) model for processing time series data with dynamic and static features.
+
+    Uses a EALSTMCell and returns the hidden final hidden state.
+    """
+    def __init__(self, dynamic_in_size, static_in_size, out_size, hidden_size, *, key, **kwargs):
+        super().__init__(dynamic_in_size, out_size, hidden_size, key=key, **kwargs)
+        self.cell = EALSTMCell(dynamic_in_size, static_in_size, out_size, hidden_size, key=key)
+
+    def __call__(self, data):
+        """
+        Forward pass of the TEALSTM module.
+
+        Args:
+            data (dict): Contains at least these two key, values:
+                x_d (jax.Array): Dynamic input features.
+                x_s (jax.Array): Static input features.
+
+        Returns:
+            Output of the TEALSTM module and final skip count.
+        """
+        # Input gate is based on static watershed features
+        i = jax.nn.sigmoid(self.cell.input_linear(data['x_s']))
+        
+        def scan_fn(state, x_d):
+            new_state = self.cell(state, x_d, i)
+            return new_state, None
+
+        init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
+        (out, _), _ = jax.lax.scan(scan_fn, init_state, data['x_dd'])
+
+        if self.dense is not None:
+            out = self.dense(out)
+        return out
+
+        
 class TEALSTMCell(eqx.Module):
     """
-    A Time- and Entity-Aware LSTM (EALSTM) cell .
-    
+    A Time- and Entity-Aware LSTM (TEALSTM) cell for processing time series data with
+    dynamic and static features. This cell modified the classic LSTM cell by:
+    1. Controlling the input gate with an array of static entity features.
+    2. Skipping cell updates when the inputs are missing. When updating the cell, the
+        previous cell state is then decayed according to the number of skips.
+
     Attributes:
-        hidden_size (int): The size of the hidden state in the EALSTM cell.
-        input_size (int): The size of the input features.
-        weight_ih (jax.Array): Input weights for input, forget, cell, and output gates.
-        weight_hh (jax.Array): Hidden weights for input, forget, cell, and output gates.
-        bias (jax.Array): Bias terms for forget, cell, and output gates.
+        weight_ih (jax.Array): Input weights for input, forget, and output gates.
+        weight_hh (jax.Array): Hidden weights for input, forget, and output gates.
+        bias (jax.Array): Bias terms for input, forget, and output gates.
         input_linear (eqx.nn.Linear): Linear transformation for static input features.
+        weight_decomp (jax.Array): Weights for decomposing the cell state.
+        bias_decomp (jax.Array): Bias for decomposing the cell state.
     """
     weight_ih: jax.Array
     weight_hh: jax.Array
@@ -71,17 +199,7 @@ class TEALSTMCell(eqx.Module):
     weight_decomp: jax.Array
     bias_decomp: jax.Array
     
-    def __init__(self, dynamic_input_size, static_input_size, hidden_size, out_size, *, key):
-        """
-        Initializes the EALSTM cell.
-
-        Args:
-            dynamic_input_size (int): The size of the dynamic input features.
-            static_input_size (int): The size of the static input features.
-            hidden_size (int): The size of the hidden state in the EALSTM cell.
-            out_size (int): The size of the output features.
-            key (jax.random.PRNGKey): A random key for initializing the cell parameters.
-        """
+    def __init__(self, dynamic_input_size, static_input_size, out_size, hidden_size, *, key):
         wkey, bkey, ikey, dkey = jrandom.split(key, 4)
         self.weight_ih = jax.nn.initializers.glorot_normal()(wkey, (3 * hidden_size, dynamic_input_size))
         self.weight_hh = jax.nn.initializers.glorot_normal()(wkey, (3 * hidden_size, hidden_size))
@@ -104,7 +222,7 @@ class TEALSTMCell(eqx.Module):
         return state, skip_count
 
     def _update_cell(self, operand):
-        state, x_d, x_s, skip_count = operand
+        state, x_d, i, skip_count = operand
         h_0, c_0 = state
 
         # Apply time decay if we have skipped any updates.
@@ -114,7 +232,6 @@ class TEALSTMCell(eqx.Module):
                        operand=None)  # The operand is not used in the functions
 
         # Compute the gates
-        i = jax.nn.sigmoid(self.input_linear(x_s))  # Static input gate
         gates = jnp.dot(x_d, self.weight_ih.T) + jnp.dot(h_0, self.weight_hh.T) + self.bias
         f, g, o = jnp.split(gates, 3, axis=-1)
         f = jax.nn.sigmoid(f)
@@ -126,71 +243,115 @@ class TEALSTMCell(eqx.Module):
         h_1 = o * jnp.tanh(c_1)
 
         #return state and 0 for skip_count
-        return (h_1, c_1), 0
+        skip_count = 0
+        return (h_1, c_1), skip_count
         
-    def _is_input_nan(self, x_d):
-        # Create a dummy array with the same shape as x_d, filled with NaNs
-        nan_array = jnp.full_like(x_d, jnp.nan)
-        # Check if x_d is equal to the dummy NaN array
-        return jnp.all(jnp.isnan(x_d) == jnp.isnan(nan_array))
-        
-    def __call__(self, state, x_d, x_s, skip_count):
-        is_nan = jnp.isnan(x_d).any()
-        # is_nan = self._is_input_nan(x_d)
+    def __call__(self, state, x_d, i, skip_count):
+        """
+        Forward pass of the TEALSTMCell module.
+
+        Args:
+            state (tuple): Tuple containing the hidden and cell states.
+            x_d (jax.Array): Dynamic input features.
+            x_s (jax.Array): Static input features.
+            skip_count (int): Number of skipped updates due to missing data.
+
+        Returns:
+            Updated state and current skip count
+        """
+        is_nan = jnp.any(jnp.isnan(x_d))
 
         state = lax.cond(is_nan,
                          self._skip_update,
                          self._update_cell,
-                         operand=(state, x_d, x_s, skip_count))
+                         operand=(state, x_d, i, skip_count))
         
         return state
 
 
 class TEALSTM(BaseLSTM):
-    def __init__(self, dynamic_in_size, static_in_size, out_size, hidden_size, *, key):
-        lkey, ckey = jrandom.split(key)
-        super().__init__(dynamic_in_size, out_size, hidden_size, key=lkey)
-        self.cell = TEALSTMCell(dynamic_in_size, static_in_size, hidden_size, out_size, key=ckey)
+    """
+    Time- and Entity-Aware LSTM (TEALSTM) model for processing time series data with
+    dynamic and static features.
 
-    def __call__(self, x_d, x_s):
+    Uses a TEALSTMCell and returns the hidden final hidden state.
+    """
+    
+    def __init__(self, dynamic_in_size, static_in_size, out_size, hidden_size, *, key, **kwargs):
+        super().__init__(dynamic_in_size, out_size, hidden_size, key=key, **kwargs)
+        self.cell = TEALSTMCell(dynamic_in_size, static_in_size, out_size, hidden_size, key=key)
+
+    def __call__(self, data):
+        """
+        Forward pass of the TEALSTM module.
+
+        Args:
+            x_d (jax.Array): Dynamic input features.
+            x_s (jax.Array): Static input features.
+
+        Returns:
+            Output of the TEALSTM module and final skip count.
+        """
+        # Input gate is based on static watershed features
+        i = jax.nn.sigmoid(self.cell.input_linear(data['x_s']))
+        
         def scan_fn(state, x_d):
             skip_count = state[2]
-            new_state, skip_count = self.cell(state[:2], x_d, x_s, skip_count)
+            new_state, skip_count = self.cell(state[:2], x_d, i, skip_count)
             return (*new_state, skip_count), None
 
         init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size), 0)
-        (out, _, skip_count), _ = jax.lax.scan(scan_fn, init_state, x_d)
+        (out, _, skip_count), _ = jax.lax.scan(scan_fn, init_state, data['x_di'])
+
+        if self.dense is not None:
+            out = self.dense(out)
         return out, skip_count
 
 
 class TAPLSTM(eqx.Module):
     """
-    A Time-Attentitive Parallel LSTM model structure
-    """
-    tealstm_d: TEALSTM
-    tealstm_i: TEALSTM
-    attention_lambda: jnp.ndarray
-    linear: eqx.nn.Linear
+    Time-Attentive Parallel LSTM (TAPLSTM) model for processing daily and irregular time series data
+    with attention mechanism to combine outputs from both branches.
 
-    def __init__(self, daily_in_size, irregular_in_size, static_in_size, out_size, hidden_size, *, key):
-        dkey, ikey, lkey = jrandom.split(key, 3)
-        self.tealstm_d = TEALSTM(daily_in_size, static_in_size, out_size, hidden_size, key=dkey)
-        self.tealstm_i = TEALSTM(irregular_in_size, static_in_size, out_size, hidden_size, key=ikey)
-        self.attention_lambda = jnp.array([0.1])
-        self.linear = eqx.nn.Linear(hidden_size, out_size, use_bias=True, key=lkey)
+    Attributes:
+        tealstm_d (TEALSTM): TEALSTM model for daily time series data.
+        tealstm_i (TEALSTM): TEALSTM model for irregular time series data.
+        attention_lambda (jnp.ndarray): Attention decay parameter.
+        dense (eqx.nn.Linear): Linear layer for output transformation.
+        dropout (eqx.nn.Dropout): Optional dropout layer for entire model.
+    """
+    ealstm_d: EALSTM
+    tealstm_i: TEALSTM
+    attention_linear: eqx.nn.Linear
+    dense: eqx.nn.Linear
+    dropout: eqx.nn.Dropout
+
+    def __init__(self, daily_in_size, irregular_in_size, static_in_size, out_size, hidden_size, *, key, dropout):
+        dkey, ikey, akey, lkey = jrandom.split(key, 4)
+        self.ealstm_d = EALSTM(daily_in_size, static_in_size, out_size, hidden_size, key=dkey, dropout=0, dense=False)
+        self.tealstm_i = TEALSTM(irregular_in_size, static_in_size, out_size, hidden_size, key=ikey, dropout=0, dense=False)
+        self.attention_linear = eqx.nn.Linear(static_in_size, 1, use_bias=True, key=akey)
+        self.dense = eqx.nn.Linear(2 * hidden_size, out_size, use_bias=True, key=lkey)
+        self.dropout = eqx.nn.Dropout(dropout)
 
     def __call__(self, data):
-        d_out, _ = self.tealstm_d(data['x_dd'], data['x_s'])
-        i_out, dt = self.tealstm_i(data['x_di'], data['x_s'])
+        d_out = self.ealstm_d(data)
+        i_out, dt = self.tealstm_i(data)
 
-        # Combine the outputs from both LSTM branches using attention
-        a_i = jnp.exp(-self.attention_lambda * dt)
+        # Compute the attention decay parameter based on static features
+        attention_lambda = jax.nn.relu(self.attention_linear(data['x_s']))
+        # Compute the attention weights
+        a_i = jnp.exp(-attention_lambda * dt)
         a_d = jnp.ones_like(a_i)
-        a_normalized = jax.nn.softmax(jnp.stack([a_d, a_i], axis=-1), axis=-1)
+    
+        # Apply the attention weights to the outputs from both LSTM branches
+        weighted_d_out = a_i * d_out
+        weighted_i_out = a_d * i_out
 
-        combined_outs = a_normalized[..., 0] * d_out + a_normalized[..., 1] * i_out
+        # Concatenate the weighted outputs and pass through the final linear layer
+        final_out = self.dense(jnp.concatenate([weighted_d_out, weighted_i_out], axis=-1))
 
-        return self.linear(combined_outs)
+        return final_out
 
 
 

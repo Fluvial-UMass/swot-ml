@@ -1,8 +1,12 @@
+data/
+
 # OSX / *nix default autosave extension
 *.m~
 =======
 #OSX
 *.DS_Store
+
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
