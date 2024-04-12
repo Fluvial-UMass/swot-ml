@@ -10,6 +10,8 @@ import xarray as xr
 from pathlib import Path
 from tqdm.notebook import tqdm
 
+from concurrent.futures import ThreadPoolExecutor
+
 class DataLoader:
     """
     DataLoader class for loading and preprocessing hydrological time series data.
@@ -170,8 +172,7 @@ class DataLoader:
                 test_ids = {basin: self.test_ids[basin] for basin in self.basin_subset}
             else:
                 test_ids = self.test_ids
-            basin_index_pairs = [(basin, date) for basin, dates in test_ids.items() for date in dates]
-            
+            basin_index_pairs = [(basin, date) for basin, dates in test_ids.items() for date in dates]  
 
         def init_batch_dict():
             batch = {'x_dd': [],
@@ -179,7 +180,7 @@ class DataLoader:
                      'x_s': [],
                      'y': []}
             return batch
-          
+
         def stack_batch_dict(batch):
             # Stack the lists of arrays
             for key, value in batch.items():
@@ -188,34 +189,41 @@ class DataLoader:
             batch = jutil.tree_map(lambda x: jax.device_put(x, self.named_sharding), batch)
             return batch
 
-        basins = []
-        dates = []
-        batch = init_batch_dict()
-        for basin, date in basin_index_pairs:
-            basins.append(basin)
-            dates.append(date)
+        def get_batch_slice(basin_date_tuple):
+            basin, date = basin_date_tuple
             sequence_dates = self.date_ranges[date]
-            batch['x_dd'].append(self.x_d.sel(basin=basin, date=sequence_dates)[self.daily_features].to_array().values.T)
-            batch['x_di'].append(self.x_d.sel(basin=basin, date=sequence_dates)[self.irregular_features].to_array().values.T)
-            batch['x_s'].append(self.x_s[basin])
-            batch['y'].append(self.x_d.sel(basin=basin, date=sequence_dates)[self.target].values)
-            
-            if len(batch['x_dd']) == self.batch_size:
-                yield (basins, dates, stack_batch_dict(batch))
+            return (basin,
+                    date,
+                    self.x_d.sel(basin=basin, date=sequence_dates)[self.daily_features].to_array().values.T,
+                    self.x_d.sel(basin=basin, date=sequence_dates)[self.irregular_features].to_array().values.T,
+                    self.x_s[basin],
+                    self.x_d.sel(basin=basin, date=sequence_dates)[self.target].values)
+
+        batch_chunks = _chunk_list(basin_index_pairs, self.batch_size)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            for chunk in batch_chunks:
+                futures = [executor.submit(get_batch_slice, bd) for bd in chunk]
+                basins, dates = [], []
                 batch = init_batch_dict()
-                basins = []
-                dates = []
-                
-        # Yield the final batch, with padding if necessary
-        final_batch_size = len(basins)
-        if final_batch_size > 0:
-            if final_batch_size % self.num_devices != 0:
-                pad_count = self.num_devices - (final_batch_size % self.num_devices)
-                for key in batch.keys():
-                    batch[key] += [batch[key][-1]] * pad_count
-                basins += [basins[-1]] * pad_count
-                dates += [dates[-1]] * pad_count
-            yield (basins, dates, stack_batch_dict(batch))
+                for future in futures:
+                    basin, date, x_dd, x_di, x_s, y = future.result()
+                    basins.append(basin)
+                    dates.append(date)
+                    batch['x_dd'].append(x_dd)
+                    batch['x_di'].append(x_di)
+                    batch['x_s'].append(x_s)
+                    batch['y'].append(y)
+                    
+                # Check and pad the final batch if necessary before yielding
+                final_batch_size = len(basins)
+                if final_batch_size % self.num_devices != 0:
+                    pad_count = self.num_devices - (final_batch_size % self.num_devices)
+                    for key in batch.keys():
+                        batch[key] += [batch[key][-1]] * pad_count
+                    basins += [basins[-1]] * pad_count
+                    dates += [dates[-1]] * pad_count
+                    
+                yield (basins, dates, stack_batch_dict(batch))
 
     def _normalize_data(self):
         """
@@ -299,6 +307,13 @@ class DataLoader:
         mesh = jshard.Mesh(devices, ('batch',))
         pspec = jshard.PartitionSpec('batch',)
         self.named_sharding = jshard.NamedSharding(mesh, pspec)
+
+
+def _chunk_list(l, n):
+    """Yield successive n-sized chunks from l."""
+    for i in range(0, len(l), n):
+        yield l[i:i + n]
+
 
 def _get_available_devices():
     devices = {}
