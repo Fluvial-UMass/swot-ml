@@ -41,7 +41,8 @@ class DataLoader:
                  discharge_col: str = None,
                  log_norm_cols: list = [],
                  range_norm_cols: list = [],
-                 num_devices: int = 0):
+                 num_devices: int = 0,
+                 backend: str = None):
 
         # Validate the feature dict
         if not isinstance(features_dict.get('daily'), list):
@@ -58,7 +59,7 @@ class DataLoader:
         self.log_norm_cols = log_norm_cols
         self.range_norm_cols = range_norm_cols
 
-        self.update_sharding(num_devices)
+        self.update_sharding(num_devices, backend)
         
         self.all_features =  [value for sublist in features_dict.values() for value in sublist] # Unpack all features
         self.daily_features = features_dict['daily']
@@ -75,6 +76,7 @@ class DataLoader:
         self.x_s = self._load_attributes()
         self.x_d = self._load_basin_data()
         self.scale = self._normalize_data()
+        self.date_ranges = self._precompute_date_ranges()
 
     def __len__(self):
         """
@@ -139,8 +141,11 @@ class DataLoader:
                 raise KeyError(f"Basin '{basin}' not found in attributes DataFrame.")
             x_s[basin] = attributes_df.loc[basin].values
         return x_s
- 
     
+    def _precompute_date_ranges(self):
+        unique_dates = self.x_d['date'].values
+        return {date: pd.date_range(end=date, periods=self.sequence_length, freq='D').values for date in unique_dates}
+ 
     def __iter__(self):
         """
         Iterator for generating batches of data.
@@ -180,8 +185,7 @@ class DataLoader:
             for key, value in batch.items():
                 batch[key] = jnp.stack(value)
             # Shard the arrays 
-            if self.num_devices > 1:
-                batch = jutil.tree_map(lambda x: jax.device_put(x, self.named_sharding), batch)
+            batch = jutil.tree_map(lambda x: jax.device_put(x, self.named_sharding), batch)
             return batch
 
         basins = []
@@ -190,7 +194,7 @@ class DataLoader:
         for basin, date in basin_index_pairs:
             basins.append(basin)
             dates.append(date)
-            sequence_dates = pd.date_range(end=date, periods=self.sequence_length, freq='D').values
+            sequence_dates = self.date_ranges[date]
             batch['x_dd'].append(self.x_d.sel(basin=basin, date=sequence_dates)[self.daily_features].to_array().values.T)
             batch['x_di'].append(self.x_d.sel(basin=basin, date=sequence_dates)[self.irregular_features].to_array().values.T)
             batch['x_s'].append(self.x_s[basin])
@@ -269,24 +273,42 @@ class DataLoader:
             return y_normalized * scale + offset
         
         
-    def update_sharding(self, num_devices=0):
-        num_devices_available = jax.local_device_count()
-        if num_devices > num_devices_available:
-            raise ValueError(f"num_devices cannot be greater than available devices: {num_devices_available}")
+    def update_sharding(self, num_devices=0, backend=None):
+        available_devices = _get_available_devices()
+        # Validate the requested backend
+        if backend is None:
+            backend = 'cpu'
+            if 'gpu' in available_devices.keys():
+                backend = 'gpu'
+        elif backend not in available_devices.keys():
+            raise ValueError(f"requested backend ({backend}) not in available list: ({available_devices})")
+
+        # Validate the requested number of devices.
+        if num_devices > available_devices[backend]:
+            raise ValueError(f"requested devices ({backend}: {num_devices}) cannot be greater than available backend devices: {available_devices}")
         elif num_devices == 0:
-            self.num_devices = num_devices_available
+            self.num_devices = available_devices[backend]
         else:
             self.num_devices = num_devices
-        
+
         if self.batch_size % self.num_devices != 0:
             raise ValueError(f"batch_size ({self.batch_size}) must be a multiple of the num_devices ({self.num_devices}).")
-            
-        if self.num_devices > 1:
-            devices = jax.local_devices()[:self.num_devices]
-            mesh = jshard.Mesh(devices, ('batch',))
-            pspec = jshard.PartitionSpec('batch',)
-            self.named_sharding = jshard.NamedSharding(mesh, pspec)
 
+        print(f"Batch loading set to {self.num_devices} {backend}(s)")
+        devices = jax.local_devices(backend=backend)[:self.num_devices]
+        mesh = jshard.Mesh(devices, ('batch',))
+        pspec = jshard.PartitionSpec('batch',)
+        self.named_sharding = jshard.NamedSharding(mesh, pspec)
+
+def _get_available_devices():
+    devices = {}
+    for backend in ['cpu', 'gpu', 'tpu']:
+        try:
+            n = jax.local_device_count(backend=backend)
+            devices[backend] = n
+        except RuntimeError:
+            pass   
+    return devices
 
 def _distance_to_closest_obs(arr):
     nan_mask = np.isnan(arr)
@@ -309,12 +331,3 @@ def _fill_nan_obs(arr):
                                             np.flatnonzero(~is_nan),
                                             arr[~is_nan,feature_idx])
     return arr
-
-
- 
-
-
-
-
-
-

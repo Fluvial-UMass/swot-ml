@@ -144,47 +144,44 @@ def start_training(model, dataloader, lr_schedule, num_epochs, *,
     current_date = datetime.now().strftime("%Y%m%d_%H%M")
     log_dir = Path(f"../logs/{current_date}") 
     log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / "training_errors.log"
-    logging.basicConfig(filename=log_file, level=logging.ERROR)
+    log_file = log_dir / "training.log"
+    logging.basicConfig(filename=log_file, filemode='a', level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s')
     
     # Initialize optimizer 
     optim = optax.adam(lr_schedule(start_epoch))
     if opt_state is None:
         opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
-    
+
+    error_count = 0
     loss_list = []
     dataloader.train = True
     for epoch in range(start_epoch, num_epochs):
         current_lr = lr_schedule(epoch)
         optim = optax.adam(current_lr)
-        error_count = 0
         total_loss = 0
         num_batches = 0
         pbar = tqdm(dataloader, desc=f"Epoch:{epoch} LR:{current_lr:0.4f}")
-        for basins, _, batch in pbar: 
+        for basins, dates, batch in pbar: 
             try:
-                loss, model, opt_state = make_step(model, 
-                                                   batch, 
-                                                   opt_state, 
-                                                   optim,
-                                                   **kwargs)
-
+                loss, model, opt_state = make_step(model, batch, opt_state, optim, **kwargs)
                 total_loss += loss
                 num_batches += 1
                 pbar.set_postfix_str(f"Loss: {total_loss/num_batches:.4f}")
-                
             except Exception as e:
                 error_data = {"epoch": epoch,
+                              "basins": basins,
+                              "dates": dates,
                               "batch": batch,
-                              "error_count": error_count,
-                              "model_state": eqx.filter(model, eqx.is_inexact_array),
+                              "model_state": model,
                               "opt_state": opt_state}
-                
                 error_file = log_dir / f"error{error_count}_data.pkl"
                 with open(error_file, "wb") as f:
                     pickle.dump(error_data, f)
-                logging.error(f"Model broke in epoch {epoch}! Logged data and states to {error_file}", exc_info=True)
-                print(f"Model broke in epoch {epoch}! Logged data and states to {error_file}")
+                logging.error(f"Model step error: {str(e)}. Error data saved to {error_file}", exc_info=True)
+                print(f"Model exception! Logged batch data and states to {error_file}")
+                error_count += 1
+                
 
         current_loss = total_loss / num_batches
         loss_list.append(current_loss)
@@ -192,9 +189,10 @@ def start_training(model, dataloader, lr_schedule, num_epochs, *,
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logging.info(f"Time: {now}, Epoch: {epoch}, Loss: {current_loss:.4f}")
         
-        # Save model state at end of Epoch
-        model_state_file = log_dir / f"model_state_epoch{epoch}.pkl"
-        with open(model_state_file, "wb") as f:
-            pickle.dump(model, f)
+        # Save model state every 5 Epochs
+        if (epoch % 5 == 0):
+            model_state_file = log_dir / f"model_state_epoch{epoch}.pkl"
+            with open(model_state_file, "wb") as f:
+                pickle.dump(model, f)
 
     return model
