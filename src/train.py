@@ -1,10 +1,17 @@
 import equinox as eqx
 import optax
 import jax
-import jax.lax as lax
 import jax.numpy as jnp
-import jax.random as jrandom
+import jax.tree_util as jutil
 import numpy as np
+from functools import partial
+from tqdm.notebook import trange, tqdm
+import logging
+import pickle
+from pathlib import Path
+from datetime import datetime
+
+
 
 def mse_loss(y, y_pred):
     mse = jnp.mean(jnp.square(y[:,-1] - y_pred[:,-1]))
@@ -52,8 +59,41 @@ def compute_loss(model, data, loss_name):
         return if_mse_loss(data['y'], y_pred, data['x_dd'][:,-1])
     else:
         raise ValueError("Invalid loss function name.")
+       
+    
+def clip_gradients(grads, max_norm):
+    """
+    Clip gradients to prevent them from exceeding a maximum norm.
 
-@eqx.filter_jit
+    Args:
+        grads (jax.grad): The gradients to be clipped.
+        max_norm (float): The maximum norm for clipping.
+        
+    Returns:
+        jax.grad: The clipped gradients.
+    """
+    total_norm = jutil.tree_reduce(lambda x, y: x + y, jutil.tree_map(lambda x: jnp.sum(x ** 2), grads))
+    total_norm = jnp.sqrt(total_norm)
+    scale = jnp.minimum(max_norm / total_norm, 1.0)
+    return jax.tree_map(lambda g: scale * g, grads)
+
+
+def l2_regularization(model, weight_decay):
+    """
+    Computes the L2 regularization term for a pytree model.
+
+    Args:
+        model: A pytree model where tunable parameters are inexact arrays
+        weight_decay (float): The weight decay coefficient (lambda) for L2 regularization.
+
+    Returns:
+        float: The L2 regularization term.
+    """
+    params = eqx.filter(model, eqx.is_inexact_array)
+    sum_l2 = jutil.tree_reduce(lambda x, y: x + jnp.sum(jnp.square(y)), params, 0)
+    return 0.5 * weight_decay * sum_l2
+
+@eqx.filter_jit    
 def make_step(model, data, opt_state, optim, loss_name="mse", max_grad_norm=None, l2_weight=None):
     """
     Performs a single optimization step, updating the model parameters.
@@ -79,38 +119,82 @@ def make_step(model, data, opt_state, optim, loss_name="mse", max_grad_norm=None
     updates, opt_state = optim.update(grads, opt_state)
     model = eqx.apply_updates(model, updates)
     return loss, model, opt_state
+
+
+def start_training(model, dataloader, lr_schedule, num_epochs, *,
+                   start_epoch=1, 
+                   opt_state=None, 
+                   **kwargs):
+    """
+    Starts or continues the training of a given model.
+
+    Args:
+        model (eqx.Module): The model to be trained.
+        dataloader (iterable): An iterable that provides batches of data.
+        lr_schedule (function): A function that takes an epoch index and returns the learning rate.
+        num_epochs (int): The number of epochs to train for.
+        start_epoch (int, optional): The epoch index to start training from. Defaults to 0.
+        opt_state (optax.OptState, optional): Optional initial state of the optimizer.
+        **kwargs: Additional keyword arguments passed to the `make_step` function.
+
+    Returns:
+        eqx.Module: The trained model.
+    """
+    # Set up logging
+    current_date = datetime.now().strftime("%Y%m%d_%H%M")
+    log_dir = Path(f"../logs/{current_date}") 
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / "training_errors.log"
+    logging.basicConfig(filename=log_file, level=logging.ERROR)
     
+    # Initialize optimizer 
+    optim = optax.adam(lr_schedule(start_epoch))
+    if opt_state is None:
+        opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
+    
+    loss_list = []
+    dataloader.train = True
+    for epoch in range(start_epoch, num_epochs):
+        current_lr = lr_schedule(epoch)
+        optim = optax.adam(current_lr)
+        error_count = 0
+        total_loss = 0
+        num_batches = 0
+        pbar = tqdm(dataloader, desc=f"Epoch:{epoch} LR:{current_lr:0.4f}")
+        for basins, _, batch in pbar: 
+            try:
+                loss, model, opt_state = make_step(model, 
+                                                   batch, 
+                                                   opt_state, 
+                                                   optim,
+                                                   **kwargs)
 
-def clip_gradients(grads, max_norm):
-    """
-    Clip gradients to prevent them from exceeding a maximum norm.
+                total_loss += loss
+                num_batches += 1
+                pbar.set_postfix_str(f"Loss: {total_loss/num_batches:.4f}")
+                
+            except Exception as e:
+                error_data = {"epoch": epoch,
+                              "batch": batch,
+                              "error_count": error_count,
+                              "model_state": eqx.filter(model, eqx.is_inexact_array),
+                              "opt_state": opt_state}
+                
+                error_file = log_dir / f"error{error_count}_data.pkl"
+                with open(error_file, "wb") as f:
+                    pickle.dump(error_data, f)
+                logging.error(f"Model broke in epoch {epoch}! Logged data and states to {error_file}", exc_info=True)
+                print(f"Model broke in epoch {epoch}! Logged data and states to {error_file}")
 
-    Args:
-        grads (jax.grad): The gradients to be clipped.
-        max_norm (float): The maximum norm for clipping.
+        current_loss = total_loss / num_batches
+        loss_list.append(current_loss)
         
-    Returns:
-        jax.grad: The clipped gradients.
-    """
-    total_norm = jax.tree_util.tree_reduce(lambda x, y: x + y, jax.tree_util.tree_map(lambda x: jnp.sum(x ** 2), grads))
-    total_norm = jnp.sqrt(total_norm)
-    scale = jnp.minimum(max_norm / total_norm, 1.0)
-    return jax.tree_map(lambda g: scale * g, grads)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logging.info(f"Time: {now}, Epoch: {epoch}, Loss: {current_loss:.4f}")
+        
+        # Save model state at end of Epoch
+        model_state_file = log_dir / f"model_state_epoch{epoch}.pkl"
+        with open(model_state_file, "wb") as f:
+            pickle.dump(model, f)
 
-
-def l2_regularization(model, weight_decay):
-    """
-    Computes the L2 regularization term for a pytree model.
-
-    Args:
-        model: A pytree model where tunable parameters are inexact arrays
-        weight_decay (float): The weight decay coefficient (lambda) for L2 regularization.
-
-    Returns:
-        float: The L2 regularization term.
-    """
-    params = eqx.filter(model, eqx.is_inexact_array)
-    sum_l2 = jax.tree_util.tree_reduce(lambda x, y: x + jnp.sum(jnp.square(y)), params, 0)
-    return 0.5 * weight_decay * sum_l2
-
-
+    return model

@@ -1,10 +1,14 @@
 import os
 import pandas as pd
 import numpy as np
+import jax
 import jax.numpy as jnp
+import jax.tree_util as jutil
+import jax.sharding as jshard
 from scipy.ndimage import distance_transform_edt
 import xarray as xr
 from pathlib import Path
+from tqdm.notebook import tqdm
 
 class DataLoader:
     """
@@ -36,7 +40,8 @@ class DataLoader:
                  train: bool = True,
                  discharge_col: str = None,
                  log_norm_cols: list = [],
-                 range_norm_cols: list = []):
+                 range_norm_cols: list = [],
+                 num_devices: int = 0):
 
         # Validate the feature dict
         if not isinstance(features_dict.get('daily'), list):
@@ -53,6 +58,8 @@ class DataLoader:
         self.log_norm_cols = log_norm_cols
         self.range_norm_cols = range_norm_cols
 
+        self.update_sharding(num_devices)
+        
         self.all_features =  [value for sublist in features_dict.values() for value in sublist] # Unpack all features
         self.daily_features = features_dict['daily']
         self.discharge_idx = features_dict['daily'].index(discharge_col)
@@ -60,6 +67,7 @@ class DataLoader:
 
         self.log_pad = 0.001
         self.basin_subset = []
+        
         
         self.train_ids = {}
         self.test_ids = {}
@@ -87,7 +95,7 @@ class DataLoader:
         self.n_train_samples = 0
         self.n_test_samples = 0
         ds_list = []
-        for basin in self.basins:
+        for basin in tqdm(self.basins, desc="Loading Basins"):
             file_path = f"{self.data_dir}/time_series/{basin}.nc"
             ds = xr.open_dataset(file_path).sel(date=self.time_slice)
             ds['date'] = ds['date'].astype('datetime64[ns]')
@@ -152,8 +160,8 @@ class DataLoader:
             basin_index_pairs = [(basin, date) for basin, dates in self.train_ids.items() for date in dates]
             np.random.shuffle(basin_index_pairs)
         else:
+            # If a non-empty subset list exists, we will only generate batches for those basins.
             if self.basin_subset:
-                # If a non-empty list exists, we will only generate batches for those basins.
                 test_ids = {basin: self.test_ids[basin] for basin in self.basin_subset}
             else:
                 test_ids = self.test_ids
@@ -166,10 +174,14 @@ class DataLoader:
                      'x_s': [],
                      'y': []}
             return batch
-
+          
         def stack_batch_dict(batch):
+            # Stack the lists of arrays
             for key, value in batch.items():
                 batch[key] = jnp.stack(value)
+            # Shard the arrays 
+            if self.num_devices > 1:
+                batch = jutil.tree_map(lambda x: jax.device_put(x, self.named_sharding), batch)
             return batch
 
         basins = []
@@ -189,9 +201,16 @@ class DataLoader:
                 batch = init_batch_dict()
                 basins = []
                 dates = []
-                    
-        #Yield the final partial batch 
-        if len(batch['x_dd'])>0:
+                
+        # Yield the final batch, with padding if necessary
+        final_batch_size = len(basins)
+        if final_batch_size > 0:
+            if final_batch_size % self.num_devices != 0:
+                pad_count = self.num_devices - (final_batch_size % self.num_devices)
+                for key in batch.keys():
+                    batch[key] += [batch[key][-1]] * pad_count
+                basins += [basins[-1]] * pad_count
+                dates += [dates[-1]] * pad_count
             yield (basins, dates, stack_batch_dict(batch))
 
     def _normalize_data(self):
@@ -248,6 +267,25 @@ class DataLoader:
             return np.exp(y_normalized) - self.log_pad
         else:
             return y_normalized * scale + offset
+        
+        
+    def update_sharding(self, num_devices=0):
+        num_devices_available = jax.local_device_count()
+        if num_devices > num_devices_available:
+            raise ValueError(f"num_devices cannot be greater than available devices: {num_devices_available}")
+        elif num_devices == 0:
+            self.num_devices = num_devices_available
+        else:
+            self.num_devices = num_devices
+        
+        if self.batch_size % self.num_devices != 0:
+            raise ValueError(f"batch_size ({self.batch_size}) must be a multiple of the num_devices ({self.num_devices}).")
+            
+        if self.num_devices > 1:
+            devices = jax.local_devices()[:self.num_devices]
+            mesh = jshard.Mesh(devices, ('batch',))
+            pspec = jshard.PartitionSpec('batch',)
+            self.named_sharding = jshard.NamedSharding(mesh, pspec)
 
 
 def _distance_to_closest_obs(arr):

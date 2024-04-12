@@ -1,0 +1,15 @@
+jax
+equinox
+notebook
+optax
+ipython
+matplotlib
+pandas
+pyarrow
+xarray
+netcdf4
+ipympl
+tqdm
+tensorflow
+tensorboard
+geopandas
