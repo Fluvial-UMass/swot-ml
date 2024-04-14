@@ -1,18 +1,88 @@
 import os
+from pathlib import Path
+from tqdm.notebook import tqdm
 import pandas as pd
+import xarray as xr
 import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jutil
 import jax.sharding as jshard
-from scipy.ndimage import distance_transform_edt
-import xarray as xr
-from pathlib import Path
-from tqdm.notebook import tqdm
+from torch.utils.data import Dataset, DataLoader
 
-from concurrent.futures import ThreadPoolExecutor
+class TAPDataLoader(DataLoader):
+    def __init__(self, **kwargs):
+        dataset = kwargs.get('dataset', TAPDataset(**kwargs))
+        super().__init__(dataset,
+                         collate_fn=self.collate_batch,
+                         shuffle=kwargs.get('suffle', True),
+                         batch_size=kwargs.get('batch_size', 1),
+                         num_workers=kwargs.get('num_workers', 1),
+                         pin_memory=kwargs.get('pin_memory', True),
+                         persistent_workers=kwargs.get('peristent_workers',True))
+        
+        print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 
-class DataLoader:
+        backend = kwargs.get('backend', None)
+        num_devices = kwargs.get('num_devices', None)
+        self.set_jax_sharding(backend, num_devices)
+
+    @staticmethod
+    def collate_batch(sample):
+        """Collates sample data into batched data."""
+        basin = [item['basin'] for item in sample]
+        date = [item['date'] for item in sample]
+        x_dd = jnp.stack([item['x_dd'] for item in sample])
+        x_di = jnp.stack([item['x_di'] for item in sample])
+        x_s = jnp.stack([item['x_s'] for item in sample])
+        y = jnp.stack([item['y'] for item in sample])
+        batch = {'x_dd':x_dd, 'x_di':x_di, 'x_s':x_s, 'y': y}
+        return basin, date, batch
+
+    def set_mode(self, *, train, shuffle=None, basin_subset=None):
+        self.train = train
+        self.shuffle = train if shuffle is None else shuffle
+        self.dataset.update_indices(train, basin_subset)
+    
+    def set_jax_sharding(self, backend=None, num_devices=None):
+        """
+        Updates the jax device sharding of data. 
+    
+        Args:
+        backend (str): XLA backend to use (cpu, gpu, or tpu). If None is passed, select GPU if available.
+        num_devices (int): Number of devices to use. If None is passed, use all available devices for 'backend'.
+        """
+        available_devices = _get_available_devices()
+        # Default use GPU if available
+        if backend is None:
+            backend = 'gpu' if 'gpu' in available_devices.keys() else 'cpu'
+        else:
+            backend = backend.lower()
+        
+        # Validate the requested number of devices. 
+        if num_devices is None:
+            self.num_devices = available_devices[backend]
+        elif num_devices > available_devices[backend]:
+            raise ValueError(f"requested devices ({backend}: {num_devices}) cannot be greater than available backend devices: {available_devices}.")
+        elif num_devices <= 0:
+            raise ValueError(f"num_devices {num_devices} cannot be <= 0.")
+        else:
+            self.num_devices = num_devices
+    
+        if self.batch_size % self.num_devices != 0:
+            raise ValueError(f"batch_size ({self.batch_size}) must be a multiple of the num_devices ({self.num_devices}).")
+    
+        print(f"Batch sharding set to {self.num_devices} {backend}(s)")
+        devices = jax.local_devices(backend=backend)[:self.num_devices]
+        mesh = jshard.Mesh(devices, ('batch',))
+        pspec = jshard.PartitionSpec('batch',)
+        self.sharding = jshard.NamedSharding(mesh, pspec)
+
+    def shard_batch(self, batch):
+        batch = jutil.tree_map(lambda x: jax.device_put(x, self.sharding), batch)
+        return batch
+
+class TAPDataset(Dataset):
     """
     DataLoader class for loading and preprocessing hydrological time series data.
 
@@ -32,7 +102,7 @@ class DataLoader:
     """
     def __init__(self, *,
                  data_dir: Path, 
-                 basins: list,
+                 basin_list: list,
                  features_dict: dict,
                  target: str,
                  time_slice: slice,
@@ -44,24 +114,24 @@ class DataLoader:
                  log_norm_cols: list = [],
                  range_norm_cols: list = [],
                  num_devices: int = 0,
-                 backend: str = None):
+                 backend: str = None,
+                 **kwargs):
 
         # Validate the feature dict
         if not isinstance(features_dict.get('daily'), list):
             raise ValueError("features_dict must contain a list of daily features at a minimum.")
 
         self.data_dir = data_dir
-        self.basins = basins
+        self.basins = basin_list
         self.target = target
         self.time_slice = time_slice
         self.split_time = split_time
-        self.batch_size = batch_size
         self.sequence_length = sequence_length
         self.train = train
         self.log_norm_cols = log_norm_cols
         self.range_norm_cols = range_norm_cols
 
-        self.update_sharding(num_devices, backend)
+        # self.update_sharding(backend, num_devices)
         
         self.all_features =  [value for sublist in features_dict.values() for value in sublist] # Unpack all features
         self.daily_features = features_dict['daily']
@@ -69,8 +139,6 @@ class DataLoader:
         self.irregular_features = features_dict.get('irregular') # is None if key doesn't exist. 
 
         self.log_pad = 0.001
-        self.basin_subset = []
-        
         
         self.train_ids = {}
         self.test_ids = {}
@@ -80,14 +148,13 @@ class DataLoader:
         self.scale = self._normalize_data()
         self.date_ranges = self._precompute_date_ranges()
 
+        self.update_indices(train, basin_list)
+
     def __len__(self):
         """
-        Returns the number of batches in the dataset.
+        Returns the number of valid sequences in the dataset.
         """
-        if self.train:
-            return (self.n_train_samples + self.batch_size - 1) // self.batch_size
-        else: 
-            return (self.n_test_samples + self.batch_size - 1) // self.batch_size
+        return len(self.basin_index_pairs)
     
     def _load_basin_data(self):
         """
@@ -96,8 +163,6 @@ class DataLoader:
         Returns:
             xr.Dataset: An xarray dataset of time series data with time and basin coordinates.
         """
-        self.n_train_samples = 0
-        self.n_test_samples = 0
         ds_list = []
         for basin in tqdm(self.basins, desc="Loading Basins"):
             file_path = f"{self.data_dir}/time_series/{basin}.nc"
@@ -110,15 +175,13 @@ class DataLoader:
             # Create dict of train and test dates
             min_train_date = (np.datetime64(self.time_slice.start) +
                               np.timedelta64(self.sequence_length, 'D'))  # Minimum date for training data
-            train_mask = ((ds['date'] >= min_train_date) & (ds['date'] < self.split_time) & (~np.isnan(ds[self.target])))
+            train_mask = (ds['date'] >= min_train_date) & (ds['date'] < self.split_time) & (~np.isnan(ds[self.target]))
             train_dates = ds['date'][train_mask].values
             self.train_ids[basin] = train_dates
-            self.n_train_samples += len(train_dates)
     
             test_mask = ds['date'] >= self.split_time
             test_dates = ds['date'][test_mask].values
             self.test_ids[basin] = test_dates
-            self.n_test_samples += len(test_dates)
     
             ds = ds.assign_coords({'basin': basin})
             ds_list.append(ds)
@@ -146,84 +209,22 @@ class DataLoader:
     
     def _precompute_date_ranges(self):
         unique_dates = self.x_d['date'].values
-        return {date: pd.date_range(end=date, periods=self.sequence_length, freq='D').values for date in unique_dates}
- 
-    def __iter__(self):
-        """
-        Iterator for generating batches of data.
+        date_ranges = {date: pd.date_range(end=date, periods=self.sequence_length, freq='D').values for date in unique_dates}
+        return date_ranges
 
-        Yields:
-            tuple: A tuple containing three elements:
-                - list of basins: List of basin identifiers for each sample in the batch.
-                - list of dates: List of dates corresponding to each sample in the batch.
-                - dict: A dictionary containing the batch of data with keys 
-                        'x_dd' (daily data)
-                        'x_di' (irregular data)
-                        'y' (target variable)
-                        'x_s' (static attributes).
-        """
-        # Create a list of (basin, index) pairs
-        if self.train:
-            basin_index_pairs = [(basin, date) for basin, dates in self.train_ids.items() for date in dates]
-            np.random.shuffle(basin_index_pairs)
-        else:
-            # If a non-empty subset list exists, we will only generate batches for those basins.
-            if self.basin_subset:
-                test_ids = {basin: self.test_ids[basin] for basin in self.basin_subset}
-            else:
-                test_ids = self.test_ids
-            basin_index_pairs = [(basin, date) for basin, dates in test_ids.items() for date in dates]  
+    def __getitem__(self, idx):
+        """Generate one batch of data."""
+        basin, date = self.basin_index_pairs[idx]
+        
+        sequence_dates = self.date_ranges[date]
+        x_dd = self.x_d.sel(basin=basin, date=sequence_dates)[self.daily_features].to_array().values.T
+        x_di = self.x_d.sel(basin=basin, date=sequence_dates)[self.irregular_features].to_array().values.T
+        x_s = self.x_s[basin]
+        y = self.x_d.sel(basin=basin, date=sequence_dates)[self.target].values
 
-        def init_batch_dict():
-            batch = {'x_dd': [],
-                     'x_di': [],
-                     'x_s': [],
-                     'y': []}
-            return batch
-
-        def stack_batch_dict(batch):
-            # Stack the lists of arrays
-            for key, value in batch.items():
-                batch[key] = jnp.stack(value)
-            # Shard the arrays 
-            batch = jutil.tree_map(lambda x: jax.device_put(x, self.named_sharding), batch)
-            return batch
-
-        def get_batch_slice(basin_date_tuple):
-            basin, date = basin_date_tuple
-            sequence_dates = self.date_ranges[date]
-            return (basin,
-                    date,
-                    self.x_d.sel(basin=basin, date=sequence_dates)[self.daily_features].to_array().values.T,
-                    self.x_d.sel(basin=basin, date=sequence_dates)[self.irregular_features].to_array().values.T,
-                    self.x_s[basin],
-                    self.x_d.sel(basin=basin, date=sequence_dates)[self.target].values)
-
-        batch_chunks = _chunk_list(basin_index_pairs, self.batch_size)
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            for chunk in batch_chunks:
-                futures = [executor.submit(get_batch_slice, bd) for bd in chunk]
-                basins, dates = [], []
-                batch = init_batch_dict()
-                for future in futures:
-                    basin, date, x_dd, x_di, x_s, y = future.result()
-                    basins.append(basin)
-                    dates.append(date)
-                    batch['x_dd'].append(x_dd)
-                    batch['x_di'].append(x_di)
-                    batch['x_s'].append(x_s)
-                    batch['y'].append(y)
-                    
-                # Check and pad the final batch if necessary before yielding
-                final_batch_size = len(basins)
-                if final_batch_size % self.num_devices != 0:
-                    pad_count = self.num_devices - (final_batch_size % self.num_devices)
-                    for key in batch.keys():
-                        batch[key] += [batch[key][-1]] * pad_count
-                    basins += [basins[-1]] * pad_count
-                    dates += [dates[-1]] * pad_count
-                    
-                yield (basins, dates, stack_batch_dict(batch))
+        sample = {'basin':basin, 'date':date, 'x_dd':x_dd, 'x_di':x_di, 'x_s':x_s, 'y':y}
+        # sample = jutil.tree_map(lambda x: jax.device_put(x, self.named_sharding), sample)
+        return sample
 
     def _normalize_data(self):
         """
@@ -257,8 +258,7 @@ class DataLoader:
                 self.x_d[var] = (self.x_d[var] - scale[var]['offset']) / scale[var]['scale']
                 
         return scale
-
-    
+ 
     def denormalize_target(self, y_normalized):
         """
         Denormalizes the target variable.
@@ -279,43 +279,26 @@ class DataLoader:
             return np.exp(y_normalized) - self.log_pad
         else:
             return y_normalized * scale + offset
-        
-        
-    def update_sharding(self, num_devices=0, backend=None):
-        available_devices = _get_available_devices()
-        # Validate the requested backend
-        if backend is None:
-            backend = 'cpu'
-            if 'gpu' in available_devices.keys():
-                backend = 'gpu'
-        elif backend not in available_devices.keys():
-            raise ValueError(f"requested backend ({backend}) not in available list: ({available_devices})")
 
-        # Validate the requested number of devices.
-        if num_devices > available_devices[backend]:
-            raise ValueError(f"requested devices ({backend}: {num_devices}) cannot be greater than available backend devices: {available_devices}")
-        elif num_devices == 0:
-            self.num_devices = available_devices[backend]
+    def update_indices(self, train, basin_subset=[]):
+        if train:
+            basin_index_pairs = [(basin, date) for basin, dates in self.train_ids.items() for date in dates]
         else:
-            self.num_devices = num_devices
-
-        if self.batch_size % self.num_devices != 0:
-            raise ValueError(f"batch_size ({self.batch_size}) must be a multiple of the num_devices ({self.num_devices}).")
-
-        print(f"Batch loading set to {self.num_devices} {backend}(s)")
-        devices = jax.local_devices(backend=backend)[:self.num_devices]
-        mesh = jshard.Mesh(devices, ('batch',))
-        pspec = jshard.PartitionSpec('batch',)
-        self.named_sharding = jshard.NamedSharding(mesh, pspec)
-
-
-def _chunk_list(l, n):
-    """Yield successive n-sized chunks from l."""
-    for i in range(0, len(l), n):
-        yield l[i:i + n]
-
+            # If a non-empty subset list exists, we will only generate batches for those basins.
+            if basin_subset:
+                test_ids = {basin: self.test_ids[basin] for basin in basin_subset}
+            else:
+                test_ids = self.test_ids
+            basin_index_pairs = [(basin, date) for basin, dates in test_ids.items() for date in dates] 
+            
+        self.train = train
+        self.basin_index_pairs = basin_index_pairs
+        
 
 def _get_available_devices():
+    """
+    Returns a dict of number of available backend devices
+    """
     devices = {}
     for backend in ['cpu', 'gpu', 'tpu']:
         try:
@@ -325,24 +308,4 @@ def _get_available_devices():
             pass   
     return devices
 
-def _distance_to_closest_obs(arr):
-    nan_mask = np.isnan(arr)
-    distances = np.full(arr.shape, np.inf) # All nan columns will be inf. Weights -> 0
-    
-    for feature_idx in range(arr.shape[1]):
-        # Calculate the distance transform for the column
-        distances[:,feature_idx] = distance_transform_edt(nan_mask[:,feature_idx])
-    return distances+1
-    
-def _fill_nan_obs(arr):
-    for feature_idx in range(arr.shape[1]):
-        is_nan = jnp.isnan(arr[:,feature_idx])
-        if np.sum(~is_nan)==0:
-            # Can't interpolate without observations, but distances will be inf and weights 0.
-            arr[:,feature_idx][is_nan] = 0
-            continue
-        #Interpolate based on closest measurement. 
-        arr[is_nan,feature_idx] = np.interp(np.flatnonzero(is_nan),
-                                            np.flatnonzero(~is_nan),
-                                            arr[~is_nan,feature_idx])
-    return arr
+

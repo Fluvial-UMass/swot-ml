@@ -13,8 +13,7 @@ def predict(model, dataloader, basin_subset=[]):
         basin_subset = [basin_subset]
     
     model = eqx.tree_at(lambda m: m.dropout.inference, model, True)
-    dataloader.train = False
-    dataloader.basin_subset = basin_subset
+    dataloader.set_mode(train=False, basin_subset=basin_subset)
     
     basins = []
     dates = []
@@ -28,8 +27,8 @@ def predict(model, dataloader, basin_subset=[]):
         
     # Create a dataframe with multi-index
     multi_index = pd.MultiIndex.from_arrays([basins,dates],names=['basin','date'])
-    y = dataloader.denormalize_target(np.array(y).flatten())
-    y_hat = dataloader.denormalize_target(np.array(y_hat).flatten())
+    y = dataloader.dataset.denormalize_target(np.array(y).flatten())
+    y_hat = dataloader.dataset.denormalize_target(np.array(y_hat).flatten())
     results = pd.DataFrame({'obs':  y, 'pred': y_hat}, index=multi_index)
 
     return results

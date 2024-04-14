@@ -12,7 +12,6 @@ from pathlib import Path
 from datetime import datetime
 
 
-
 def mse_loss(y, y_pred):
     mse = jnp.mean(jnp.square(y[:,-1] - y_pred[:,-1]))
     return mse
@@ -155,8 +154,8 @@ def start_training(model, dataloader, lr_schedule, num_epochs, *,
 
     error_count = 0
     loss_list = []
-    dataloader.train = True
-    for epoch in range(start_epoch, num_epochs):
+    dataloader.set_mode(train=True)
+    for epoch in range(start_epoch, num_epochs+1):
         current_lr = lr_schedule(epoch)
         optim = optax.adam(current_lr)
         total_loss = 0
@@ -164,6 +163,7 @@ def start_training(model, dataloader, lr_schedule, num_epochs, *,
         pbar = tqdm(dataloader, desc=f"Epoch:{epoch} LR:{current_lr:0.4f}")
         for basins, dates, batch in pbar: 
             try:
+                batch = dataloader.shard_batch(batch)
                 loss, model, opt_state = make_step(model, batch, opt_state, optim, **kwargs)
                 total_loss += loss
                 num_batches += 1

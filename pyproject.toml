@@ -21,6 +21,7 @@ tqdm = "^4.66.2"
 tensorflow = "^2.16.1"
 tensorboard = "^2.16.2"
 geopandas = "^0.14.3"
+torch = "^2.2.2"
 
 
 [build-system]
