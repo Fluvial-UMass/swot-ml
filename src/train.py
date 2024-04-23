@@ -4,16 +4,141 @@ import jax
 import jax.numpy as jnp
 import jax.tree_util as jutil
 import numpy as np
-from functools import partial
-from tqdm.notebook import trange, tqdm
+from rich.progress import Progress
 import logging
 import pickle
 from pathlib import Path
 from datetime import datetime
+import matplotlib.pyplot as plt
 
+
+class Trainer:
+    def __init__(self, model, dataloader, lr_schedule, num_epochs, *, log_every=5, **step_kwargs):
+        """        
+        Initializes optimizers, logging, and sets up the training environment.
+        
+        Args:
+            model: The model to be trained.
+            dataloader: An iterable dataloader that provides batches of data.
+            lr_schedule: A function that returns the learning rate given the epoch number.
+            num_epochs: Total number of epochs to train the model.
+            log_every: Interval of epochs after which to log and save the model state.
+            **step_kwargs: Additional keyword arguments to pass to the training step function.
+        """
+        self.model = model
+        self.dataloader = dataloader
+        self.lr_schedule = lr_schedule
+        self.num_epochs = num_epochs
+        self.log_every = log_every
+        self.step_kwargs = step_kwargs
+
+        self.loss_list = []
+        self.epoch = 0
+        self.epoch_str_fn = lambda l: f"[red]Epoch:{self.epoch} Loss:{l:.4f}"
+        
+        self.optim = optax.adam(lr_schedule(self.epoch))
+        self.opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
+        self.setup_logging()
+
+    def setup_logging(self):
+        current_date = datetime.now().strftime("%Y%m%d_%H%M")
+        self.log_dir = Path(f"../logs/{current_date}")
+        self.log_dir.mkdir(exist_ok=True)
+        log_file = self.log_dir / "training.log"
+        logging.basicConfig(filename=log_file, filemode='a', level=logging.INFO,
+                            format='%(asctime)s - %(levelname)s - %(message)s')
+
+    def start_training(self):
+        """
+        Starts or continues training the model.
+    
+        Manages the training loop, including updating progress bars, logging, handling keyboard 
+        interruptions, and saving the model state at specified intervals. Catches a KeyboardInterrupt 
+        to save the model state before exiting.
+    
+        Returns:
+            The trained model after completing the training or upon an interruption.
+        """ 
+        try:
+            with Progress() as progress:
+                epoch_pbar = progress.add_task(self.epoch_str_fn(0), completed=self.epoch, total=self.num_epochs)
+                batch_pbar = progress.add_task("[green]Batch", total=len(self.dataloader))
+                
+                while self.epoch <= self.num_epochs:
+                    self.epoch += 1
+                    loss = self._train_epoch(progress, batch_pbar)
+                    progress.update(epoch_pbar, advance=1, description=self.epoch_str_fn(loss))
+                    logging.info(f"Time: {datetime.now()}, Epoch: {self.epoch}, Loss: {loss:.4f}")
+                    if self.epoch % self.log_every == 0:
+                        self.save_model_state()
+                    self.loss_list.append(loss)
+        except KeyboardInterrupt:
+            pass
+
+        # Cleanup and return 
+        print("Training finished or interrupted. Model state saved.")
+        if self.epoch % self.log_every != 0:
+            self.save_model_state()
+        plt.plot(self.loss_list)
+        return self.model
+        
+
+    
+    def _train_epoch(self, progress, batch_pbar):
+        """
+        Iterates over the dataloader batches, updates the model using the optimization step, and handles 
+        any exceptions that occur during the training. Logs errors and saves error data if issues are encountered.
+    
+        Args:
+            progress: The rich progress manager instance to update the progress bar.
+            batch_pbar: The batch progress bar within the epoch.
+    
+        Returns:
+            float: The average loss calculated over the epoch.
+        """
+        self.optim = optax.adam(self.lr_schedule(self.epoch))
+        progress.update(batch_pbar, completed=0)
+        error_count = 0
+        consecutive_errors = 0
+        total_loss = 0
+        num_batches = 0
+
+        for basins, dates, batch in self.dataloader:
+            try:
+                batch = self.dataloader.shard_batch(batch)
+                loss, self.model, self.opt_state = make_step(self.model, batch, self.opt_state, self.optim, **self.step_kwargs)
+                total_loss += loss
+                num_batches += 1
+                consecutive_errors = 0
+            except Exception as e:
+                error_data = {"epoch": self.epoch,
+                              "basins": basins,
+                              "dates": dates,
+                              "batch": batch,
+                              "model_state": self.model,
+                              "opt_state": self.opt_state}
+                error_file = log_dir / f"epoch{self.epoch}_error{error_count}_data.pkl"
+                with open(error_file, "wb") as f:
+                    pickle.dump(error_data, f)
+                logging.error(f"Model step error: {str(e)}. Error data saved to {error_file}", exc_info=True)
+                print(f"Model exception! Logged batch data and states to {error_file}")
+                error_count += 1
+                consecutive_errors += 1
+            if consecutive_errors >= 3:
+                raise RuntimeError(f"Too many consecutive errors ({consecutive_errors})")
+                
+            progress.update(batch_pbar, advance=1)
+        average_loss = total_loss / num_batches
+        return average_loss
+
+    def save_model_state(self):
+        model_state_file = self.log_dir / f"model_state_epoch{self.epoch}.pkl"
+        with open(model_state_file, "wb") as f:
+            pickle.dump(self.model, f)
+            
 
 def mse_loss(y, y_pred):
-    mse = jnp.mean(jnp.square(y[:,-1] - y_pred[:,-1]))
+    mse = jnp.mean(jnp.square(y - y_pred[...,-1]))
     return mse
 
 # Intermittent flow modified MSE
@@ -119,80 +244,39 @@ def make_step(model, data, opt_state, optim, loss_name="mse", max_grad_norm=None
     model = eqx.apply_updates(model, updates)
     return loss, model, opt_state
 
-
-def start_training(model, dataloader, lr_schedule, num_epochs, *,
-                   start_epoch=1, 
-                   opt_state=None, 
-                   **kwargs):
+def freeze_components(model, freeze: bool, component_names=None):
     """
-    Starts or continues the training of a given model.
+    Freezes or unfreezes named components of the model.
 
     Args:
-        model (eqx.Module): The model to be trained.
-        dataloader (iterable): An iterable that provides batches of data.
-        lr_schedule (function): A function that takes an epoch index and returns the learning rate.
-        num_epochs (int): The number of epochs to train for.
-        start_epoch (int, optional): The epoch index to start training from. Defaults to 0.
-        opt_state (optax.OptState, optional): Optional initial state of the optimizer.
-        **kwargs: Additional keyword arguments passed to the `make_step` function.
+        model: The model or part of the model to freeze/unfreeze.
+        freeze (bool): If True, components are set to inference mode (frozen).
+                       If False, components are set to training mode (unfrozen).
+        component_names (list or str, optional): Names of the model components to freeze/unfreeze.
+                                                 If None, applies to the whole model.
 
     Returns:
-        eqx.Module: The trained model.
+        The updated model with components set to the desired mode.
     """
-    # Set up logging
-    current_date = datetime.now().strftime("%Y%m%d_%H%M")
-    log_dir = Path(f"../logs/{current_date}") 
-    log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / "training.log"
-    logging.basicConfig(filename=log_file, filemode='a', level=logging.INFO,
-                        format='%(asctime)s - %(levelname)s - %(message)s')
-    
-    # Initialize optimizer 
-    optim = optax.adam(lr_schedule(start_epoch))
-    if opt_state is None:
-        opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
+    if component_names is None:
+        # Apply to the entire model
+        return eqx.nn.inference_mode(model, freeze)
+    else:
+        if isinstance(component_names, str):
+            component_names = [component_names]
 
-    error_count = 0
-    loss_list = []
-    dataloader.set_mode(train=True)
-    for epoch in range(start_epoch, num_epochs+1):
-        current_lr = lr_schedule(epoch)
-        optim = optax.adam(current_lr)
-        total_loss = 0
-        num_batches = 0
-        pbar = tqdm(dataloader, desc=f"Epoch:{epoch} LR:{current_lr:0.4f}")
-        for basins, dates, batch in pbar: 
-            try:
-                batch = dataloader.shard_batch(batch)
-                loss, model, opt_state = make_step(model, batch, opt_state, optim, **kwargs)
-                total_loss += loss
-                num_batches += 1
-                pbar.set_postfix_str(f"Loss: {total_loss/num_batches:.4f}")
-            except Exception as e:
-                error_data = {"epoch": epoch,
-                              "basins": basins,
-                              "dates": dates,
-                              "batch": batch,
-                              "model_state": model,
-                              "opt_state": opt_state}
-                error_file = log_dir / f"error{error_count}_data.pkl"
-                with open(error_file, "wb") as f:
-                    pickle.dump(error_data, f)
-                logging.error(f"Model step error: {str(e)}. Error data saved to {error_file}", exc_info=True)
-                print(f"Model exception! Logged batch data and states to {error_file}")
-                error_count += 1
-                
+        def modify_component(tree):
+            for name in component_names:
+                if hasattr(tree, name):
+                    subtree = getattr(tree, name)
+                    subtree = eqx.nn.inference_mode(subtree, freeze)
+                    setattr(tree, name, subtree)
+            return tree
 
-        current_loss = total_loss / num_batches
-        loss_list.append(current_loss)
-        
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logging.info(f"Time: {now}, Epoch: {epoch}, Loss: {current_loss:.4f}")
-        
-        # Save model state every 5 Epochs
-        if (epoch % 5 == 0):
-            model_state_file = log_dir / f"model_state_epoch{epoch}.pkl"
-            with open(model_state_file, "wb") as f:
-                pickle.dump(model, f)
+        return jax.tree_map(modify_component, model, is_leaf=lambda x: isinstance(x, eqx.Module))
 
-    return model
+
+
+
+
+
