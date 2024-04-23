@@ -11,8 +11,11 @@ def _predict_map(model, batch):
 def predict(model, dataloader, basin_subset=[]):
     if not isinstance(basin_subset,list):
         basin_subset = [basin_subset]
-    
-    model = eqx.tree_at(lambda m: m.dropout.inference, model, True)
+
+    # Copy the model state without dropout
+    model = eqx.nn.inference_mode(model)
+
+    # Set the dataloader to give the test data from a subset of basins.
     dataloader.set_mode(train=False, basin_subset=basin_subset)
     
     basins = []
@@ -22,7 +25,7 @@ def predict(model, dataloader, basin_subset=[]):
     for basin, date, batch in tqdm(dataloader):
         basins.extend(basin)
         dates.extend(date)
-        y.extend(batch['y'][:,-1])
+        y.extend(batch['y'])
         y_hat.extend(_predict_map(model,batch))
         
     # Create a dataframe with multi-index

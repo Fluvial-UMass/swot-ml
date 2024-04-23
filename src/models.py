@@ -353,5 +353,75 @@ class TAPLSTM(eqx.Module):
 
         return final_out
 
+class ANN(eqx.Module):
+    dynamic_layers: list
+    static_layers: list
+    dense: eqx.nn.Linear
+    dropout: eqx.nn.Dropout
+
+    def __init__(self, *, 
+                 dynamic_in_size, 
+                 dynamic_hidden_size, 
+                 num_dynamic_layers,
+                 static_in_size,
+                 static_hidden_size,
+                 num_static_layers,
+                 output_size,
+                 key, 
+                 dropout):
+        keys = jrandom.split(key, 3)
+        
+        dynamic_sizes = (dynamic_in_size, *[dynamic_hidden_size]*num_dynamic_layers)
+        dynamic_keys = jrandom.split(keys[0],num_dynamic_layers)
+        self.dynamic_layers = []
+        for k, i in zip(dynamic_keys, range(num_dynamic_layers)):
+            layer = eqx.nn.Linear(dynamic_sizes[i], dynamic_sizes[i+1], key=k)
+            self.dynamic_layers.append(layer)
+
+        static_sizes = (static_in_size, *[static_hidden_size]*num_static_layers)
+        static_keys = jrandom.split(keys[1],num_static_layers)
+        self.static_layers = []
+        for k, i in zip(static_keys, range(num_static_layers)):
+            layer = eqx.nn.Linear(static_sizes[i], static_sizes[i+1], key=k)
+            self.static_layers.append(layer)
+        
+        self.dense = eqx.nn.Linear(dynamic_sizes[-1] + static_sizes[-1], output_size, key=keys[2])
+        self.dropout = eqx.nn.Dropout(dropout)
+
+    def __call__(self, data):
+        # x_dynamic = data['x_di']
+        x_dynamic = jnp.concatenate((data['x_dd'], data['x_di']))
+        for layer in self.dynamic_layers:
+            x_dynamic = jax.nn.relu(layer(x_dynamic))
+        
+        x_static = data['x_s']
+        for layer in self.static_layers:
+            x_static = jax.nn.relu(layer(x_static))
+        
+        x_combined = jnp.concatenate((x_dynamic, x_static))
+        return self.dense(x_combined)  # Final output layer
+
+
+class HybridModel(eqx.Module):
+    ann: ANN
+    ealstm: EALSTM
+    dropout: eqx.nn.Dropout
+
+    def __init__(self, ann_layer_sizes, dynamic_in_size, static_in_size, out_size, hidden_size, *, key, dropout=0):
+        keys = jrandom.split(key, 3)
+        self.ann = ANN(ann_layer_sizes, key=keys[0], dropout=dropout)
+        self.ealstm = EALSTM(dynamic_in_size, static_in_size, out_size, hidden_size, key=keys[1], dropout=dropout, dense=True)
+        self.dropout = eqx.nn.Dropout(dropout)
+
+    def __call__(self, data):
+        ann_output = self.ann(data)
+        ealstm_output = self.ealstm({'x_dd': ann_output, 'x_s': data['x_s']})
+        final_output = self.dense(ealstm_output)
+        return final_output
+
+
+
+
+
 
 
