@@ -35,6 +35,7 @@ class Trainer:
         self.loss_list = []
         self.epoch = 0
         self.epoch_str_fn = lambda l: f"[red]Epoch:{self.epoch} Loss:{l:.4f}"
+        self.batch_str_fn = lambda b,l: f"[green]Batch:{b}/{len(dataloader)} Loss:{l:.4f}"
         
         self.optim = optax.adam(lr_schedule(self.epoch))
         self.opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
@@ -62,11 +63,12 @@ class Trainer:
         try:
             with Progress() as progress:
                 epoch_pbar = progress.add_task(self.epoch_str_fn(0), completed=self.epoch, total=self.num_epochs)
-                batch_pbar = progress.add_task("[green]Batch", total=len(self.dataloader))
+                batch_pbar = progress.add_task(self.batch_str_fn(0,0), total=len(self.dataloader))
                 
                 while self.epoch <= self.num_epochs:
                     self.epoch += 1
                     loss = self._train_epoch(progress, batch_pbar)
+
                     progress.update(epoch_pbar, advance=1, description=self.epoch_str_fn(loss))
                     logging.info(f"Time: {datetime.now()}, Epoch: {self.epoch}, Loss: {loss:.4f}")
                     if self.epoch % self.log_every == 0:
@@ -97,7 +99,8 @@ class Trainer:
             float: The average loss calculated over the epoch.
         """
         self.optim = optax.adam(self.lr_schedule(self.epoch))
-        progress.update(batch_pbar, completed=0)
+        progress.reset(batch_pbar)
+        progress.update(batch_pbar, completed=0, total=len(self.dataloader), description=self.batch_str_fn(0,0))
         error_count = 0
         consecutive_errors = 0
         total_loss = 0
@@ -106,7 +109,7 @@ class Trainer:
         for basins, dates, batch in self.dataloader:
             try:
                 batch = self.dataloader.shard_batch(batch)
-                loss, self.model, self.opt_state = make_step(self.model, batch, self.opt_state, self.optim, **self.step_kwargs)
+                loss, grads, self.model, self.opt_state = make_step(self.model, batch, self.opt_state, self.optim, **self.step_kwargs)
                 total_loss += loss
                 num_batches += 1
                 consecutive_errors = 0
@@ -124,11 +127,29 @@ class Trainer:
                 print(f"Model exception! Logged batch data and states to {error_file}")
                 error_count += 1
                 consecutive_errors += 1
+
+            # Monitor gradients after some warmup
+            if self.epoch>5:
+                grad_norms = jutil.tree_map(jnp.linalg.norm, grads)
+                grad_norms = jutil.tree_leaves_with_path(grad_norms)
+                # Check each gradient norm
+                for keypath, norm in grad_norms:
+                    key = jutil.keystr(keypath)
+                    if norm < 1e-6:  # Threshold for vanishing gradients
+                        print(f"Warning: Vanishing gradient detected at {key} with norm {norm}")
+                    elif norm > 1e3:  # Threshold for exploding gradients
+                        print(f"Warning: Exploding gradient detected at {key} with norm {norm}")
+
+            
             if consecutive_errors >= 3:
                 raise RuntimeError(f"Too many consecutive errors ({consecutive_errors})")
-                
-            progress.update(batch_pbar, advance=1)
-        average_loss = total_loss / num_batches
+
+            average_loss = total_loss / num_batches
+            progress.update(batch_pbar, advance=1, description=self.batch_str_fn(num_batches,loss))
+
+            if jnp.isnan(loss):
+                raise RuntimeError(f"NaN loss encountered {batch}")
+        
         return average_loss
 
     def save_model_state(self):
@@ -138,7 +159,7 @@ class Trainer:
             
 
 def mse_loss(y, y_pred):
-    mse = jnp.mean(jnp.square(y - y_pred[...,-1]))
+    mse = jnp.mean(jnp.square(y[...,-1] - y_pred[...,-1]))
     return mse
 
 # Intermittent flow modified MSE
@@ -182,8 +203,7 @@ def compute_loss(model, data, loss_name):
     elif loss_name == "if_mse":
         return if_mse_loss(data['y'], y_pred, data['x_dd'][:,-1])
     else:
-        raise ValueError("Invalid loss function name.")
-       
+        raise ValueError("Invalid loss function name.")  
     
 def clip_gradients(grads, max_norm):
     """
@@ -234,7 +254,6 @@ def make_step(model, data, opt_state, optim, loss_name="mse", max_grad_norm=None
         tuple: A tuple containing the loss, updated model, and updated optimizer state.
     """
     loss, grads = compute_loss(model, data, loss_name)
-    
     if max_grad_norm is not None:
         grads = clip_gradients(grads, max_grad_norm)
     if l2_weight is not None:
@@ -242,7 +261,7 @@ def make_step(model, data, opt_state, optim, loss_name="mse", max_grad_norm=None
         
     updates, opt_state = optim.update(grads, opt_state)
     model = eqx.apply_updates(model, updates)
-    return loss, model, opt_state
+    return loss, grads, model, opt_state
 
 def freeze_components(model, freeze: bool, component_names=None):
     """

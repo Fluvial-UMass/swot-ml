@@ -8,15 +8,10 @@ from tqdm.notebook import tqdm
 def _predict_map(model, batch):
     return jax.vmap(model)(batch)
 
-def predict(model, dataloader, basin_subset=[]):
-    if not isinstance(basin_subset,list):
-        basin_subset = [basin_subset]
+def predict(model, dataloader, denormalize=True):
 
-    # Copy the model state without dropout
+    # Set model to inference mode (no dropout)
     model = eqx.nn.inference_mode(model)
-
-    # Set the dataloader to give the test data from a subset of basins.
-    dataloader.set_mode(train=False, basin_subset=basin_subset)
     
     basins = []
     dates = []
@@ -25,13 +20,16 @@ def predict(model, dataloader, basin_subset=[]):
     for basin, date, batch in tqdm(dataloader):
         basins.extend(basin)
         dates.extend(date)
-        y.extend(batch['y'])
+        y.extend(batch['y'][:,-1])
         y_hat.extend(_predict_map(model,batch))
         
     # Create a dataframe with multi-index
     multi_index = pd.MultiIndex.from_arrays([basins,dates],names=['basin','date'])
-    y = dataloader.dataset.denormalize_target(np.array(y).flatten())
-    y_hat = dataloader.dataset.denormalize_target(np.array(y_hat).flatten())
+    y = np.array(y).flatten()
+    y_hat = np.array(y_hat).flatten()
+    if denormalize:
+        y = dataloader.dataset.denormalize_target(y)
+        y_hat = dataloader.dataset.denormalize_target(y_hat)
     results = pd.DataFrame({'obs':  y, 'pred': y_hat}, index=multi_index)
 
     return results

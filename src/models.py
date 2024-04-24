@@ -300,7 +300,7 @@ class TEALSTM(BaseLSTM):
             new_state, skip_count = self.cell(state[:2], x_d, i, skip_count)
             return (*new_state, skip_count), None
 
-        init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size), 0)
+        init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size), int(0))
         (out, _, skip_count), _ = jax.lax.scan(scan_fn, init_state, data['x_di'])
 
         if self.dense is not None:
@@ -392,14 +392,45 @@ class ANN(eqx.Module):
         # x_dynamic = data['x_di']
         x_dynamic = jnp.concatenate((data['x_dd'], data['x_di']))
         for layer in self.dynamic_layers:
-            x_dynamic = jax.nn.relu(layer(x_dynamic))
+            x_dynamic = jax.nn.tanh(layer(x_dynamic))
         
         x_static = data['x_s']
         for layer in self.static_layers:
-            x_static = jax.nn.relu(layer(x_static))
+            x_static = jax.nn.tanh(layer(x_static))
         
         x_combined = jnp.concatenate((x_dynamic, x_static))
         return self.dense(x_combined)  # Final output layer
+
+class simpleANN(eqx.Module):
+    layers: list
+    dropout: eqx.nn.Dropout
+
+    def __init__(self, *, 
+                 in_size, 
+                 hidden_size, 
+                 num_hidden_layers,
+                 output_size,
+                 key, 
+                 dropout):
+        
+        layer_sizes = (in_size, *[hidden_size]*(num_hidden_layers+1), output_size)
+        total_n_layers = len(layer_sizes)-1
+        keys = jrandom.split(key,total_n_layers)
+        self.layers = []
+        for k, i in zip(keys, range(total_n_layers)):
+            layer = eqx.nn.Linear(layer_sizes[i], layer_sizes[i+1], key=k)
+            self.layers.append(layer)
+
+        self.dropout = eqx.nn.Dropout(dropout)
+
+    def __call__(self, data):
+        x = data['x_di']
+        # x = jnp.concatenate((data['x_dd'], data['x_di'], data['x_s']))
+        for layer in self.layers[:-1]:
+            x = jax.nn.relu(layer(x))
+        x = self.layers[-1](x)
+        
+        return x  # Final output layer
 
 
 class HybridModel(eqx.Module):
