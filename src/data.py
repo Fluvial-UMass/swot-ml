@@ -27,11 +27,9 @@ class TAPDataLoader(DataLoader):
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 
         # Dataset index params
-        self.train = kwargs.get('train',True)
-        self.sequence = kwargs.get('sequence',True)
-        self.end2end = kwargs.get('end2end',True)
+        self.data_subset = kwargs.get('data_subset','train')
         self.basin_subset = kwargs.get('basin_subset',None)
-        # self.set_mode()
+        self.set_mode()
 
         # Data sharding params
         backend = kwargs.get('backend', None)
@@ -50,22 +48,14 @@ class TAPDataLoader(DataLoader):
         batch = {'x_dd':x_dd, 'x_di':x_di, 'x_s':x_s, 'y': y}
         return basin, date, batch
 
-    def set_mode(self, *, train:bool=None, sequence:bool=None, end2end:bool=None, basin_subset:list=None):
-        # Use existing value if None provided.
-        if train is not None: 
-            self.train = train
-        if sequence is not None:
-            self.sequence = sequence
-        if end2end is not None:
-            self.end2end = end2end
+    def set_mode(self, *, data_subset:str=None, basin_subset:list=None):
+        # Use existing values if None provided.
+        if data_subset is not None:
+            self.data_subset = data_subset    
         if basin_subset is not None:
-            if not isinstance(basin_subset,list):
-                basin_subset = [basin_subset]
             self.basin_subset = basin_subset
 
-        self.dataset.update_indices(train=self.train, 
-                                    sequence=self.sequence,
-                                    end2end=self.end2end,
+        self.dataset.update_indices(data_subset=self.data_subset,
                                     basin_subset=self.basin_subset)
     
     def set_jax_sharding(self, backend=None, num_devices=None):
@@ -133,6 +123,7 @@ class TAPDataset(Dataset):
                  split_time: np.datetime64,
                  sequence_length: int,
                  sequence: bool = True,
+                 static_features: list = None,
                  discharge_col: str = None,
                  log_norm_cols: list = [],
                  range_norm_cols: list = [],
@@ -157,6 +148,7 @@ class TAPDataset(Dataset):
         self.daily_features = features_dict['daily']
         self.discharge_idx = features_dict['daily'].index(discharge_col)
         self.irregular_features = features_dict.get('irregular') # is None if key doesn't exist. 
+        self.static_features = static_features
 
         self.log_pad = 0.001
 
@@ -164,7 +156,7 @@ class TAPDataset(Dataset):
         self.x_d = self._load_basin_data()
         self.scale = self._normalize_data()
         self.date_ranges = self._precompute_date_ranges()
-        self.update_indices()
+        self.update_indices(data_subset='train')
 
     def __len__(self):
         """
@@ -200,7 +192,7 @@ class TAPDataset(Dataset):
             if self.clip_target_to_zero:
                 ds[self.target] = ds[self.target].where(ds[self.target] >= 0, np.nan)
 
-            #Testing
+            # Testing if this is causing an issue
             for col in self.daily_features:
                 ds[col] = ds[col].where(~np.isnan(ds[col]), 0)
                 
@@ -211,14 +203,11 @@ class TAPDataset(Dataset):
             valid_target = ~np.isnan(ds[self.target])
 
             # Create valid data indices for this basin
-            masks = [('train', 'single', 'irregular', is_train & valid_irregular & valid_target),
-                     ('test', 'single', 'irregular', ~is_train & valid_irregular),
-                     ('train', 'seq', 'irregular', is_train & valid_sequence & valid_irregular),
-                     ('test', 'seq', 'irregular', ~is_train & valid_sequence & valid_irregular),
-                     ('train', 'seq', 'target', is_train & valid_sequence & valid_target),
-                     ('test', 'seq', 'target', ~is_train & valid_sequence)]
-            for train_type, seq_type, data_type, mask in masks:
-                self.indices[(train_type, seq_type, data_type)][basin] = ds['date'][mask].values
+            masks = [('pre-train', is_train & valid_sequence & valid_irregular & valid_target),
+                     ('train', is_train & valid_sequence & valid_target),
+                     ('test', ~is_train & valid_sequence)]
+            for key, mask in masks:
+                self.indices[key][basin] = ds['date'][mask].values
     
             ds = ds.assign_coords({'basin': basin})
             ds_list.append(ds)
@@ -239,11 +228,16 @@ class TAPDataset(Dataset):
         attributes_df = pd.read_csv(file_path, index_col="index")
         attributes_df.index = attributes_df.index.astype(str)
 
+        if self.static_features is not None:
+            attributes_df = attributes_df[self.static_features]
+
         # Remove columns with zero variance
         zero_var_cols = list(attributes_df.columns[attributes_df.std(ddof=0) == 0])
         if zero_var_cols:
             print(f"Dropping static attributes with 0 variance: {zero_var_cols}")
             attributes_df.drop(columns=zero_var_cols, inplace=True)
+
+        self.static_features = list(attributes_df.columns)
 
         mu = attributes_df.mean()
         std = attributes_df.std(ddof=0)
@@ -268,12 +262,7 @@ class TAPDataset(Dataset):
     def __getitem__(self, idx):
         """Generate one batch of data."""
         basin, date = self.basin_index_pairs[idx]
-
-        if self.sequence:
-            sequence_dates = self.date_ranges[date]
-        else:
-            sequence_dates = date
-            
+        sequence_dates = self.date_ranges[date]
         x_dd = self.x_d.sel(basin=basin, date=sequence_dates)[self.daily_features].to_array().values.T
         x_di = self.x_d.sel(basin=basin, date=sequence_dates)[self.irregular_features].to_array().values.T
         x_s = self.x_s[basin]
@@ -340,27 +329,23 @@ class TAPDataset(Dataset):
             return y_normalized * scale + offset
       
     def update_indices(self, *,
-                       train:bool = True,
-                       sequence:bool = True,
-                       end2end:bool = True,
+                       data_subset:str,
                        basin_subset:list = []):
-    
-        train_type = 'train' if train else 'test'
-        seq_type = 'seq' if sequence else 'single'
-        target_type = 'target' if end2end else 'irregular'
-
-        ids = self.indices[(train_type, seq_type, target_type)]
+        # Validate the data_subset choice
+        if data_subset not in self.indices.keys():
+             raise ValueError(f"data_subset ({data_subset}) must be in data index dict keys ({self.indices.keys()}) ")
+        ids = self.indices[data_subset]
             
         # If a non-empty subset list exists, we will only generate batches for those basins.
         if basin_subset:
+            if not isinstance(basin_subset,list):
+                basin_subset = [basin_subset]
             ids = {basin: ids[basin] for basin in basin_subset}
+
         basin_index_pairs = [(basin, date) for basin, dates in ids.items() for date in dates] 
 
-        self.train = train
-        self.sequence = sequence
-        self.end2end = end2end
+        self.data_subset = data_subset
         self.basin_index_pairs = basin_index_pairs
-
 
 def _get_available_devices():
     """

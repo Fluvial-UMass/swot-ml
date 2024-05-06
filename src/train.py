@@ -2,7 +2,7 @@ import equinox as eqx
 import optax
 import jax
 import jax.numpy as jnp
-import jax.tree_util as jutil
+import jax.tree_util as jtu
 import numpy as np
 from rich.progress import Progress
 import logging
@@ -39,15 +39,16 @@ class Trainer:
         
         self.optim = optax.adam(lr_schedule(self.epoch))
         self.opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
-        self.setup_logging()
 
-    def setup_logging(self):
+        self.freeze_components(None, False)
+
+        # Setup logging
         current_date = datetime.now().strftime("%Y%m%d_%H%M")
         self.log_dir = Path(f"../logs/{current_date}")
         self.log_dir.mkdir(exist_ok=True)
         log_file = self.log_dir / "training.log"
-        logging.basicConfig(filename=log_file, filemode='a', level=logging.INFO,
-                            format='%(asctime)s - %(levelname)s - %(message)s')
+        logging.basicConfig(filename=log_file, filemode='w', level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 
     def start_training(self):
         """
@@ -63,7 +64,7 @@ class Trainer:
         try:
             with Progress() as progress:
                 epoch_pbar = progress.add_task(self.epoch_str_fn(0), completed=self.epoch, total=self.num_epochs)
-                batch_pbar = progress.add_task(self.batch_str_fn(0,0), total=len(self.dataloader))
+                batch_pbar = progress.add_task(self.batch_str_fn(0,0))
                 
                 while self.epoch <= self.num_epochs:
                     self.epoch += 1
@@ -82,9 +83,6 @@ class Trainer:
         if self.epoch % self.log_every != 0:
             self.save_model_state()
         plt.plot(self.loss_list)
-        return self.model
-        
-
     
     def _train_epoch(self, progress, batch_pbar):
         """
@@ -100,62 +98,84 @@ class Trainer:
         """
         self.optim = optax.adam(self.lr_schedule(self.epoch))
         progress.reset(batch_pbar)
-        progress.update(batch_pbar, completed=0, total=len(self.dataloader), description=self.batch_str_fn(0,0))
-        error_count = 0
-        consecutive_errors = 0
+        progress.update(batch_pbar, completed=0, total=len(self.dataloader)-1, description=self.batch_str_fn(0,0))
+        exception_count = 0
+        consecutive_exceptions = 0
         total_loss = 0
         num_batches = 0
 
         for basins, dates, batch in self.dataloader:
             try:
                 batch = self.dataloader.shard_batch(batch)
-                loss, grads, self.model, self.opt_state = make_step(self.model, batch, self.opt_state, self.optim, **self.step_kwargs)
+                loss, grads, self.model, self.opt_state = make_step(self.model, batch, self.opt_state, 
+                                                                    self.optim, self.filter_spec, **self.step_kwargs)
+
+                if jnp.isnan(loss):
+                    raise RuntimeError(f"NaN loss encountered")
+                    
                 total_loss += loss
                 num_batches += 1
-                consecutive_errors = 0
+                consecutive_exceptions = 0
+                
+                # Monitor gradients
+                grad_norms = jtu.tree_map(jnp.linalg.norm, grads)
+                grad_norms = jtu.tree_leaves_with_path(grad_norms)
+                # Check each gradient norm
+                for keypath, norm in grad_norms:
+                    key = jtu.keystr(keypath)
+                    if norm < 1e-6:  # Threshold for vanishing gradients
+                        warning_str = f"Warning: Vanishing gradient detected during epoch {self.epoch} at {key} with norm {norm}"
+                        logging.error(warning_str)
+                    elif norm > 1e3:  # Threshold for exploding gradients
+                        logging.error(f"Warning: Exploding gradient detected during epoch {self.epoch} at {key} with norm {norm}")
+                        
             except Exception as e:
-                error_data = {"epoch": self.epoch,
+                error_data = {#"trainer": self,
                               "basins": basins,
                               "dates": dates,
-                              "batch": batch,
-                              "model_state": self.model,
-                              "opt_state": self.opt_state}
-                error_file = log_dir / f"epoch{self.epoch}_error{error_count}_data.pkl"
+                              "batch": batch}
+                error_file = self.log_dir / f"epoch{self.epoch}_error{exception_count}_data.pkl"
                 with open(error_file, "wb") as f:
                     pickle.dump(error_data, f)
                 logging.error(f"Model step error: {str(e)}. Error data saved to {error_file}", exc_info=True)
                 print(f"Model exception! Logged batch data and states to {error_file}")
-                error_count += 1
-                consecutive_errors += 1
-
-            # Monitor gradients after some warmup
-            if self.epoch>5:
-                grad_norms = jutil.tree_map(jnp.linalg.norm, grads)
-                grad_norms = jutil.tree_leaves_with_path(grad_norms)
-                # Check each gradient norm
-                for keypath, norm in grad_norms:
-                    key = jutil.keystr(keypath)
-                    if norm < 1e-6:  # Threshold for vanishing gradients
-                        print(f"Warning: Vanishing gradient detected at {key} with norm {norm}")
-                    elif norm > 1e3:  # Threshold for exploding gradients
-                        print(f"Warning: Exploding gradient detected at {key} with norm {norm}")
-
+                exception_count += 1
+                consecutive_exceptions += 1
             
-            if consecutive_errors >= 3:
-                raise RuntimeError(f"Too many consecutive errors ({consecutive_errors})")
+            if consecutive_exceptions >= 3:
+                raise RuntimeError(f"Too many consecutive errors ({consecutive_exceptions})")
 
-            average_loss = total_loss / num_batches
-            progress.update(batch_pbar, advance=1, description=self.batch_str_fn(num_batches,loss))
-
-            if jnp.isnan(loss):
-                raise RuntimeError(f"NaN loss encountered {batch}")
-        
+            if num_batches > 0:
+                average_loss = total_loss / num_batches
+                progress.update(batch_pbar, advance=1, description=self.batch_str_fn(num_batches,average_loss))
+                
         return average_loss
 
     def save_model_state(self):
+        model_state = eqx.filter(self.model, eqx.is_inexact_array)
         model_state_file = self.log_dir / f"model_state_epoch{self.epoch}.pkl"
         with open(model_state_file, "wb") as f:
-            pickle.dump(self.model, f)
+            pickle.dump(model_state, f)
+
+    def freeze_components(self, component_names=None, freeze:bool=True):
+        if isinstance(component_names, str):
+                component_names = [component_names]
+            
+        # Returns True for any elements we want to be differentiable
+        def diff_filter(keypath, _):
+            keystr = jtu.keystr(keypath)
+
+            # return not freeze for all components if None is passed
+            if component_names is None:
+                return not freeze
+            # return not freeze for keystrs that exist in component_names
+            elif any([component in keystr for component in component_names]):
+                return not freeze
+            # return True (differentiable) for any remaining components.
+            else:
+                return True
+                
+        self.filter_spec = jtu.tree_map_with_path(diff_filter, self.model)
             
 
 def mse_loss(y, y_pred):
@@ -185,7 +205,7 @@ def if_mse_loss(y, y_pred, q):
     return loss
 
 @eqx.filter_value_and_grad
-def compute_loss(model, data, loss_name):
+def compute_loss(diff_model, static_model, data, loss_name):
     """
     Computes the loss between the model predictions and the targets using the specified loss function.
 
@@ -197,6 +217,7 @@ def compute_loss(model, data, loss_name):
     Returns:
         float: The computed loss.
     """
+    model = eqx.combine(diff_model, static_model)
     y_pred = jax.vmap(model)(data)
     if loss_name == "mse":
         return mse_loss(data['y'], y_pred)
@@ -216,7 +237,7 @@ def clip_gradients(grads, max_norm):
     Returns:
         jax.grad: The clipped gradients.
     """
-    total_norm = jutil.tree_reduce(lambda x, y: x + y, jutil.tree_map(lambda x: jnp.sum(x ** 2), grads))
+    total_norm = jtu.tree_reduce(lambda x, y: x + y, jtu.tree_map(lambda x: jnp.sum(x ** 2), grads))
     total_norm = jnp.sqrt(total_norm)
     scale = jnp.minimum(max_norm / total_norm, 1.0)
     return jax.tree_map(lambda g: scale * g, grads)
@@ -234,11 +255,11 @@ def l2_regularization(model, weight_decay):
         float: The L2 regularization term.
     """
     params = eqx.filter(model, eqx.is_inexact_array)
-    sum_l2 = jutil.tree_reduce(lambda x, y: x + jnp.sum(jnp.square(y)), params, 0)
+    sum_l2 = jtu.tree_reduce(lambda x, y: x + jnp.sum(jnp.square(y)), params, 0)
     return 0.5 * weight_decay * sum_l2
 
 @eqx.filter_jit    
-def make_step(model, data, opt_state, optim, loss_name="mse", max_grad_norm=None, l2_weight=None):
+def make_step(model, data, opt_state, optim, filter_spec, loss_name="mse", max_grad_norm=None, l2_weight=None):
     """
     Performs a single optimization step, updating the model parameters.
 
@@ -253,7 +274,9 @@ def make_step(model, data, opt_state, optim, loss_name="mse", max_grad_norm=None
     Returns:
         tuple: A tuple containing the loss, updated model, and updated optimizer state.
     """
-    loss, grads = compute_loss(model, data, loss_name)
+    diff_model, static_model = eqx.partition(model, filter_spec)
+    loss, grads = compute_loss(diff_model, static_model, data, loss_name)
+    
     if max_grad_norm is not None:
         grads = clip_gradients(grads, max_grad_norm)
     if l2_weight is not None:
@@ -262,39 +285,6 @@ def make_step(model, data, opt_state, optim, loss_name="mse", max_grad_norm=None
     updates, opt_state = optim.update(grads, opt_state)
     model = eqx.apply_updates(model, updates)
     return loss, grads, model, opt_state
-
-def freeze_components(model, freeze: bool, component_names=None):
-    """
-    Freezes or unfreezes named components of the model.
-
-    Args:
-        model: The model or part of the model to freeze/unfreeze.
-        freeze (bool): If True, components are set to inference mode (frozen).
-                       If False, components are set to training mode (unfrozen).
-        component_names (list or str, optional): Names of the model components to freeze/unfreeze.
-                                                 If None, applies to the whole model.
-
-    Returns:
-        The updated model with components set to the desired mode.
-    """
-    if component_names is None:
-        # Apply to the entire model
-        return eqx.nn.inference_mode(model, freeze)
-    else:
-        if isinstance(component_names, str):
-            component_names = [component_names]
-
-        def modify_component(tree):
-            for name in component_names:
-                if hasattr(tree, name):
-                    subtree = getattr(tree, name)
-                    subtree = eqx.nn.inference_mode(subtree, freeze)
-                    setattr(tree, name, subtree)
-            return tree
-
-        return jax.tree_map(modify_component, model, is_leaf=lambda x: isinstance(x, eqx.Module))
-
-
 
 
 

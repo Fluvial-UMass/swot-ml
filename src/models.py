@@ -64,28 +64,7 @@ class LSTM(BaseLSTM):
         if self.dense is not None:
             out = self.dense(out)
         return out
-
-
-class Gated_LSTM(BaseLSTM):
-    """
-    Gated LSTM model with an additional input gate to control information flow.
-    """
-    def __init__(self, in_size, out_size, hidden_size, *, key, **kwargs):
-        super().__init__(in_size, out_size, hidden_size, key=key, **kwargs)
-
-    def __call__(self, data):
-        def scan_fn(state, inputs):
-            x, w = inputs
-            input_gate = jax.nn.sigmoid(w)
-            gated_x = x * input_gate
-            return self.cell(gated_x, state), None
-
-        init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
-        (out, _), _ = jax.lax.scan(scan_fn, init_state, (data['xd'], data['w']))
         
-        if self.dense is not None:
-            out = self.dense(out)
-        return out
 
 class EALSTMCell(eqx.Module):
     """
@@ -322,86 +301,49 @@ class TAPLSTM(eqx.Module):
     """
     ealstm_d: EALSTM
     tealstm_i: TEALSTM
-    attention_linear: eqx.nn.Linear
+    mlp_attention: eqx.nn.MLP
     dense: eqx.nn.Linear
     dropout: eqx.nn.Dropout
 
     def __init__(self, daily_in_size, irregular_in_size, static_in_size, out_size, hidden_size, *, key, dropout):
-        dkey, ikey, akey, lkey = jrandom.split(key, 4)
-        self.ealstm_d = EALSTM(daily_in_size, static_in_size, out_size, hidden_size, key=dkey, dropout=0, dense=False)
-        self.tealstm_i = TEALSTM(irregular_in_size, static_in_size, out_size, hidden_size, key=ikey, dropout=0, dense=False)
-        self.attention_linear = eqx.nn.Linear(static_in_size, 1, use_bias=True, key=akey)
-        self.dense = eqx.nn.Linear(2 * hidden_size, out_size, use_bias=True, key=lkey)
+        keys = jrandom.split(key, 4)
+        self.ealstm_d = EALSTM(daily_in_size, static_in_size, out_size, hidden_size, 
+                               key=keys[0], dropout=0, dense=False)
+        self.tealstm_i = TEALSTM(irregular_in_size, static_in_size, out_size, hidden_size, 
+                                 key=keys[1], dropout=0, dense=False)
+        self.mlp_attention = eqx.nn.MLP(in_size=static_in_size, out_size=1, width_size=hidden_size, 
+                                        depth=3, key=keys[2])
+        self.dense = eqx.nn.Linear(2 * hidden_size, out_size, use_bias=True, key=keys[3])
         self.dropout = eqx.nn.Dropout(dropout)
 
     def __call__(self, data):
         d_out = self.ealstm_d(data)
-        i_out, dt = self.tealstm_i(data)
+        i_out, skip_count = self.tealstm_i(data)
+        dt = skip_count + 1 # skip = 0 is still a dt of 1
 
         # Compute the attention decay parameter based on static features
-        attention_lambda = jax.nn.relu(self.attention_linear(data['x_s']))
-        # Compute the attention weights
+        attention_lambda = self.mlp_attention(data['x_s'])
+
+        # Compute the raw attention weights
         a_i = jnp.exp(-attention_lambda * dt)
         a_d = jnp.ones_like(a_i)
-    
-        # Apply the attention weights to the outputs from both LSTM branches
-        weighted_d_out = a_i * d_out
-        weighted_i_out = a_d * i_out
 
+        # Normalize the attention weights
+        weight_sum = a_i + a_d
+        a_i_normalized = a_i / weight_sum
+        a_d_normalized = a_d / weight_sum
+    
+        # Apply the normalized attention weights to the outputs from both LSTM branches
+        weighted_d_out = a_i_normalized * d_out
+        weighted_i_out = a_d_normalized * i_out
+        
+        # jax.debug.print("dt: {a}, weight:{b}", a=dt, b=a_d_normalized)
         # Concatenate the weighted outputs and pass through the final linear layer
         final_out = self.dense(jnp.concatenate([weighted_d_out, weighted_i_out], axis=-1))
 
         return final_out
 
 class ANN(eqx.Module):
-    dynamic_layers: list
-    static_layers: list
-    dense: eqx.nn.Linear
-    dropout: eqx.nn.Dropout
-
-    def __init__(self, *, 
-                 dynamic_in_size, 
-                 dynamic_hidden_size, 
-                 num_dynamic_layers,
-                 static_in_size,
-                 static_hidden_size,
-                 num_static_layers,
-                 output_size,
-                 key, 
-                 dropout):
-        keys = jrandom.split(key, 3)
-        
-        dynamic_sizes = (dynamic_in_size, *[dynamic_hidden_size]*num_dynamic_layers)
-        dynamic_keys = jrandom.split(keys[0],num_dynamic_layers)
-        self.dynamic_layers = []
-        for k, i in zip(dynamic_keys, range(num_dynamic_layers)):
-            layer = eqx.nn.Linear(dynamic_sizes[i], dynamic_sizes[i+1], key=k)
-            self.dynamic_layers.append(layer)
-
-        static_sizes = (static_in_size, *[static_hidden_size]*num_static_layers)
-        static_keys = jrandom.split(keys[1],num_static_layers)
-        self.static_layers = []
-        for k, i in zip(static_keys, range(num_static_layers)):
-            layer = eqx.nn.Linear(static_sizes[i], static_sizes[i+1], key=k)
-            self.static_layers.append(layer)
-        
-        self.dense = eqx.nn.Linear(dynamic_sizes[-1] + static_sizes[-1], output_size, key=keys[2])
-        self.dropout = eqx.nn.Dropout(dropout)
-
-    def __call__(self, data):
-        # x_dynamic = data['x_di']
-        x_dynamic = jnp.concatenate((data['x_dd'], data['x_di']))
-        for layer in self.dynamic_layers:
-            x_dynamic = jax.nn.tanh(layer(x_dynamic))
-        
-        x_static = data['x_s']
-        for layer in self.static_layers:
-            x_static = jax.nn.tanh(layer(x_static))
-        
-        x_combined = jnp.concatenate((x_dynamic, x_static))
-        return self.dense(x_combined)  # Final output layer
-
-class simpleANN(eqx.Module):
     layers: list
     dropout: eqx.nn.Dropout
 
