@@ -121,8 +121,6 @@ class EALSTMCell(eqx.Module):
 class EALSTM(BaseLSTM):
     """
     Entity-Aware LSTM (TEALSTM) model for processing time series data with dynamic and static features.
-
-    Uses a EALSTMCell and returns the hidden final hidden state.
     """
     def __init__(self, dynamic_in_size, static_in_size, out_size, hidden_size, *, key, **kwargs):
         super().__init__(dynamic_in_size, out_size, hidden_size, key=key, **kwargs)
@@ -133,7 +131,7 @@ class EALSTM(BaseLSTM):
         Forward pass of the TEALSTM module.
 
         Args:
-            data (dict): Contains at least these two key, values:
+            data (dict): Contains at least these two keys:
                 x_d (jax.Array): Dynamic input features.
                 x_s (jax.Array): Static input features.
 
@@ -205,10 +203,11 @@ class TEALSTMCell(eqx.Module):
         h_0, c_0 = state
 
         # Apply time decay if we have skipped any updates.
-        c_0 = lax.cond(skip_count>0,
-                       lambda _: self._decomp_and_decay(c_0, skip_count),  # Pass c_0 to the decay function
-                       lambda _: c_0,  # Return c_0 as is
-                       operand=None)  # The operand is not used in the functions
+        c_0 = self._decomp_and_decay(c_0, skip_count)
+        # c_0 = lax.cond(skip_count>0,
+        #                lambda _: self._decomp_and_decay(c_0, skip_count),  # Pass c_0 to the decay function
+        #                lambda _: c_0,  # Return c_0 as is
+        #                operand=None)  # The operand is not used in the functions
 
         # Compute the gates
         gates = jnp.dot(x_d, self.weight_ih.T) + jnp.dot(h_0, self.weight_hh.T) + self.bias
@@ -252,8 +251,6 @@ class TEALSTM(BaseLSTM):
     """
     Time- and Entity-Aware LSTM (TEALSTM) model for processing time series data with
     dynamic and static features.
-
-    Uses a TEALSTMCell and returns the hidden final hidden state.
     """
     
     def __init__(self, dynamic_in_size, static_in_size, out_size, hidden_size, *, key, **kwargs):
@@ -265,8 +262,9 @@ class TEALSTM(BaseLSTM):
         Forward pass of the TEALSTM module.
 
         Args:
-            x_d (jax.Array): Dynamic input features.
-            x_s (jax.Array): Static input features.
+            data (dict): Contains at least these two keys:
+                x_d (jax.Array): Dynamic input features.
+                x_s (jax.Array): Static input features.
 
         Returns:
             Output of the TEALSTM module and final skip count.
@@ -301,19 +299,26 @@ class TAPLSTM(eqx.Module):
     """
     ealstm_d: EALSTM
     tealstm_i: TEALSTM
-    mlp_attention: eqx.nn.MLP
-    dense: eqx.nn.Linear
+    # mlp_attention: eqx.nn.MLP
+    # dense: eqx.nn.Linear
+    dense: eqx.nn.MLP
     dropout: eqx.nn.Dropout
 
-    def __init__(self, daily_in_size, irregular_in_size, static_in_size, out_size, hidden_size, *, key, dropout):
+    def __init__(self, *, daily_in_size, irregular_in_size, static_in_size, out_size, hidden_size, seed, dropout):
+        key = jax.random.PRNGKey(seed)
         keys = jrandom.split(key, 4)
         self.ealstm_d = EALSTM(daily_in_size, static_in_size, out_size, hidden_size, 
                                key=keys[0], dropout=0, dense=False)
         self.tealstm_i = TEALSTM(irregular_in_size, static_in_size, out_size, hidden_size, 
                                  key=keys[1], dropout=0, dense=False)
-        self.mlp_attention = eqx.nn.MLP(in_size=static_in_size, out_size=1, width_size=hidden_size, 
-                                        depth=3, key=keys[2])
-        self.dense = eqx.nn.Linear(2 * hidden_size, out_size, use_bias=True, key=keys[3])
+        # self.mlp_attention = eqx.nn.MLP(in_size=static_in_size, out_size=1, width_size=hidden_size, 
+        #                                 depth=3, key=keys[2])
+        # self.dense = eqx.nn.Linear(2 * hidden_size, out_size, use_bias=True, key=keys[3])
+        self.dense = eqx.nn.MLP(in_size=(2 * hidden_size) + static_in_size + 1, 
+                                       out_size=out_size, 
+                                       width_size=hidden_size, 
+                                       depth=4, 
+                                       key=keys[2])
         self.dropout = eqx.nn.Dropout(dropout)
 
     def __call__(self, data):
@@ -321,25 +326,29 @@ class TAPLSTM(eqx.Module):
         i_out, skip_count = self.tealstm_i(data)
         dt = skip_count + 1 # skip = 0 is still a dt of 1
 
-        # Compute the attention decay parameter based on static features
-        attention_lambda = self.mlp_attention(data['x_s'])
+        # # Compute the attention decay parameter based on static features
+        # attention_lambda = self.mlp_attention(data['x_s'])
 
-        # Compute the raw attention weights
-        a_i = jnp.exp(-attention_lambda * dt)
-        a_d = jnp.ones_like(a_i)
+        # # Compute the raw attention weights
+        # a_i = jnp.exp(-attention_lambda * dt)
+        # a_d = jnp.ones_like(a_i)
 
-        # Normalize the attention weights
-        weight_sum = a_i + a_d
-        a_i_normalized = a_i / weight_sum
-        a_d_normalized = a_d / weight_sum
+        # # Normalize the attention weights
+        # weight_sum = a_i + a_d
+        # a_i_normalized = a_i / weight_sum
+        # a_d_normalized = a_d / weight_sum
     
-        # Apply the normalized attention weights to the outputs from both LSTM branches
-        weighted_d_out = a_i_normalized * d_out
-        weighted_i_out = a_d_normalized * i_out
+        # # Apply the normalized attention weights to the outputs from both LSTM branches
+        # weighted_d_out = a_i_normalized * d_out
+        # weighted_i_out = a_d_normalized * i_out
         
-        # jax.debug.print("dt: {a}, weight:{b}", a=dt, b=a_d_normalized)
-        # Concatenate the weighted outputs and pass through the final linear layer
-        final_out = self.dense(jnp.concatenate([weighted_d_out, weighted_i_out], axis=-1))
+        # # jax.debug.print("dt: {a}, weight:{b}", a=dt, b=a_d_normalized)
+        # # Concatenate the weighted outputs and pass through the final linear layer
+        # final_out = self.dense(jnp.concatenate([weighted_d_out, weighted_i_out], axis=-1))
+
+        # jax.debug.print("d_out:{a}\ni_out:{b}\nx_s:{c}\ndt:{d}", a=d_out.shape, b=i_out.shape, c=data['x_s'].shape, d=jnp.array([dt]).shape)
+        combined_input = jnp.concatenate([d_out, i_out, data['x_s'], jnp.array([dt])])
+        final_out = self.dense(combined_input)
 
         return final_out
 
@@ -352,11 +361,12 @@ class ANN(eqx.Module):
                  hidden_size, 
                  num_hidden_layers,
                  output_size,
-                 key, 
+                 seed, 
                  dropout):
         
         layer_sizes = (in_size, *[hidden_size]*(num_hidden_layers+1), output_size)
         total_n_layers = len(layer_sizes)-1
+        key = jax.random.PRNGKey(seed)
         keys = jrandom.split(key,total_n_layers)
         self.layers = []
         for k, i in zip(keys, range(total_n_layers)):
@@ -380,7 +390,8 @@ class HybridModel(eqx.Module):
     ealstm: EALSTM
     dropout: eqx.nn.Dropout
 
-    def __init__(self, ann_layer_sizes, dynamic_in_size, static_in_size, out_size, hidden_size, *, key, dropout=0):
+    def __init__(self, *, ann_layer_sizes, dynamic_in_size, static_in_size, out_size, hidden_size, seed, dropout=0):
+        key = jax.random.PRNGKey(seed)
         keys = jrandom.split(key, 3)
         self.ann = ANN(ann_layer_sizes, key=keys[0], dropout=dropout)
         self.ealstm = EALSTM(dynamic_in_size, static_in_size, out_size, hidden_size, key=keys[1], dropout=dropout, dense=True)

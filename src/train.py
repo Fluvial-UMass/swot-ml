@@ -7,13 +7,24 @@ import numpy as np
 from rich.progress import Progress
 import logging
 import pickle
+import json
+import os
+import re
 from pathlib import Path
 from datetime import datetime
 import matplotlib.pyplot as plt
 
 
 class Trainer:
-    def __init__(self, model, dataloader, lr_schedule, num_epochs, *, log_every=5, **step_kwargs):
+    def __init__(self, *,
+                 model_func,
+                 model_args: dict, 
+                 dataloader, 
+                 lr_schedule, 
+                 num_epochs: int, 
+                 model: eqx.Module = None,
+                 log_every=5, 
+                 **step_kwargs):
         """        
         Initializes optimizers, logging, and sets up the training environment.
         
@@ -25,12 +36,18 @@ class Trainer:
             log_every: Interval of epochs after which to log and save the model state.
             **step_kwargs: Additional keyword arguments to pass to the training step function.
         """
-        self.model = model
+        self.model_func = model_func
+        self.model_args = model_args
         self.dataloader = dataloader
         self.lr_schedule = lr_schedule
         self.num_epochs = num_epochs
         self.log_every = log_every
         self.step_kwargs = step_kwargs
+
+        if model is None:
+            self.model = model_func(**model_args)
+        else:
+            self.model = model
 
         self.loss_list = []
         self.epoch = 0
@@ -68,12 +85,21 @@ class Trainer:
                 
                 while self.epoch <= self.num_epochs:
                     self.epoch += 1
-                    loss = self._train_epoch(progress, batch_pbar)
+                    loss, bad_grads = self._train_epoch(progress, batch_pbar)
+
+                    logging.info(f"Time: {datetime.now()}, Epoch: {self.epoch}, Loss: {loss:.4f}")
+
+                    # Log the counts of any bad gradients.
+                    for type_key, tree_counts in bad_grads.items():
+                        if tree_counts:
+                            warning_str = f"{type_key} gradients detected:"
+                            for tree_key, count in tree_counts.items():
+                                warning_str += f"\n\t{tree_key}: {count}"
+                            logging.warning(warning_str)
 
                     progress.update(epoch_pbar, advance=1, description=self.epoch_str_fn(loss))
-                    logging.info(f"Time: {datetime.now()}, Epoch: {self.epoch}, Loss: {loss:.4f}")
                     if self.epoch % self.log_every == 0:
-                        self.save_model_state()
+                        self.save_state()
                     self.loss_list.append(loss)
         except KeyboardInterrupt:
             pass
@@ -81,7 +107,7 @@ class Trainer:
         # Cleanup and return 
         print("Training finished or interrupted. Model state saved.")
         if self.epoch % self.log_every != 0:
-            self.save_model_state()
+            self.save_state()
         plt.plot(self.loss_list)
     
     def _train_epoch(self, progress, batch_pbar):
@@ -103,6 +129,7 @@ class Trainer:
         consecutive_exceptions = 0
         total_loss = 0
         num_batches = 0
+        bad_grads = {'vanishing': {}, 'exploding':{}}
 
         for basins, dates, batch in self.dataloader:
             try:
@@ -122,40 +149,79 @@ class Trainer:
                 grad_norms = jtu.tree_leaves_with_path(grad_norms)
                 # Check each gradient norm
                 for keypath, norm in grad_norms:
-                    key = jtu.keystr(keypath)
-                    if norm < 1e-6:  # Threshold for vanishing gradients
-                        warning_str = f"Warning: Vanishing gradient detected during epoch {self.epoch} at {key} with norm {norm}"
-                        logging.error(warning_str)
-                    elif norm > 1e3:  # Threshold for exploding gradients
-                        logging.error(f"Warning: Exploding gradient detected during epoch {self.epoch} at {key} with norm {norm}")
-                        
+                    tree_key = jtu.keystr(keypath)
+                    type_key = 'vanishing' if norm < 1e-6 else 'exploding' if norm > 1e3 else None
+                    if type_key is not None:
+                        if tree_key not in bad_grads[type_key]:
+                            bad_grads[type_key][tree_key] = 1
+                        else:
+                            bad_grads[type_key][tree_key] += 1
+
             except Exception as e:
-                error_data = {#"trainer": self,
-                              "basins": basins,
+                error_dir = self.log_dir / "exceptions" / f"epoch{self.epoch}_exception{exception_count}"
+                self.save_state(error_dir)
+                
+                error_data = {"basins": basins,
                               "dates": dates,
                               "batch": batch}
-                error_file = self.log_dir / f"epoch{self.epoch}_error{exception_count}_data.pkl"
-                with open(error_file, "wb") as f:
+                data_fp = error_dir / "data.pkl"
+                with open(data_fp, "wb") as f:
                     pickle.dump(error_data, f)
-                logging.error(f"Model step error: {str(e)}. Error data saved to {error_file}", exc_info=True)
-                print(f"Model exception! Logged batch data and states to {error_file}")
+                logging.error(f"Model step exception: {str(e)}. States and data saved to {data_fp}", exc_info=True)
+                print(f"Model exception! Logged batch data and states to {data_fp}")
                 exception_count += 1
                 consecutive_exceptions += 1
             
-            if consecutive_exceptions >= 3:
-                raise RuntimeError(f"Too many consecutive errors ({consecutive_exceptions})")
+            if consecutive_exceptions >= 5:
+                raise RuntimeError(f"Too many consecutive exceptions ({consecutive_exceptions})")
 
             if num_batches > 0:
                 average_loss = total_loss / num_batches
                 progress.update(batch_pbar, advance=1, description=self.batch_str_fn(num_batches,average_loss))
-                
-        return average_loss
+    
+        return average_loss, bad_grads
 
-    def save_model_state(self):
-        model_state = eqx.filter(self.model, eqx.is_inexact_array)
-        model_state_file = self.log_dir / f"model_state_epoch{self.epoch}.pkl"
-        with open(model_state_file, "wb") as f:
-            pickle.dump(model_state, f)
+    def save_state(self, save_dir=None):
+        if save_dir is None:
+            save_dir = self.log_dir / f"epoch{self.epoch}"
+        os.makedirs(save_dir, exist_ok=True)
+
+        state = {'epoch': self.epoch,
+                 'loss_list': self.loss_list,
+                 'opt_state':self.opt_state}          
+        with open(save_dir / "state.pkl", "wb") as f:
+            pickle.dump(state, f)
+            
+        with open(save_dir / "model.eqx", "wb") as f:
+            model_args_str = json.dumps(self.model_args)
+            f.write((model_args_str + "\n").encode())
+            eqx.tree_serialise_leaves(f, self.model)
+
+    def load_state(self, save_dir:str):
+        with open(self.log_dir / save_dir / "state.pkl", "rb") as f:
+            state = pickle.load(f)
+            self.epoch = state['epoch']
+            self.loss_list = state['loss_list']
+            self.opt_state = state['opt_state']
+             
+        with open(self.log_dir / save_dir / "model.eqx", "rb") as f:
+            model_args = json.loads(f.readline().decode())
+            model = self.model_func(**model_args)
+            self.model = eqx.tree_deserialise_leaves(f, model)
+
+        data_path = self.log_dir / save_dir / "data.pkl"
+        if os.path.exists(data_path):
+            with open(data_path, 'rb') as file:
+                data = pickle.load(file)
+            return data
+
+    def load_last_state(self):
+        epoch_regex = re.compile(r"epoch(\d+)")
+        dirs = os.listdir(self.log_dir)
+        matches = [epoch_regex.match(d) for d in dirs]
+        epochs = [int(m.group(1)) for m in matches if isinstance(m, re.Match)]
+        save_dir = f"epoch{max(epochs)}"
+        self.load_state(save_dir)
 
     def freeze_components(self, component_names=None, freeze:bool=True):
         if isinstance(component_names, str):
@@ -164,7 +230,6 @@ class Trainer:
         # Returns True for any elements we want to be differentiable
         def diff_filter(keypath, _):
             keystr = jtu.keystr(keypath)
-
             # return not freeze for all components if None is passed
             if component_names is None:
                 return not freeze
@@ -176,33 +241,15 @@ class Trainer:
                 return True
                 
         self.filter_spec = jtu.tree_map_with_path(diff_filter, self.model)
-            
 
 def mse_loss(y, y_pred):
     mse = jnp.mean(jnp.square(y[...,-1] - y_pred[...,-1]))
     return mse
 
 # Intermittent flow modified MSE
-def if_mse_loss(y, y_pred, q):
-    """
-    Computes the intermittent flow modified mean squared error loss.
-
-    Args:
-        y (jax.Array): The true target values.
-        y_pred (jax.Array): The predicted target values.
-        q (jax.Array): The flow rate values.
-
-    Returns:
-        jax.Array: The intermittent flow modified mean squared error loss.
-    """
-    mse = mse_loss(y, y_pred)
-    if_err = jnp.where(q==0,
-                       y_pred-0,
-                       jnp.nan)
-    if_mse = jnp.nanmean(jnp.square(if_err))
-    
-    loss = jnp.nansum(jnp.array([mse, if_mse*0.1]))
-    return loss
+def mae_loss(y, y_pred, q):
+    mse = jnp.mean(jnp.abs(y[...,-1] - y_pred[...,-1]))
+    return mae
 
 @eqx.filter_value_and_grad
 def compute_loss(diff_model, static_model, data, loss_name):
@@ -210,7 +257,8 @@ def compute_loss(diff_model, static_model, data, loss_name):
     Computes the loss between the model predictions and the targets using the specified loss function.
 
     Args:
-        model (LSTM): The LSTM model.
+        diff_model (equinox.Module): differentiable components of model.
+        static_model (equinox.Module): static components of model.
         data (dict): Dictionary containing all input data.
         loss_name (str): The name of the loss function to use.
 
@@ -219,10 +267,22 @@ def compute_loss(diff_model, static_model, data, loss_name):
     """
     model = eqx.combine(diff_model, static_model)
     y_pred = jax.vmap(model)(data)
+
+    def print_func(operand):
+        data, y_pred = operand
+        jax.debug.print("y: {a}, pred:{b}", a=data['y'][...,-1], b=y_pred[...,-1])
+        return None
+
+    is_nan = jnp.any(jnp.isnan(y_pred))
+    jax.lax.cond(is_nan,
+                 print_func,
+                 lambda *args: None,
+                 operand=(data, y_pred))
+    
     if loss_name == "mse":
         return mse_loss(data['y'], y_pred)
-    elif loss_name == "if_mse":
-        return if_mse_loss(data['y'], y_pred, data['x_dd'][:,-1])
+    elif loss_name == "mae":
+        return mae_loss(data['y'], y_pred)
     else:
         raise ValueError("Invalid loss function name.")  
     
@@ -268,6 +328,7 @@ def make_step(model, data, opt_state, optim, filter_spec, loss_name="mse", max_g
         data (dict): Dictionary of batched data arrays for model input
         opt_state: The state of the optimizer.
         optim: The optimizer.
+        filter_spec (pytree): Pytree filter spec following structure of model. True elements will be updated.
         max_grad_norm (float, optional): The maximum norm for clipping gradients. Defaults to None.
         l2_reg (float, optional): The L2 regularization strength. Defaults to None.
 

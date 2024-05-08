@@ -5,9 +5,7 @@ DEST_DIR="/work/pi_kandread_umass_edu/tss-ml"
 
 # Define folders to exclude
 EXCLUDE=(
-    ".git"
-    ".gitignore"
-    ".github*"
+    "logs"
     ".DS_Store"
     "__pycache__"
     ".ipynb_checkpoints"

@@ -45,6 +45,7 @@ class TAPDataLoader(DataLoader):
         x_di = jnp.stack([item['x_di'] for item in sample])
         x_s = jnp.stack([item['x_s'] for item in sample])
         y = jnp.stack([item['y'] for item in sample])
+        
         batch = {'x_dd':x_dd, 'x_di':x_di, 'x_s':x_s, 'y': y}
         return basin, date, batch
 
