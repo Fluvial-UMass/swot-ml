@@ -111,7 +111,6 @@ class TAPDataset(Dataset):
         split_time (np.datetime64): Date to split the data into training and testing sets.
         sequence_length (int): Length of the input sequences.
         train (bool): Whether to load training data. If False, loads testing data.
-        discharge_col (str): Name of the discharge column, if any.
         log_norm_cols (list): List of columns to apply log normalization.
         range_norm_cols (list): List of columns to apply range normalization.
     """
@@ -125,7 +124,6 @@ class TAPDataset(Dataset):
                  sequence_length: int,
                  sequence: bool = True,
                  static_features: list = None,
-                 discharge_col: str = None,
                  log_norm_cols: list = [],
                  range_norm_cols: list = [],
                  clip_target_to_zero: bool = False,
@@ -147,7 +145,6 @@ class TAPDataset(Dataset):
         
         self.all_features =  [value for sublist in features_dict.values() for value in sublist] # Unpack all features
         self.daily_features = features_dict['daily']
-        self.discharge_idx = features_dict['daily'].index(discharge_col)
         self.irregular_features = features_dict.get('irregular') # is None if key doesn't exist. 
         self.static_features = static_features
 

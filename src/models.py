@@ -311,13 +311,15 @@ class TAPLSTM(eqx.Module):
                                key=keys[0], dropout=0, dense=False)
         self.tealstm_i = TEALSTM(irregular_in_size, static_in_size, out_size, hidden_size, 
                                  key=keys[1], dropout=0, dense=False)
+        
         # self.mlp_attention = eqx.nn.MLP(in_size=static_in_size, out_size=1, width_size=hidden_size, 
         #                                 depth=3, key=keys[2])
         # self.dense = eqx.nn.Linear(2 * hidden_size, out_size, use_bias=True, key=keys[3])
+        
         self.dense = eqx.nn.MLP(in_size=(2 * hidden_size) + static_in_size + 1, 
                                        out_size=out_size, 
                                        width_size=hidden_size, 
-                                       depth=4, 
+                                       depth=2, 
                                        key=keys[2])
         self.dropout = eqx.nn.Dropout(dropout)
 

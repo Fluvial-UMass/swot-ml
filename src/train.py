@@ -10,6 +10,7 @@ import pickle
 import json
 import os
 import re
+import traceback
 from pathlib import Path
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -23,7 +24,7 @@ class Trainer:
                  lr_schedule, 
                  num_epochs: int, 
                  model: eqx.Module = None,
-                 log_every=5, 
+                 log_interval=10, 
                  **step_kwargs):
         """        
         Initializes optimizers, logging, and sets up the training environment.
@@ -33,7 +34,7 @@ class Trainer:
             dataloader: An iterable dataloader that provides batches of data.
             lr_schedule: A function that returns the learning rate given the epoch number.
             num_epochs: Total number of epochs to train the model.
-            log_every: Interval of epochs after which to log and save the model state.
+            log_interval: Interval of epochs after which to log and save the model state.
             **step_kwargs: Additional keyword arguments to pass to the training step function.
         """
         self.model_func = model_func
@@ -41,7 +42,7 @@ class Trainer:
         self.dataloader = dataloader
         self.lr_schedule = lr_schedule
         self.num_epochs = num_epochs
-        self.log_every = log_every
+        self.log_interval = log_interval
         self.step_kwargs = step_kwargs
 
         if model is None:
@@ -87,7 +88,7 @@ class Trainer:
                     self.epoch += 1
                     loss, bad_grads = self._train_epoch(progress, batch_pbar)
 
-                    logging.info(f"Time: {datetime.now()}, Epoch: {self.epoch}, Loss: {loss:.4f}")
+                    logging.info(f"Epoch: {self.epoch}, Loss: {loss:.4f}")
 
                     # Log the counts of any bad gradients.
                     for type_key, tree_counts in bad_grads.items():
@@ -98,7 +99,7 @@ class Trainer:
                             logging.warning(warning_str)
 
                     progress.update(epoch_pbar, advance=1, description=self.epoch_str_fn(loss))
-                    if self.epoch % self.log_every == 0:
+                    if self.epoch % self.log_interval == 0:
                         self.save_state()
                     self.loss_list.append(loss)
         except KeyboardInterrupt:
@@ -106,8 +107,9 @@ class Trainer:
 
         # Cleanup and return 
         print("Training finished or interrupted. Model state saved.")
-        if self.epoch % self.log_every != 0:
+        if self.epoch % self.log_interval != 0:
             self.save_state()
+        logging.info("~~~ training stopped ~~~")
         plt.plot(self.loss_list)
     
     def _train_epoch(self, progress, batch_pbar):
@@ -167,8 +169,15 @@ class Trainer:
                 data_fp = error_dir / "data.pkl"
                 with open(data_fp, "wb") as f:
                     pickle.dump(error_data, f)
-                logging.error(f"Model step exception: {str(e)}. States and data saved to {data_fp}", exc_info=True)
-                print(f"Model exception! Logged batch data and states to {data_fp}")
+                    
+                exception_fp = error_dir / "exception.txt"
+                with open(exception_fp, "w") as f:
+                    f.write(str(e) + "\n" + traceback.format_exc())
+
+                error_str = f"{type(e).__name__} exception caught. See {error_dir} for data, model, state, and trace."
+                logging.error(error_str)
+                print(error_str)
+                
                 exception_count += 1
                 consecutive_exceptions += 1
             
@@ -209,6 +218,7 @@ class Trainer:
             model = self.model_func(**model_args)
             self.model = eqx.tree_deserialise_leaves(f, model)
 
+        # If some data were stored alongside this record, load and return it.
         data_path = self.log_dir / save_dir / "data.pkl"
         if os.path.exists(data_path):
             with open(data_path, 'rb') as file:
