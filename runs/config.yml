@@ -1,0 +1,57 @@
+data_args:
+  data_dir: "./data/wqp"
+  basin_file: "metadata/site_lists/sites_test.txt"
+  #basin_file: "metadata/site_lists/sites_turb_area1000_n10.txt"
+  features:
+    daily:
+      - "grfr_q"
+    irregular:
+      - "Blue"
+      - "Green"
+      - "Red"
+      - "Nir"
+      - "Swir1"
+      - "Swir2"
+    static:
+      - "wet_pc_s02"
+      - "glc_pc_s11"
+      - "wet_pc_s02"
+      - "glc_pc_s11"
+      - "dor_pc_pva"
+      - "soc_th_sav"
+      - "snw_pc_s08"
+      - "wet_pc_s09"
+      - "fmh_cl_smj"
+      - "glc_pc_s14"
+      - "pnv_pc_s11"
+      - "pac_pc_sse"
+    target: "turbidity"
+  time_slice: ["1979-01-01", "2018-12-31"]
+  split_time: 2010-01-01 
+  sequence_length: 30
+  log_norm_cols:
+    - "turbidity"
+    - "grfr_q"
+  clip_target_to_zero: true
+
+loader_args:
+  shuffle: true
+  batch_size: 256
+  data_subset: "train"
+  num_workers: 1
+  pin_memory: true
+
+model: "taplstm"
+model_args:
+  hidden_size: 256
+  dropout: 0.4
+  seed: 0
+
+# Training args
+num_epochs: 500
+learning_rate: 0.01
+decay_rate: 0.01
+max_grad_norm: 2
+
+# Misc
+quiet: false # Use to declutter the slurm output (removes tqdm)
