@@ -1,7 +1,7 @@
 import os
 from collections import defaultdict
 from pathlib import Path
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
 import pandas as pd
 import xarray as xr
 import numpy as np
@@ -11,9 +11,11 @@ import jax.tree_util as jutil
 import jax.sharding as jshard
 from torch.utils.data import Dataset, DataLoader
 
+from utils import smart_tqdm
+
 
 class TAPDataLoader(DataLoader):
-    def __init__(self, dataset, **kwargs):
+    def __init__(self, dataset, **kwargs):    
         num_workers = kwargs.get('num_workers', 1)
         persistent_workers = False if num_workers==0 else kwargs.get('persistent_workers',True)
         
@@ -116,37 +118,43 @@ class TAPDataset(Dataset):
     """
     def __init__(self, *,
                  data_dir: Path, 
-                 basin_list: list,
-                 features_dict: dict,
-                 target: str,
+                 basin_file: Path,
+                 features: dict,
                  time_slice: slice,
                  split_time: np.datetime64,
                  sequence_length: int,
                  sequence: bool = True,
-                 static_features: list = None,
                  log_norm_cols: list = [],
                  range_norm_cols: list = [],
                  clip_target_to_zero: bool = False,
+                 quiet: bool = False,
                  **kwargs):
 
         # Validate the feature dict
-        if not isinstance(features_dict.get('daily'), list):
+        if not isinstance(features.get('daily'), list):
             raise ValueError("features_dict must contain a list of daily features at a minimum.")
 
         self.data_dir = data_dir
-        self.basins = basin_list
-        self.target = target
+        self.basin_file = basin_file
         self.time_slice = time_slice
         self.split_time = split_time
         self.sequence_length = sequence_length
         self.log_norm_cols = log_norm_cols
         self.range_norm_cols = range_norm_cols
         self.clip_target_to_zero = clip_target_to_zero
+        self.quiet = quiet
         
-        self.all_features =  [value for sublist in features_dict.values() for value in sublist] # Unpack all features
-        self.daily_features = features_dict['daily']
-        self.irregular_features = features_dict.get('irregular') # is None if key doesn't exist. 
-        self.static_features = static_features
+        with open(basin_file, 'r') as file:
+            basin_list = file.readlines()
+            basin_list = [basin.strip() for basin in basin_list]
+        self.basins = basin_list
+        
+        self.daily_features = features['daily']
+        self.irregular_features = features.get('irregular') # is None if key doesn't exist. 
+        self.static_features = features.get('static')
+        self.target = features['target']
+        
+        self.all_features =  self.daily_features + self.irregular_features
 
         self.log_pad = 0.001
 
@@ -175,13 +183,13 @@ class TAPDataset(Dataset):
 
         self.indices = defaultdict(dict)
         ds_list = []
-        for basin in tqdm(self.basins, desc="Loading Basins"):
+        for basin in smart_tqdm(self.basins, self.quiet, desc="Loading Basins"):
             file_path = f"{self.data_dir}/time_series/{basin}.nc"
             ds = xr.open_dataset(file_path).sel(date=self.time_slice)
             ds['date'] = ds['date'].astype('datetime64[ns]')
     
             # Filter to keep only the necessary features and the target variable
-            ds = ds[[*self.all_features, self.target]]
+            ds = ds[[*self.daily_features, *self.irregular_features, self.target]]
 
             # Replace negative values with NaN in specific columns without explicit loop
             for col in self.log_norm_cols:

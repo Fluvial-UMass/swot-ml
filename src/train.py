@@ -4,7 +4,6 @@ import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
 import numpy as np
-from rich.progress import Progress
 import logging
 import pickle
 import json
@@ -15,6 +14,8 @@ from pathlib import Path
 from datetime import datetime
 import matplotlib.pyplot as plt
 
+from utils import smart_tqdm
+
 
 class Trainer:
     def __init__(self, *,
@@ -24,8 +25,12 @@ class Trainer:
                  lr_schedule, 
                  num_epochs: int, 
                  model: eqx.Module = None,
-                 log_interval=10, 
-                 **step_kwargs):
+                 log_interval=10,
+                 quiet=False,
+                 config_dir:Path=None,
+                 config_str=None,
+                 max_grad_norm=None,
+                 l2_weight=None):
         """        
         Initializes optimizers, logging, and sets up the training environment.
         
@@ -43,7 +48,11 @@ class Trainer:
         self.lr_schedule = lr_schedule
         self.num_epochs = num_epochs
         self.log_interval = log_interval
-        self.step_kwargs = step_kwargs
+        self.quiet = quiet
+        
+        self.step_kwargs = {}
+        self.step_kwargs['max_grad_norm'] = max_grad_norm
+        self.step_kwargs['l2_weight'] = l2_weight
 
         if model is None:
             self.model = model_func(**model_args)
@@ -52,8 +61,6 @@ class Trainer:
 
         self.loss_list = []
         self.epoch = 0
-        self.epoch_str_fn = lambda l: f"[red]Epoch:{self.epoch} Loss:{l:.4f}"
-        self.batch_str_fn = lambda b,l: f"[green]Batch:{b}/{len(dataloader)} Loss:{l:.4f}"
         
         self.optim = optax.adam(lr_schedule(self.epoch))
         self.opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
@@ -62,11 +69,16 @@ class Trainer:
 
         # Setup logging
         current_date = datetime.now().strftime("%Y%m%d_%H%M")
-        self.log_dir = Path(f"../logs/{current_date}")
-        self.log_dir.mkdir(exist_ok=True)
+        if config_dir is not None:
+            self.log_dir = config_dir / current_date
+        else:     
+            self.log_dir = Path(f"./logs/{current_date}")
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         log_file = self.log_dir / "training.log"
         logging.basicConfig(filename=log_file, filemode='w', level=logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s', force=True)
+        if config_str is not None:
+            logging.info("Run Configuration\n"+config_str)
 
     def start_training(self):
         """
@@ -80,28 +92,26 @@ class Trainer:
             The trained model after completing the training or upon an interruption.
         """ 
         try:
-            with Progress() as progress:
-                epoch_pbar = progress.add_task(self.epoch_str_fn(0), completed=self.epoch, total=self.num_epochs)
-                batch_pbar = progress.add_task(self.batch_str_fn(0,0))
-                
-                while self.epoch <= self.num_epochs:
-                    self.epoch += 1
-                    loss, bad_grads = self._train_epoch(progress, batch_pbar)
+            while self.epoch <= self.num_epochs:
+                self.epoch += 1
+                loss, bad_grads = self._train_epoch()
 
-                    logging.info(f"Epoch: {self.epoch}, Loss: {loss:.4f}")
+                info_str = f"Epoch: {self.epoch}, Loss: {loss:.4f}"
+                logging.info(info_str)
+                if self.quiet:
+                    print(info_str)
 
-                    # Log the counts of any bad gradients.
-                    for type_key, tree_counts in bad_grads.items():
-                        if tree_counts:
-                            warning_str = f"{type_key} gradients detected:"
-                            for tree_key, count in tree_counts.items():
-                                warning_str += f"\n\t{tree_key}: {count}"
-                            logging.warning(warning_str)
+                # Log the counts of any bad gradients.
+                for type_key, tree_counts in bad_grads.items():
+                    if tree_counts:
+                        warning_str = f"{type_key} gradients detected:"
+                        for tree_key, count in tree_counts.items():
+                            warning_str += f"\n\t{tree_key}: {count}"
+                        logging.warning(warning_str)
 
-                    progress.update(epoch_pbar, advance=1, description=self.epoch_str_fn(loss))
-                    if self.epoch % self.log_interval == 0:
-                        self.save_state()
-                    self.loss_list.append(loss)
+                if self.epoch % self.log_interval == 0:
+                    self.save_state()
+                self.loss_list.append(loss)
         except KeyboardInterrupt:
             pass
 
@@ -112,28 +122,24 @@ class Trainer:
         logging.info("~~~ training stopped ~~~")
         plt.plot(self.loss_list)
     
-    def _train_epoch(self, progress, batch_pbar):
+    def _train_epoch(self):
         """
         Iterates over the dataloader batches, updates the model using the optimization step, and handles 
         any exceptions that occur during the training. Logs errors and saves error data if issues are encountered.
     
-        Args:
-            progress: The rich progress manager instance to update the progress bar.
-            batch_pbar: The batch progress bar within the epoch.
-    
         Returns:
             float: The average loss calculated over the epoch.
         """
-        self.optim = optax.adam(self.lr_schedule(self.epoch))
-        progress.reset(batch_pbar)
-        progress.update(batch_pbar, completed=0, total=len(self.dataloader)-1, description=self.batch_str_fn(0,0))
+        lr = self.lr_schedule(self.epoch)
+        self.optim = optax.adam(lr)
         exception_count = 0
         consecutive_exceptions = 0
         total_loss = 0
         num_batches = 0
         bad_grads = {'vanishing': {}, 'exploding':{}}
 
-        for basins, dates, batch in self.dataloader:
+        pbar = smart_tqdm(self.dataloader, self.quiet, desc=f"Epoch:{self.epoch:03.0f}")
+        for basins, dates, batch in pbar:
             try:
                 batch = self.dataloader.shard_batch(batch)
                 loss, grads, self.model, self.opt_state = make_step(self.model, batch, self.opt_state, 
@@ -186,7 +192,7 @@ class Trainer:
 
             if num_batches > 0:
                 average_loss = total_loss / num_batches
-                progress.update(batch_pbar, advance=1, description=self.batch_str_fn(num_batches,average_loss))
+                pbar.set_postfix_str(f"Loss:{average_loss:0.04f}")
     
         return average_loss, bad_grads
 

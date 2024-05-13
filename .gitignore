@@ -1,5 +1,6 @@
 data/
 logs/
+/runs/*/logs
 
 # OSX / *nix default autosave extension
 *.m~

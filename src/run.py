@@ -49,3 +49,8 @@ if __name__ == '__main__':
                       config_str=config_str,
                       **config['trainer_args'])
     trainer.start_training()
+    
+    
+    
+    
+    

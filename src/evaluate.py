@@ -2,7 +2,7 @@ import equinox as eqx
 import jax
 import pandas as pd
 import numpy as np
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
 
 @eqx.filter_jit
 def _predict_map(model, batch):

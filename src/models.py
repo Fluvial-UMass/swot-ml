@@ -176,12 +176,12 @@ class TEALSTMCell(eqx.Module):
     weight_decomp: jax.Array
     bias_decomp: jax.Array
     
-    def __init__(self, dynamic_input_size, static_input_size, out_size, hidden_size, *, key):
+    def __init__(self, dynamic_in_size, static_in_size, out_size, hidden_size, *, key):
         wkey, bkey, ikey, dkey = jrandom.split(key, 4)
-        self.weight_ih = jax.nn.initializers.glorot_normal()(wkey, (3 * hidden_size, dynamic_input_size))
+        self.weight_ih = jax.nn.initializers.glorot_normal()(wkey, (3 * hidden_size, dynamic_in_size))
         self.weight_hh = jax.nn.initializers.glorot_normal()(wkey, (3 * hidden_size, hidden_size))
         self.bias = jax.nn.initializers.zeros(bkey, (3 * hidden_size,))
-        self.input_linear = eqx.nn.Linear(static_input_size, hidden_size, use_bias=True, key=ikey)
+        self.input_linear = eqx.nn.Linear(static_in_size, hidden_size, use_bias=True, key=ikey)
         self.weight_decomp = jax.nn.initializers.glorot_normal()(dkey, (hidden_size, hidden_size))
         self.bias_decomp = jax.nn.initializers.zeros(dkey, (hidden_size))
         
