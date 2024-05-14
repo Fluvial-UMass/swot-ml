@@ -1,0 +1,48 @@
+# Data
+data_dir: "./data/wqp"
+basin_file: "metadata/site_lists/sites_turb_area1000_n10.txt"
+features:
+    #Daily (or consistent timescale) features in the netcdf files. 
+    daily:
+      - "grfr_q"
+    #Irregularly-timed features in the netcdf files
+    irregular: 
+      - "Blue"
+      - "Green"
+      - "Red"
+      - "Nir"
+      - "Swir1"
+      - "Swir2"
+    #Static basin parameters from the csv file. If none, all are used.
+    static: 
+    target: "turbidity"
+time_slice: ["1979-01-01", "2018-12-31"] #Has to be this format for now.
+split_time: 2010-01-01
+sequence_length: 30
+log_norm_cols:
+    - "turbidity"
+    - "grfr_q"
+clip_target_to_zero: true
+
+# DataLoader
+shuffle: true
+batch_size: 32
+data_subset: "train"
+num_workers: 1
+pin_memory: true
+
+# Model
+model: "taplstm"
+model_args:
+  hidden_size: 256
+  dropout: 0.4
+  seed: 0
+
+# Trainer 
+num_epochs: 150
+learning_rate: 0.01
+decay_rate: 0.01
+max_grad_norm: 2
+
+# Misc.
+quiet: true # Use to declutter the slurm output (removes tqdm)

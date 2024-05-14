@@ -10,12 +10,10 @@ import json
 import os
 import re
 import traceback
+from tqdm.auto import tqdm
 from pathlib import Path
 from datetime import datetime
 import matplotlib.pyplot as plt
-
-from utils import smart_tqdm
-
 
 class Trainer:
     def __init__(self, *,
@@ -72,7 +70,7 @@ class Trainer:
         if config_dir is not None:
             self.log_dir = config_dir / current_date
         else:     
-            self.log_dir = Path(f"./logs/{current_date}")
+            self.log_dir = Path(f"../runs/notebooks/{current_date}")
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log_file = self.log_dir / "training.log"
         logging.basicConfig(filename=log_file, filemode='w', level=logging.INFO,
@@ -138,7 +136,7 @@ class Trainer:
         num_batches = 0
         bad_grads = {'vanishing': {}, 'exploding':{}}
 
-        pbar = smart_tqdm(self.dataloader, self.quiet, desc=f"Epoch:{self.epoch:03.0f}")
+        pbar = tqdm(self.dataloader, disable=self.quiet, desc=f"Epoch:{self.epoch:03.0f}")
         for basins, dates, batch in pbar:
             try:
                 batch = self.dataloader.shard_batch(batch)

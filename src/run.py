@@ -12,10 +12,10 @@ import optax
 from pathlib import Path
 from tqdm import trange, tqdm
 
-from utils import read_config
-from data import TAPDataset, TAPDataLoader
-from models import TAPLSTM, EALSTM, TEALSTM, HybridModel
-from train import Trainer
+from .utils import read_config
+from .data import TAPDataset, TAPDataLoader
+from .models import TAPLSTM, EALSTM, TEALSTM
+from .train import Trainer
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
@@ -29,19 +29,26 @@ if __name__ == '__main__':
     dataset = TAPDataset(quiet=quiet, **config['data_args']) 
     dataloader = TAPDataLoader(dataset, **config['loader_args'])
     
+    # Model config is a bit more dynamic
     model_name = config['model'].lower()
     if model_name == 'taplstm':
         model = TAPLSTM
+        config['model_args']['daily_in_size'] = len(dataset.daily_features)
+        config['model_args']['irregular_in_size'] = len(dataset.irregular_features)
+        config['model_args']['static_in_size'] = len(dataset.static_features)
     elif model_name == 'ealstm':
         model = EALSTM
+        config['model_args']['dynamic_in_size'] = len(dataset.daily_features)
+        config['model_args']['static_in_size'] = len(dataset.static_features)
     elif model_name == 'tealstm':
         model = TEALSTM
-    elif model_name == 'hybrid':
-        model = HybridModel
+        config['model_args']['dynamic_in_size'] = len(dataset.irregular_features)
+        config['model_args']['static_in_size'] = len(dataset.static_features)
     else:
-        raise ValueError("Please provide a valid model name (taplstm, ealstm, tealstm, hybrid)")
+        raise ValueError("Please provide a valid model name (taplstm, ealstm, tealstm)")
         
     config['trainer_args']['model_func'] = model
+    config['trainer_args']['model_args'] = config['model_args'] #Required to properly save model state
     config['trainer_args']['dataloader'] = dataloader
     
     trainer = Trainer(quiet=quiet, 

@@ -11,8 +11,6 @@ import jax.tree_util as jutil
 import jax.sharding as jshard
 from torch.utils.data import Dataset, DataLoader
 
-from utils import smart_tqdm
-
 
 class TAPDataLoader(DataLoader):
     def __init__(self, dataset, **kwargs):    
@@ -159,8 +157,7 @@ class TAPDataset(Dataset):
         self.log_pad = 0.001
 
         self.x_s, self.attributes_scale = self._load_attributes()
-        self.x_d = self._load_basin_data()
-        self.scale = self._normalize_data()
+        self.x_d, self.scale = self._load_basin_data()
         self.date_ranges = self._precompute_date_ranges()
         self.update_indices(data_subset='train')
 
@@ -183,7 +180,7 @@ class TAPDataset(Dataset):
 
         self.indices = defaultdict(dict)
         ds_list = []
-        for basin in smart_tqdm(self.basins, self.quiet, desc="Loading Basins"):
+        for basin in tqdm(self.basins, disable=self.quiet, desc="Loading Basins"):
             file_path = f"{self.data_dir}/time_series/{basin}.nc"
             ds = xr.open_dataset(file_path).sel(date=self.time_slice)
             ds['date'] = ds['date'].astype('datetime64[ns]')
@@ -220,8 +217,9 @@ class TAPDataset(Dataset):
 
         ds = xr.concat(ds_list, dim="basin")
         ds = ds.drop_duplicates('basin')
+        x_d, scale = self._normalize_data(ds)
         
-        return ds
+        return x_d, scale
 
     def _load_attributes(self):
         """
@@ -277,41 +275,41 @@ class TAPDataset(Dataset):
         sample = {'basin': basin, 'date': date, 'x_dd': x_dd, 'x_di': x_di, 'x_s': x_s, 'y': y}
         return sample
 
-    def _normalize_data(self):
+    def _normalize_data(self, ds):
         """
         Normalize the input data using log normalization for specified variables and standard normalization for others.
-        Updates the self.x_d dataset in place with the normalized data.
         
         Returns:
-            Dict[str, Dict[str, float]]: A dictionary containing the 'offset', 'scale', and 'log_norm' for each variable.
+            ds: the input xarray dataset after normalization
+            scale: A dictionary containing the 'offset', 'scale', and 'log_norm' for each variable.
         """
         # Initialize
-        scale = {k: {'offset': 0, 'scale': 1, 'log_norm': False} for k in self.x_d.data_vars}
+        scale = {k: {'offset': 0, 'scale': 1, 'log_norm': False} for k in ds.data_vars}
     
         # Subset the dataset to the training time period
-        training_ds = self.x_d.sel(date=slice(None, self.split_time))
+        training_ds = ds.sel(date=slice(None, self.split_time))
     
         # Iterate over each variable in the dataset
-        for var in self.x_d.data_vars:
+        for var in ds.data_vars:
             if var in self.log_norm_cols:
                 # Perform log normalization
                 scale[var]['log_norm'] = True
-                x = self.x_d[var] + self.log_pad
+                x = ds[var] + self.log_pad
                 training_x = x.sel(date=slice(None, self.split_time))
                 scale[var]['offset'] = np.nanmean(np.log(training_x))    
                 # Apply normalization and offset
-                self.x_d[var] = np.log(x) - scale[var]['offset']
+                ds[var] = np.log(x) - scale[var]['offset']
             elif var in self.range_norm_cols:
                 # Perform min-max scaling
                 scale[var]['scale'] = training_ds[var].max().values.item()
-                self.x_d[var] = self.x_d[var] / scale[var]['scale']
+                ds[var] = ds[var] / scale[var]['scale']
             else:
                 # Perform standard normalization
                 scale[var]['offset'] = training_ds[var].mean().values.item()
                 scale[var]['scale'] = training_ds[var].std().values.item()
-                self.x_d[var] = (self.x_d[var] - scale[var]['offset']) / scale[var]['scale']
+                ds[var] = (ds[var] - scale[var]['offset']) / scale[var]['scale']
                 
-        return scale
+        return ds, scale
  
     def denormalize_target(self, y_normalized):
         """
