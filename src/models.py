@@ -203,11 +203,11 @@ class TEALSTMCell(eqx.Module):
         h_0, c_0 = state
 
         # Apply time decay if we have skipped any updates.
-        c_0 = self._decomp_and_decay(c_0, skip_count)
-        # c_0 = lax.cond(skip_count>0,
-        #                lambda _: self._decomp_and_decay(c_0, skip_count),  # Pass c_0 to the decay function
-        #                lambda _: c_0,  # Return c_0 as is
-        #                operand=None)  # The operand is not used in the functions
+        # c_0 = self._decomp_and_decay(c_0, skip_count)
+        c_0 = lax.cond(skip_count>0,
+                       lambda _: self._decomp_and_decay(c_0, skip_count),  # Pass c_0 to the decay function
+                       lambda _: c_0,  # Return c_0 as is
+                       operand=None)  # The operand is not used in the functions
 
         # Compute the gates
         gates = jnp.dot(x_d, self.weight_ih.T) + jnp.dot(h_0, self.weight_hh.T) + self.bias

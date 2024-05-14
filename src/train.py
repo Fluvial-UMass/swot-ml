@@ -16,62 +16,70 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 
 class Trainer:
-    def __init__(self, *,
-                 model_func,
-                 model_args: dict, 
-                 dataloader, 
-                 lr_schedule, 
-                 num_epochs: int, 
-                 model: eqx.Module = None,
-                 log_interval=10,
-                 quiet=False,
-                 config_dir:Path=None,
-                 config_str=None,
-                 max_grad_norm=None,
-                 l2_weight=None):
+    """
+    A class to handle training of models.
+
+    Attributes:
+        cfg (dict): Configuration dictionary.
+        dataloader: DataLoader object.
+        model_fn: Function to create the model.
+        log_dir (Path): Directory for logging.
+        num_epochs (int): Number of epochs for training.
+        log_interval (int): Interval for logging.
+        lr_schedule: Learning rate scheduler.
+        model: Model to be trained.
+        loss_list (list): List to store loss values.
+        epoch (int): Current epoch.
+        optim: Optimizer.
+        opt_state: Optimizer state.
+        filter_spec: Specification for freezing components.
+    """
+    def __init__(self, cfg, dataloader, model_fn, *, log_parent:Path=None, config_str=None, model=None):
         """        
         Initializes optimizers, logging, and sets up the training environment.
-        
+
         Args:
-            model: The model to be trained.
-            dataloader: An iterable dataloader that provides batches of data.
-            lr_schedule: A function that returns the learning rate given the epoch number.
-            num_epochs: Total number of epochs to train the model.
-            log_interval: Interval of epochs after which to log and save the model state.
-            **step_kwargs: Additional keyword arguments to pass to the training step function.
+            cfg (dict): Configuration dictionary.
+            dataloader: DataLoader object.
+            model_fn: Function to create the model.
+            log_parent (Path, optional): Parent directory for logging.
+            config_str (str, optional): Configuration string for logging.
+            model (eqx.Module, optional): Pre-initialized model.
         """
-        self.model_func = model_func
-        self.model_args = model_args
+        self.cfg = cfg
         self.dataloader = dataloader
-        self.lr_schedule = lr_schedule
-        self.num_epochs = num_epochs
-        self.log_interval = log_interval
-        self.quiet = quiet
+        self.model_fn = model_fn
         
-        self.step_kwargs = {}
-        self.step_kwargs['max_grad_norm'] = max_grad_norm
-        self.step_kwargs['l2_weight'] = l2_weight
+        self.num_epochs = cfg['num_epochs']
+        self.log_interval = cfg.get('log_interval', 5)
+        
+        self.lr_schedule = optax.exponential_decay(
+            cfg['initial_lr'],
+            cfg['num_epochs'],
+            cfg['decay_rate'])
 
         if model is None:
-            self.model = model_func(**model_args)
+            self.model = model_fn(**cfg['model_args'])
         else:
             self.model = model
 
         self.loss_list = []
         self.epoch = 0
         
-        self.optim = optax.adam(lr_schedule(self.epoch))
+        self.optim = optax.adam(self.lr_schedule(self.epoch))
         self.opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
 
+        #unfreeze everything
         self.freeze_components(None, False)
 
         # Setup logging
         current_date = datetime.now().strftime("%Y%m%d_%H%M")
-        if config_dir is not None:
-            self.log_dir = config_dir / current_date
+        if log_parent is not None:
+            self.log_dir = log_parent / current_date
         else:     
-            self.log_dir = Path(f"../runs/notebooks/{current_date}")
+            self.log_dir = Path(f"../runs/notebook/{current_date}")
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        
         log_file = self.log_dir / "training.log"
         logging.basicConfig(filename=log_file, filemode='w', level=logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s', force=True)
@@ -81,14 +89,13 @@ class Trainer:
     def start_training(self):
         """
         Starts or continues training the model.
-    
+
         Manages the training loop, including updating progress bars, logging, handling keyboard 
-        interruptions, and saving the model state at specified intervals. Catches a KeyboardInterrupt 
-        to save the model state before exiting.
-    
+        interruptions, and saving the model state at specified intervals.
+
         Returns:
             The trained model after completing the training or upon an interruption.
-        """ 
+        """
         try:
             while self.epoch <= self.num_epochs:
                 self.epoch += 1
@@ -96,7 +103,7 @@ class Trainer:
 
                 info_str = f"Epoch: {self.epoch}, Loss: {loss:.4f}"
                 logging.info(info_str)
-                if self.quiet:
+                if self.cfg['quiet']:
                     print(info_str)
 
                 # Log the counts of any bad gradients.
@@ -124,7 +131,7 @@ class Trainer:
         """
         Iterates over the dataloader batches, updates the model using the optimization step, and handles 
         any exceptions that occur during the training. Logs errors and saves error data if issues are encountered.
-    
+
         Returns:
             float: The average loss calculated over the epoch.
         """
@@ -136,12 +143,12 @@ class Trainer:
         num_batches = 0
         bad_grads = {'vanishing': {}, 'exploding':{}}
 
-        pbar = tqdm(self.dataloader, disable=self.quiet, desc=f"Epoch:{self.epoch:03.0f}")
+        pbar = tqdm(self.dataloader, disable=self.cfg['quiet'], desc=f"Epoch:{self.epoch:03.0f}")
         for basins, dates, batch in pbar:
             try:
                 batch = self.dataloader.shard_batch(batch)
                 loss, grads, self.model, self.opt_state = make_step(self.model, batch, self.opt_state, 
-                                                                    self.optim, self.filter_spec, **self.step_kwargs)
+                                                                    self.optim, self.filter_spec, **self.cfg['step_kwargs'])
 
                 if jnp.isnan(loss):
                     raise RuntimeError(f"NaN loss encountered")
@@ -206,7 +213,7 @@ class Trainer:
             pickle.dump(state, f)
             
         with open(save_dir / "model.eqx", "wb") as f:
-            model_args_str = json.dumps(self.model_args)
+            model_args_str = json.dumps(self.cfg['model_args'])
             f.write((model_args_str + "\n").encode())
             eqx.tree_serialise_leaves(f, self.model)
 
@@ -219,7 +226,7 @@ class Trainer:
              
         with open(self.log_dir / save_dir / "model.eqx", "rb") as f:
             model_args = json.loads(f.readline().decode())
-            model = self.model_func(**model_args)
+            model = self.model_fn(**model_args)
             self.model = eqx.tree_deserialise_leaves(f, model)
 
         # If some data were stored alongside this record, load and return it.
@@ -282,11 +289,11 @@ def compute_loss(diff_model, static_model, data, loss_name):
     model = eqx.combine(diff_model, static_model)
     y_pred = jax.vmap(model)(data)
 
+    # Debugging
     def print_func(operand):
         data, y_pred = operand
         jax.debug.print("y: {a}, pred:{b}", a=data['y'][...,-1], b=y_pred[...,-1])
         return None
-
     is_nan = jnp.any(jnp.isnan(y_pred))
     jax.lax.cond(is_nan,
                  print_func,
@@ -333,7 +340,7 @@ def l2_regularization(model, weight_decay):
     return 0.5 * weight_decay * sum_l2
 
 @eqx.filter_jit    
-def make_step(model, data, opt_state, optim, filter_spec, loss_name="mse", max_grad_norm=None, l2_weight=None):
+def make_step(model, data, opt_state, optim, filter_spec, loss="mse", max_grad_norm=None, l2_weight=None):
     """
     Performs a single optimization step, updating the model parameters.
 
@@ -350,7 +357,7 @@ def make_step(model, data, opt_state, optim, filter_spec, loss_name="mse", max_g
         tuple: A tuple containing the loss, updated model, and updated optimizer state.
     """
     diff_model, static_model = eqx.partition(model, filter_spec)
-    loss, grads = compute_loss(diff_model, static_model, data, loss_name)
+    loss, grads = compute_loss(diff_model, static_model, data, loss)
     
     if max_grad_norm is not None:
         grads = clip_gradients(grads, max_grad_norm)

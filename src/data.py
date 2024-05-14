@@ -13,27 +13,27 @@ from torch.utils.data import Dataset, DataLoader
 
 
 class TAPDataLoader(DataLoader):
-    def __init__(self, dataset, **kwargs):    
-        num_workers = kwargs.get('num_workers', 1)
-        persistent_workers = False if num_workers==0 else kwargs.get('persistent_workers',True)
+    def __init__(self, cfg, dataset):    
+        num_workers = cfg.get('num_workers', 1)
+        persistent_workers = False if num_workers==0 else cfg.get('persistent_workers',True)
         
         super().__init__(dataset,
                          collate_fn=self.collate_batch,
-                         shuffle=kwargs.get('shuffle', True),
-                         batch_size=kwargs.get('batch_size', 1),
+                         shuffle=cfg.get('shuffle', True),
+                         batch_size=cfg.get('batch_size', 1),
                          num_workers=num_workers,
-                         pin_memory=kwargs.get('pin_memory', True),
+                         pin_memory=cfg.get('pin_memory', True),
                          persistent_workers=persistent_workers)     
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 
         # Dataset index params
-        self.data_subset = kwargs.get('data_subset','train')
-        self.basin_subset = kwargs.get('basin_subset',None)
+        self.data_subset = cfg.get('data_subset','train')
+        self.basin_subset = cfg.get('basin_subset',None)
         self.set_mode()
 
         # Data sharding params
-        backend = kwargs.get('backend', None)
-        num_devices = kwargs.get('num_devices', None)
+        backend = cfg.get('backend', None)
+        num_devices = cfg.get('num_devices', None)
         self.set_jax_sharding(backend, num_devices)
 
     @staticmethod
@@ -101,58 +101,25 @@ class TAPDataLoader(DataLoader):
 class TAPDataset(Dataset):
     """
     DataLoader class for loading and preprocessing hydrological time series data.
-
-    Attributes:
-        data_dir (Path): Path to the directory containing the data.
-        basins (list): List of basin identifiers.
-        features_dict (dict): Dictionary specifying the daily and irregular features.
-        target (str): Name of the target variable.
-        time_slice (slice): Time slice for selecting the data.
-        split_time (np.datetime64): Date to split the data into training and testing sets.
-        sequence_length (int): Length of the input sequences.
-        train (bool): Whether to load training data. If False, loads testing data.
-        log_norm_cols (list): List of columns to apply log normalization.
-        range_norm_cols (list): List of columns to apply range normalization.
     """
-    def __init__(self, *,
-                 data_dir: Path, 
-                 basin_file: Path,
-                 features: dict,
-                 time_slice: slice,
-                 split_time: np.datetime64,
-                 sequence_length: int,
-                 sequence: bool = True,
-                 log_norm_cols: list = [],
-                 range_norm_cols: list = [],
-                 clip_target_to_zero: bool = False,
-                 quiet: bool = False,
-                 **kwargs):
-
+    def __init__(self, cfg):
+        self.cfg = cfg
+        
         # Validate the feature dict
+        features = cfg['features']
         if not isinstance(features.get('daily'), list):
             raise ValueError("features_dict must contain a list of daily features at a minimum.")
-
-        self.data_dir = data_dir
-        self.basin_file = basin_file
-        self.time_slice = time_slice
-        self.split_time = split_time
-        self.sequence_length = sequence_length
-        self.log_norm_cols = log_norm_cols
-        self.range_norm_cols = range_norm_cols
-        self.clip_target_to_zero = clip_target_to_zero
-        self.quiet = quiet
+        self.daily_features = features['daily']
+        self.target = features['target']
         
-        with open(basin_file, 'r') as file:
+        #Not required for simpler models. Returns None if missing from features.
+        self.irregular_features = features.get('irregular')
+        self.static_features = features.get('static') 
+        
+        with open(self.cfg['basin_file'], 'r') as file:
             basin_list = file.readlines()
             basin_list = [basin.strip() for basin in basin_list]
         self.basins = basin_list
-        
-        self.daily_features = features['daily']
-        self.irregular_features = features.get('irregular') # is None if key doesn't exist. 
-        self.static_features = features.get('static')
-        self.target = features['target']
-        
-        self.all_features =  self.daily_features + self.irregular_features
 
         self.log_pad = 0.001
 
@@ -175,24 +142,24 @@ class TAPDataset(Dataset):
             xr.Dataset: An xarray dataset of time series data with time and basin coordinates.
         """
         # Minimum date for sequenced training data
-        min_train_date = (np.datetime64(self.time_slice.start) +
-                          np.timedelta64(self.sequence_length, 'D'))  
+        min_train_date = (np.datetime64(self.cfg['time_slice'].start) +
+                          np.timedelta64(self.cfg['sequence_length'], 'D'))  
 
         self.indices = defaultdict(dict)
         ds_list = []
-        for basin in tqdm(self.basins, disable=self.quiet, desc="Loading Basins"):
-            file_path = f"{self.data_dir}/time_series/{basin}.nc"
-            ds = xr.open_dataset(file_path).sel(date=self.time_slice)
+        for basin in tqdm(self.basins, disable=self.cfg['quiet'], desc="Loading Basins"):
+            file_path = f"{self.cfg['data_dir']}/time_series/{basin}.nc"
+            ds = xr.open_dataset(file_path).sel(date=self.cfg['time_slice'])
             ds['date'] = ds['date'].astype('datetime64[ns]')
     
             # Filter to keep only the necessary features and the target variable
             ds = ds[[*self.daily_features, *self.irregular_features, self.target]]
 
             # Replace negative values with NaN in specific columns without explicit loop
-            for col in self.log_norm_cols:
+            for col in self.cfg['log_norm_cols']:
                 ds[col] = ds[col].where(ds[col] >= 0, np.nan)
             # Repetitive if target is in log_norm_cols, but not a problem. 
-            if self.clip_target_to_zero:
+            if self.cfg['clip_target_to_zero']:
                 ds[self.target] = ds[self.target].where(ds[self.target] >= 0, np.nan)
 
             # Testing if this is causing an issue
@@ -200,7 +167,7 @@ class TAPDataset(Dataset):
                 ds[col] = ds[col].where(~np.isnan(ds[col]), 0)
                 
             # Component masks for creating data indices
-            is_train = ds['date'] < self.split_time
+            is_train = ds['date'] < self.cfg['split_time']
             valid_sequence = ds['date'] >= min_train_date
             valid_irregular = (~np.isnan(ds[self.irregular_features])).to_array().all(dim='variable')
             valid_target = ~np.isnan(ds[self.target])
@@ -228,7 +195,7 @@ class TAPDataset(Dataset):
         Returns:
             dict: A basin-keyed dictionary of static attributes.
         """
-        file_path = f"{self.data_dir}/attributes/attributes.csv"
+        file_path = f"{self.cfg['data_dir']}/attributes/attributes.csv"
         attributes_df = pd.read_csv(file_path, index_col="index")
         attributes_df.index = attributes_df.index.astype(str)
 
@@ -260,7 +227,7 @@ class TAPDataset(Dataset):
     
     def _precompute_date_ranges(self):
         unique_dates = self.x_d['date'].values
-        date_ranges = {date: pd.date_range(end=date, periods=self.sequence_length, freq='D').values for date in unique_dates}
+        date_ranges = {date: pd.date_range(end=date, periods=self.cfg['sequence_length'], freq='D').values for date in unique_dates}
         return date_ranges
 
     def __getitem__(self, idx):
@@ -287,19 +254,19 @@ class TAPDataset(Dataset):
         scale = {k: {'offset': 0, 'scale': 1, 'log_norm': False} for k in ds.data_vars}
     
         # Subset the dataset to the training time period
-        training_ds = ds.sel(date=slice(None, self.split_time))
+        training_ds = ds.sel(date=slice(None, self.cfg['split_time']))
     
         # Iterate over each variable in the dataset
         for var in ds.data_vars:
-            if var in self.log_norm_cols:
+            if var in self.cfg.get('log_norm_cols',[]):
                 # Perform log normalization
                 scale[var]['log_norm'] = True
                 x = ds[var] + self.log_pad
-                training_x = x.sel(date=slice(None, self.split_time))
+                training_x = x.sel(date=slice(None, self.cfg['split_time']))
                 scale[var]['offset'] = np.nanmean(np.log(training_x))    
                 # Apply normalization and offset
                 ds[var] = np.log(x) - scale[var]['offset']
-            elif var in self.range_norm_cols:
+            elif var in self.cfg.get('range_norm_cols',[]):
                 # Perform min-max scaling
                 scale[var]['scale'] = training_ds[var].max().values.item()
                 ds[var] = ds[var] / scale[var]['scale']

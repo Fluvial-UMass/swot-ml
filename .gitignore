@@ -1,6 +1,7 @@
+logs
 data/
 logs/
-runs/**
+runs/
 !runs/example_config.yml
 
 # OSX / *nix default autosave extension
