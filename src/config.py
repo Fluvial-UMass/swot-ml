@@ -20,5 +20,7 @@ def format_config(cfg):
     cfg['split_time'] = np.datetime64(cfg['split_time'])
     
     cfg['model_args']['out_size'] = 1
+
+    cfg['model'] = cfg['model'].lower()
     
     return cfg

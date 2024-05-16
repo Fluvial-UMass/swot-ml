@@ -73,18 +73,19 @@ class Trainer:
         self.freeze_components(None, False)
 
         # Setup logging
-        current_date = datetime.now().strftime("%Y%m%d_%H%M")
-        if log_parent is not None:
-            self.log_dir = log_parent / current_date
-        else:     
-            self.log_dir = Path(f"../runs/notebook/{current_date}")
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        if cfg['log']:
+            current_date = datetime.now().strftime("%Y%m%d_%H%M")
+            if log_parent is not None:
+                self.log_dir = log_parent / current_date
+            else:     
+                self.log_dir = Path(f"../runs/notebook/{current_date}")
+            self.log_dir.mkdir(parents=True, exist_ok=True)
         
-        log_file = self.log_dir / "training.log"
-        logging.basicConfig(filename=log_file, filemode='w', level=logging.INFO,
-                        format='%(asctime)s - %(levelname)s - %(message)s', force=True)
-        if config_str is not None:
-            logging.info("Run Configuration\n"+config_str)
+            log_file = self.log_dir / "training.log"
+            logging.basicConfig(filename=log_file, filemode='w', level=logging.INFO,
+                            format='%(asctime)s - %(levelname)s - %(message)s', force=True)
+            if config_str is not None:
+                logging.info("Run Configuration\n"+config_str)
 
     def start_training(self):
         """
@@ -102,7 +103,8 @@ class Trainer:
                 loss, bad_grads = self._train_epoch()
 
                 info_str = f"Epoch: {self.epoch}, Loss: {loss:.4f}"
-                logging.info(info_str)
+                if self.cfg['log']:
+                    logging.info(info_str)
                 if self.cfg['quiet']:
                     print(info_str)
 
@@ -112,20 +114,28 @@ class Trainer:
                         warning_str = f"{type_key} gradients detected:"
                         for tree_key, count in tree_counts.items():
                             warning_str += f"\n\t{tree_key}: {count}"
-                        logging.warning(warning_str)
 
-                if self.epoch % self.log_interval == 0:
+                        if self.cfg['log']:
+                            logging.warning(warning_str)
+                        else:
+                            print(warning_str)
+
+                if self.cfg['log'] & (self.epoch % self.log_interval == 0):
                     self.save_state()
+                    
                 self.loss_list.append(loss)
         except KeyboardInterrupt:
             pass
 
         # Cleanup and return 
         print("Training finished or interrupted. Model state saved.")
-        if self.epoch % self.log_interval != 0:
-            self.save_state()
-        logging.info("~~~ training stopped ~~~")
+        if self.cfg['log']:
+            if self.epoch % self.log_interval != 0:
+                self.save_state()
+            logging.info("~~~ training stopped ~~~")
+            
         plt.plot(self.loss_list)
+        plt.show()
     
     def _train_epoch(self):
         """
@@ -137,14 +147,14 @@ class Trainer:
         """
         lr = self.lr_schedule(self.epoch)
         self.optim = optax.adam(lr)
-        exception_count = 0
         consecutive_exceptions = 0
         total_loss = 0
         num_batches = 0
         bad_grads = {'vanishing': {}, 'exploding':{}}
 
         pbar = tqdm(self.dataloader, disable=self.cfg['quiet'], desc=f"Epoch:{self.epoch:03.0f}")
-        for basins, dates, batch in pbar:
+        for data_tuple in pbar:
+            basins, dates, batch = data_tuple
             try:
                 batch = self.dataloader.shard_batch(batch)
                 loss, grads, self.model, self.opt_state = make_step(self.model, batch, self.opt_state, 
@@ -171,28 +181,23 @@ class Trainer:
                             bad_grads[type_key][tree_key] += 1
 
             except Exception as e:
-                error_dir = self.log_dir / "exceptions" / f"epoch{self.epoch}_exception{exception_count}"
-                self.save_state(error_dir)
-                
-                error_data = {"basins": basins,
-                              "dates": dates,
-                              "batch": batch}
-                data_fp = error_dir / "data.pkl"
-                with open(data_fp, "wb") as f:
-                    pickle.dump(error_data, f)
-                    
-                exception_fp = error_dir / "exception.txt"
-                with open(exception_fp, "w") as f:
-                    f.write(str(e) + "\n" + traceback.format_exc())
-
-                error_str = f"{type(e).__name__} exception caught. See {error_dir} for data, model, state, and trace."
-                logging.error(error_str)
-                print(error_str)
-                
-                exception_count += 1
                 consecutive_exceptions += 1
-            
-            if consecutive_exceptions >= 5:
+                
+                if self.cfg['log']:
+                    error_dir = self.log_dir / "exceptions" / f"epoch{self.epoch}_batch{pbar.n}"
+                    self.save_state(error_dir)
+
+                    with open(error_dir / "data.pkl", "wb") as f:
+                        pickle.dump(data_tuple, f)
+
+                    error_str = f"{type(e).__name__} exception caught. See {error_dir} for data, model, state, and trace."
+                    logging.error(error_str)
+                    
+                else:
+                    error_str = f"{str(e)}\n{traceback.format_exc()}"
+                print(error_str)
+
+            if consecutive_exceptions >= 3:
                 raise RuntimeError(f"Too many consecutive exceptions ({consecutive_exceptions})")
 
             if num_batches > 0:
@@ -299,7 +304,8 @@ def compute_loss(diff_model, static_model, data, loss_name):
                  print_func,
                  lambda *args: None,
                  operand=(data, y_pred))
-    
+    # Debugging
+
     if loss_name == "mse":
         return mse_loss(data['y'], y_pred)
     elif loss_name == "mae":
