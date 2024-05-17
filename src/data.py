@@ -23,6 +23,7 @@ class TAPDataLoader(DataLoader):
                          batch_size=cfg.get('batch_size', 1),
                          num_workers=num_workers,
                          pin_memory=cfg.get('pin_memory', True),
+                         drop_last=cfg.get('drop_last', False),
                          persistent_workers=persistent_workers)     
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 

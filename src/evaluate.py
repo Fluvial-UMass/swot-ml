@@ -5,11 +5,12 @@ import numpy as np
 from tqdm.auto import tqdm
 
 @eqx.filter_jit
-def _predict_map(model, batch):
-    return jax.vmap(model)(batch)
+def _predict_map(model, batch, keys):
+    return jax.vmap(model)(batch,keys)
 
-def predict(model, dataloader, denormalize=True):
-
+def predict(model, dataloader, *, seed=0, denormalize=True):
+    key = jax.random.PRNGKey(seed)
+    
     # Set model to inference mode (no dropout)
     model = eqx.nn.inference_mode(model)
     
@@ -18,10 +19,15 @@ def predict(model, dataloader, denormalize=True):
     y = []
     y_hat = []
     for basin, date, batch in tqdm(dataloader):
+        keys = jax.random.split(key, len(basin)+1)
+        key = keys[0]
+        batch_keys = keys[1:] 
+        pred = _predict_map(model, batch, batch_keys)
+        
         basins.extend(basin)
         dates.extend(date)
         y.extend(batch['y'][:,-1])
-        y_hat.extend(_predict_map(model,batch))
+        y_hat.extend(pred)
         
     # Create a dataframe with multi-index
     multi_index = pd.MultiIndex.from_arrays([basins,dates],names=['basin','date'])
