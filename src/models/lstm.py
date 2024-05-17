@@ -44,7 +44,7 @@ class BaseLSTM(eqx.Module):
         if dense:
             self.dense = eqx.nn.Linear(hidden_size, out_size, key=lkey)
 
-    def __call__(self, data):
+    def __call__(self, data, key):
         raise NotImplementedError("Subclasses must implement this method.")
 
 
@@ -55,7 +55,7 @@ class LSTM(BaseLSTM):
     def __init__(self, in_size, out_size, hidden_size, *, key, **kwargs):
         super().__init__(in_size, out_size, hidden_size, key=key, **kwargs)
 
-    def __call__(self, data):
+    def __call__(self, data, key):
         def scan_fn(state, xd):
             return self.cell(xd, state), None
         init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
@@ -141,7 +141,7 @@ class EALSTM(BaseLSTM):
         # Input gate is based on static watershed features
         i = jax.nn.sigmoid(self.cell.input_linear(data['x_s']))
         
-        def scan_fn(state, x_d):
+        def scan_fn(state, x_d, key):
             new_state = self.cell(state, x_d, i)
             return new_state, None
 
@@ -257,7 +257,7 @@ class TEALSTM(BaseLSTM):
         super().__init__(dynamic_in_size, out_size, hidden_size, key=key, **kwargs)
         self.cell = TEALSTMCell(dynamic_in_size, static_in_size, out_size, hidden_size, key=key)
 
-    def __call__(self, data):
+    def __call__(self, data, key):
         """
         Forward pass of the TEALSTM module.
 
@@ -323,7 +323,7 @@ class TAPLSTM(eqx.Module):
                                        key=keys[2])
         self.dropout = eqx.nn.Dropout(dropout)
 
-    def __call__(self, data):
+    def __call__(self, data, key):
         d_out = self.ealstm_d(data)
         i_out, skip_count = self.tealstm_i(data)
         dt = skip_count + 1 # skip = 0 is still a dt of 1
@@ -353,57 +353,6 @@ class TAPLSTM(eqx.Module):
         final_out = self.dense(combined_input)
 
         return final_out
-
-class ANN(eqx.Module):
-    layers: list
-    dropout: eqx.nn.Dropout
-
-    def __init__(self, *, 
-                 in_size, 
-                 hidden_size, 
-                 num_hidden_layers,
-                 output_size,
-                 seed, 
-                 dropout):
-        
-        layer_sizes = (in_size, *[hidden_size]*(num_hidden_layers+1), output_size)
-        total_n_layers = len(layer_sizes)-1
-        key = jax.random.PRNGKey(seed)
-        keys = jrandom.split(key,total_n_layers)
-        self.layers = []
-        for k, i in zip(keys, range(total_n_layers)):
-            layer = eqx.nn.Linear(layer_sizes[i], layer_sizes[i+1], key=k)
-            self.layers.append(layer)
-
-        self.dropout = eqx.nn.Dropout(dropout)
-
-    def __call__(self, data):
-        x = data['x_di']
-        # x = jnp.concatenate((data['x_dd'], data['x_di'], data['x_s']))
-        for layer in self.layers[:-1]:
-            x = jax.nn.relu(layer(x))
-        x = self.layers[-1](x)
-        
-        return x  # Final output layer
-
-
-class HybridModel(eqx.Module):
-    ann: ANN
-    ealstm: EALSTM
-    dropout: eqx.nn.Dropout
-
-    def __init__(self, *, ann_layer_sizes, dynamic_in_size, static_in_size, out_size, hidden_size, seed, dropout=0):
-        key = jax.random.PRNGKey(seed)
-        keys = jrandom.split(key, 3)
-        self.ann = ANN(ann_layer_sizes, key=keys[0], dropout=dropout)
-        self.ealstm = EALSTM(dynamic_in_size, static_in_size, out_size, hidden_size, key=keys[1], dropout=dropout, dense=True)
-        self.dropout = eqx.nn.Dropout(dropout)
-
-    def __call__(self, data):
-        ann_output = self.ann(data)
-        ealstm_output = self.ealstm({'x_dd': ann_output, 'x_s': data['x_s']})
-        final_output = self.dense(ealstm_output)
-        return final_output
 
 
 
