@@ -9,7 +9,6 @@ class EmbedderBlock(eqx.Module):
     Includes dropout on the embeddings.
     """
     data_embedder: eqx.nn.Linear
-    position_embedder: eqx.nn.Embedding
     layernorm: eqx.nn.LayerNorm
     dropout: eqx.nn.Dropout
 
@@ -21,22 +20,17 @@ class EmbedderBlock(eqx.Module):
                  key: jax.random.PRNGKey):
         
         self.data_embedder = eqx.nn.Linear(in_features=dynamic_in_size, out_features=hidden_size, key=key)
-        self.position_embedder = eqx.nn.Embedding(num_embeddings=max_length, embedding_size=hidden_size, key=key)
         self.layernorm = eqx.nn.LayerNorm(shape=(hidden_size,))
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
     def __call__(self, 
-                 dynamic_data: jnp.ndarray, 
-                 position_ids: jnp.ndarray,
+                 data: jnp.ndarray,
                  key: jax.random.PRNGKey) -> jnp.ndarray:  
         
-        data_embeds = jax.vmap(self.data_embedder)(dynamic_data)
-        position_embeds = jax.vmap(self.position_embedder)(position_ids)
-        
-        embedded_inputs = data_embeds + position_embeds
-        embedded_inputs = self.dropout(embedded_inputs, key=key)
-        embedded_inputs = jax.vmap(self.layernorm)(embedded_inputs)
-        return embedded_inputs
+        embedded = jax.vmap(self.data_embedder)(data)
+        embedded = self.dropout(embedded, key=key)
+        embedded = jax.vmap(self.layernorm)(embedded)
+        return embedded
 
 
 class AttentionBlock(eqx.Module):
@@ -48,6 +42,7 @@ class AttentionBlock(eqx.Module):
     layernorm: eqx.nn.LayerNorm
     static_linear: eqx.nn.Linear
     dropout: eqx.nn.Dropout
+    rope_embeddings: eqx.nn.RotaryPositionalEmbedding
 
     def __init__(self, 
                  hidden_size: int, 
@@ -67,22 +62,28 @@ class AttentionBlock(eqx.Module):
         self.layernorm = eqx.nn.LayerNorm(shape=(hidden_size,))
         self.static_linear = eqx.nn.Linear(in_features=static_in_size, out_features=hidden_size, key=keys[1])
         self.dropout = eqx.nn.Dropout(dropout_rate)
+        self.rope_embeddings = eqx.nn.RotaryPositionalEmbedding(hidden_size)
 
     def __call__(self, 
                  inputs: jnp.ndarray, 
                  static_data: jnp.ndarray,
                  base_mask: jnp.ndarray,
                  key: jax.random.PRNGKey) -> jnp.ndarray:
+        
         static_embedding = self.static_linear(static_data)
         static_embedding = jnp.expand_dims(static_embedding, axis=0)
+
         modified_keys = inputs + static_embedding
         modified_values = inputs + static_embedding
 
+        query_heads = self.rope_embeddings(inputs)
+        key_heads = self.rope_embeddings(modified_keys)
+        
         irregular_mask = jnp.tile(base_mask, (inputs.shape[0], 1))
         daily_mask = jnp.ones_like(irregular_mask)
         multihead_mask = jnp.stack([irregular_mask, daily_mask], axis=0)
         
-        attention_output = self.attention(inputs, modified_keys, modified_values, multihead_mask)
+        attention_output = self.attention(query_heads, key_heads, modified_values, multihead_mask)
         attention_output = self.dropout(attention_output, key=key)
         result = attention_output + inputs
         result = jax.vmap(self.layernorm)(result)
@@ -173,11 +174,10 @@ class Encoder(eqx.Module):
 
     def __call__(self, 
                  data: dict, 
-                 position_ids: jnp.ndarray, 
                  key: jax.random.PRNGKey) -> jnp.ndarray:
         keys = jax.random.split(key)
         
-        embeddings = self.embedder_block(data['x_d'], position_ids, keys[0])
+        embeddings = self.embedder_block(data['x_d'], keys[0])
 
         x = embeddings
         layer_keys = jax.random.split(keys[1], len(self.layers))
@@ -221,12 +221,12 @@ class EATransformer(eqx.Module):
         # Kluge to get it running now. Will address data loader later.
         x_d = jnp.concat([data['x_dd'], data['x_di']], axis=-1)
         data['mask'] = ~jnp.any(jnp.isnan(x_d),axis=1)
-        data['x_d'] = jnp.where(jnp.isnan(x_d), -10, x_d)
-        position_ids = jnp.arange(data['x_d'].shape[0]).astype(jnp.int32)
+        data['x_d'] = jnp.where(jnp.isnan(x_d), 0, x_d)
+        # position_ids = jnp.arange(data['x_d'].shape[0]).astype(jnp.int32)
 
         # for key, value in data.items():
         #     print(f"{key}: {value.shape}")
         # Kluge to get it running now. Will address data loader later.
         
-        pooled_output = self.encoder(data, position_ids, key)
+        pooled_output = self.encoder(data, key)
         return self.head(pooled_output)
