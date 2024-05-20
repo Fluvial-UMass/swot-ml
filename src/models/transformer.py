@@ -8,38 +8,32 @@ class EmbedderBlock(eqx.Module):
     Embeds input data from daily and irregular time series along with position indices.
     Includes dropout on the embeddings.
     """
-    daily_embedder: eqx.nn.Linear
-    irregular_embedder: eqx.nn.Linear
+    data_embedder: eqx.nn.Linear
     position_embedder: eqx.nn.Embedding
     layernorm: eqx.nn.LayerNorm
     dropout: eqx.nn.Dropout
 
     def __init__(self, 
-                 daily_in_size: int, 
-                 irregular_in_size: int, 
+                 dynamic_in_size: int, 
                  max_length: int, 
                  hidden_size: int,
                  dropout_rate: float, 
                  key: jax.random.PRNGKey):
         
-        self.daily_embedder = eqx.nn.Linear(in_features=daily_in_size, out_features=hidden_size, key=key)
-        self.irregular_embedder = eqx.nn.Linear(in_features=irregular_in_size, out_features=hidden_size, key=key)
+        self.data_embedder = eqx.nn.Linear(in_features=dynamic_in_size, out_features=hidden_size, key=key)
         self.position_embedder = eqx.nn.Embedding(num_embeddings=max_length, embedding_size=hidden_size, key=key)
-        self.layernorm = eqx.nn.LayerNorm(shape=(hidden_size*3,))
+        self.layernorm = eqx.nn.LayerNorm(shape=(hidden_size,))
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
     def __call__(self, 
-                 daily_data: jnp.ndarray, 
-                 irregular_data: jnp.ndarray, 
+                 dynamic_data: jnp.ndarray, 
                  position_ids: jnp.ndarray,
                  key: jax.random.PRNGKey) -> jnp.ndarray:  
         
-        daily_embeds = jax.vmap(self.daily_embedder)(daily_data)
-        irregular_embeds = jax.vmap(self.irregular_embedder)(irregular_data)
+        data_embeds = jax.vmap(self.data_embedder)(dynamic_data)
         position_embeds = jax.vmap(self.position_embedder)(position_ids)
         
-        # embedded_inputs = daily_embeds + irregular_embeds + position_embeds
-        embedded_inputs = jnp.concatenate([daily_embeds, irregular_embeds, position_embeds], axis=-1)
+        embedded_inputs = data_embeds + position_embeds
         embedded_inputs = self.dropout(embedded_inputs, key=key)
         embedded_inputs = jax.vmap(self.layernorm)(embedded_inputs)
         return embedded_inputs
@@ -77,13 +71,18 @@ class AttentionBlock(eqx.Module):
     def __call__(self, 
                  inputs: jnp.ndarray, 
                  static_data: jnp.ndarray,
+                 base_mask: jnp.ndarray,
                  key: jax.random.PRNGKey) -> jnp.ndarray:
         static_embedding = self.static_linear(static_data)
         static_embedding = jnp.expand_dims(static_embedding, axis=0)
         modified_keys = inputs + static_embedding
         modified_values = inputs + static_embedding
+
+        irregular_mask = jnp.tile(base_mask, (inputs.shape[0], 1))
+        daily_mask = jnp.ones_like(irregular_mask)
+        multihead_mask = jnp.stack([irregular_mask, daily_mask], axis=0)
         
-        attention_output = self.attention(inputs, modified_keys, modified_values)
+        attention_output = self.attention(inputs, modified_keys, modified_values, multihead_mask)
         attention_output = self.dropout(attention_output, key=key)
         result = attention_output + inputs
         result = jax.vmap(self.layernorm)(result)
@@ -140,10 +139,12 @@ class TransformerLayer(eqx.Module):
     def __call__(self, 
                  inputs: jnp.ndarray, 
                  static_data: jnp.ndarray,
+                 mask: jnp.ndarray,
                  key: jax.random.PRNGKey) -> jnp.ndarray:
         keys = jax.random.split(key)
         
-        attention_output = self.attention_block(inputs, static_data, keys[0])
+        attention_output = self.attention_block(inputs, static_data, mask, keys[0])
+        
         ff_keys = jax.random.split(keys[1], attention_output.shape[0])
         output = jax.vmap(self.ff_block)(attention_output, ff_keys)
         return output
@@ -154,8 +155,7 @@ class Encoder(eqx.Module):
     pooler: eqx.nn.Linear
 
     def __init__(self, 
-                 daily_in_size: int, 
-                 irregular_in_size: int, 
+                 dynamic_in_size: int, 
                  static_in_size: int, 
                  max_length: int, 
                  hidden_size: int, 
@@ -166,25 +166,23 @@ class Encoder(eqx.Module):
                  key: jax.random.PRNGKey): 
         keys = jax.random.split(key, num=3)
         
-        self.embedder_block = EmbedderBlock(daily_in_size, irregular_in_size, max_length, hidden_size, dropout_p, keys[0])
+        self.embedder_block = EmbedderBlock(dynamic_in_size, max_length, hidden_size, dropout_p, keys[0])
         layer_keys = jax.random.split(keys[1], num=num_layers)
-        self.layers = [TransformerLayer(3*hidden_size, intermediate_size, num_heads, static_in_size, dropout_p, layer_key) for layer_key in layer_keys]
-        self.pooler = eqx.nn.Linear(in_features=hidden_size*3, out_features=hidden_size, key=keys[2])
+        self.layers = [TransformerLayer(hidden_size, intermediate_size, num_heads, static_in_size, dropout_p, layer_key) for layer_key in layer_keys]
+        self.pooler = eqx.nn.Linear(in_features=hidden_size, out_features=hidden_size, key=keys[2])
 
     def __call__(self, 
-                 daily_data: jnp.ndarray, 
-                 irregular_data: jnp.ndarray, 
+                 data: dict, 
                  position_ids: jnp.ndarray, 
-                 static_data: jnp.ndarray,
                  key: jax.random.PRNGKey) -> jnp.ndarray:
         keys = jax.random.split(key)
         
-        embeddings = self.embedder_block(daily_data, irregular_data, position_ids, keys[0])
+        embeddings = self.embedder_block(data['x_d'], position_ids, keys[0])
 
         x = embeddings
         layer_keys = jax.random.split(keys[1], len(self.layers))
         for layer, layer_key in zip(self.layers, layer_keys):
-            x = layer(x, static_data, layer_key)
+            x = layer(x, data['x_s'], data['mask'], layer_key)
         first_token_last_layer = x[..., 0, :]
         pooled = self.pooler(first_token_last_layer)
         pooled = jnp.tanh(pooled)
@@ -195,8 +193,7 @@ class EATransformer(eqx.Module):
     head: eqx.nn.Linear
 
     def __init__(self, 
-                 daily_in_size: int, 
-                 irregular_in_size: int, 
+                 dynamic_in_size: int, 
                  static_in_size: int, 
                  max_length: int, 
                  hidden_size: int, 
@@ -209,8 +206,7 @@ class EATransformer(eqx.Module):
         key = jax.random.PRNGKey(seed)
         keys = jax.random.split(key)
         
-        self.encoder = Encoder(daily_in_size=daily_in_size,
-                               irregular_in_size=irregular_in_size,
+        self.encoder = Encoder(dynamic_in_size=dynamic_in_size,
                                static_in_size=static_in_size,
                                max_length=max_length,
                                hidden_size=hidden_size,
@@ -223,25 +219,14 @@ class EATransformer(eqx.Module):
 
     def __call__(self, data: dict, key: jax.random.PRNGKey) -> jnp.ndarray:
         # Kluge to get it running now. Will address data loader later.
-        position_ids = jnp.arange(data['x_dd'].shape[0]).astype(jnp.int32)
-        x_di = jnp.nan_to_num(data['x_di'], nan=-999.0)
+        x_d = jnp.concat([data['x_dd'], data['x_di']], axis=-1)
+        data['mask'] = ~jnp.any(jnp.isnan(x_d),axis=1)
+        data['x_d'] = jnp.where(jnp.isnan(x_d), -10, x_d)
+        position_ids = jnp.arange(data['x_d'].shape[0]).astype(jnp.int32)
+
+        # for key, value in data.items():
+        #     print(f"{key}: {value.shape}")
+        # Kluge to get it running now. Will address data loader later.
         
-        pooled_output = self.encoder(data['x_dd'], x_di, position_ids, data['x_s'], key)
+        pooled_output = self.encoder(data, position_ids, key)
         return self.head(pooled_output)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
