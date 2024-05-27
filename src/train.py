@@ -22,7 +22,7 @@ reload(models)
 
 class Trainer:
     """
-    A class to handle training of models.
+    A class to handle training of equinox models.
 
     Attributes:
         cfg (dict): Configuration dictionary.
@@ -98,7 +98,7 @@ class Trainer:
             The trained model after completing the training or upon an interruption.
         """
         try:
-            while self.epoch <= self.num_epochs:
+            while self.epoch < self.num_epochs:
                 self.epoch += 1
                 loss, bad_grads = self._train_epoch()
 
@@ -148,8 +148,7 @@ class Trainer:
         lr = self.lr_schedule(self.epoch)
         self.optim = optax.adam(lr)
         consecutive_exceptions = 0
-        total_loss = 0
-        num_batches = 0
+        losses = []
         bad_grads = {'vanishing': {}, 'exploding':{}}
 
         pbar = tqdm(self.dataloader, disable=self.cfg['quiet'], desc=f"Epoch:{self.epoch:03.0f}")
@@ -162,21 +161,22 @@ class Trainer:
             self.train_key = keys[0]
             batch_keys = keys[1:] 
             try: 
-                step = make_step(self.model, 
-                                 batch,
-                                 batch_keys,
-                                 self.opt_state, 
-                                 self.optim, 
-                                 self.filter_spec, 
-                                 **self.cfg['step_kwargs'])
-                # Unpack the tuple
-                loss, grads, self.model, self.opt_state = step
+                loss, grads, self.model, self.opt_state = make_step(
+                    self.model, 
+                    batch,
+                    batch_keys,
+                    self.opt_state, 
+                    self.optim, 
+                    self.filter_spec, 
+                    **self.cfg['step_kwargs']
+                )
 
                 if jnp.isnan(loss):
                     raise RuntimeError(f"NaN loss encountered")
-                    
-                total_loss += loss
-                num_batches += 1
+
+                pbar.set_postfix_str(f"Loss:{loss:0.04f}")
+                
+                losses.append(loss)
                 consecutive_exceptions = 0
                 
                 # Monitor gradients
@@ -201,7 +201,8 @@ class Trainer:
 
                     with open(error_dir / "data.pkl", "wb") as f:
                         pickle.dump(data_tuple, f)
-
+                    with open(error_dir / "exception.txt", "w") as f:
+                        f.write(f"{str(e)}\n{traceback.format_exc()}")
                     error_str = f"{type(e).__name__} exception caught. See {error_dir} for data, model, state, and trace."
                     logging.error(error_str)
                     
@@ -209,15 +210,37 @@ class Trainer:
                     error_str = f"{str(e)}\n{traceback.format_exc()}"
                 print(error_str)
 
+<<<<<<< Updated upstream
             if consecutive_exceptions >= 3:
+=======
+            loss_arr = np.array(losses)
+            mean_loss = loss_arr.mean()
+            std_loss = loss_arr.std()
+            z_score = ((loss-mean_loss)/std_loss)
+            if loss is not None and z_score > 5:
+                if self.cfg['log']:
+                    error_dir = self.log_dir / "exceptions" / f"epoch{self.epoch}_batch{pbar.n}"
+                    self.save_state(error_dir)
+
+                    with open(error_dir / "data.pkl", "wb") as f:
+                        pickle.dump(data_tuple, f)
+                    error_str = (f"Anomalous batch loss ({loss}, z-score of {z_score})."
+                                 f"See {error_dir} for data, model, and state")
+                    logging.error(error_str)
+                else:
+                    error_str = f"Anomalous batch loss ({loss}, z-score of {z_score})."
+                print(error_str)
+
+            if consecutive_exceptions >= 1:
+>>>>>>> Stashed changes
                 raise RuntimeError(f"Too many consecutive exceptions ({consecutive_exceptions})")
 
-            if num_batches > 0:
-                average_loss = (total_loss / num_batches).item() #jax array to float
-                pbar.set_postfix_str(f"Loss:{average_loss:0.04f}")
+            if (pbar.n+1) == pbar.total:
+                pbar.set_postfix_str(f"Avg Loss:{mean_loss:0.04f}")
+                
+        return mean_loss, bad_grads
+        
     
-        return average_loss, bad_grads
-
     def save_state(self, save_dir=None):
         if save_dir is None:
             save_dir = self.log_dir / f"epoch{self.epoch}"
@@ -233,7 +256,7 @@ class Trainer:
             state_str = json.dumps(state)
             f.write((train_state_str + "\n").encode())
             eqx.tree_serialise_leaves(f, self.opt_state)
-
+   
     def load_state(self, save_dir:str):     
         with open(self.log_dir / save_dir / "model.eqx", "rb") as f:
             model_args = json.loads(f.readline().decode())
@@ -253,7 +276,7 @@ class Trainer:
             with open(data_path, 'rb') as file:
                 data = pickle.load(file)
             return data
-
+    
     def load_last_state(self):
         epoch_regex = re.compile(r"epoch(\d+)")
         dirs = os.listdir(self.log_dir)
@@ -286,8 +309,8 @@ def mse_loss(y, y_pred):
     return mse
 
 # Intermittent flow modified MSE
-def mae_loss(y, y_pred, q):
-    mse = jnp.mean(jnp.abs(y[...,-1] - y_pred[...,-1]))
+def mae_loss(y, y_pred):
+    mae = jnp.mean(jnp.abs(y[...,-1] - y_pred[...,-1]))
     return mae
 
 @eqx.filter_value_and_grad

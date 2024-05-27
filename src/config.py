@@ -18,6 +18,8 @@ def format_config(cfg):
     cfg['basin_file'] = data_dir / cfg['basin_file']
     cfg['time_slice'] = slice(*cfg['time_slice'])
     cfg['split_time'] = np.datetime64(cfg['split_time'])
+
+    cfg['log_norm_cols'] = cfg.get('log_norm_cols',[])
     
     cfg['model_args']['out_size'] = 1
 
