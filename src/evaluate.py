@@ -6,18 +6,19 @@ from tqdm.auto import tqdm
 
 @eqx.filter_jit
 def _predict_map(model, batch, keys):
-    return jax.vmap(model)(batch,keys)
+    return jax.vmap(model)(batch, keys)
 
-def predict(model, dataloader, *, seed=0, denormalize=True):
+def predict(model, dataloader, *, seed=0, denormalize=True, return_features=False):
     key = jax.random.PRNGKey(seed)
     
     # Set model to inference mode (no dropout)
-    model = eqx.nn.inference_mode(model)
+    # model = eqx.nn.inference_mode(model)
     
     basins = []
     dates = []
     y = []
     y_hat = []
+    matchups = []
     for basin, date, batch in tqdm(dataloader):
         keys = jax.random.split(key, len(basin)+1)
         key = keys[0]
@@ -29,6 +30,11 @@ def predict(model, dataloader, *, seed=0, denormalize=True):
         y.extend(batch['y'][:,-1])
         y_hat.extend(pred)
         
+        if return_features:
+            last_obs = batch['x_di'][:,-1,:]
+            mask = (~np.any(np.isnan(last_obs),axis=1))
+            matchups.extend(mask.tolist())
+        
     # Create a dataframe with multi-index
     multi_index = pd.MultiIndex.from_arrays([basins,dates],names=['basin','date'])
     y = np.array(y).flatten()
@@ -37,55 +43,80 @@ def predict(model, dataloader, *, seed=0, denormalize=True):
         y = dataloader.dataset.denormalize_target(y)
         y_hat = dataloader.dataset.denormalize_target(y_hat)
     results = pd.DataFrame({'obs':  y, 'pred': y_hat}, index=multi_index)
+    
+    if return_features:
+        results['matchups'] = matchups
+        
+    metrics = get_all_metrics(y, y_hat)
+    for key, value in metrics.items():
+        print(f"{key}: {value:0.4f}")
 
-    return results
+    return results, metrics
 
 
 def get_all_metrics(y, y_hat):
     metrics = {
-        'mae': calc_mae(y, y_hat),
-        'mse': calc_mse(y, y_hat),
-        'rmse': calc_rmse(y, y_hat),
-        'kge': calc_kge(y, y_hat),
-        'nse': calc_nse(y, y_hat)}
+        'nBias': calc_nbias(y, y_hat),
+        'rRMSE': calc_rrmse(y, y_hat),
+        'KGE': calc_kge(y, y_hat),
+        'NSE': calc_nse(y, y_hat),
+        'lNSE': calc_lnse(y, y_hat),
+        'Agreement': calc_agreement(y, y_hat)}
     return metrics
 
-def _mask_nan(y, y_hat):
-    mask = (~np.isnan(y)) & (~np.isnan(y_hat))
-    return y[mask], y_hat[mask]
+def mask_nan(func):
+    def wrapper(y, y_hat, *args, **kwargs):
+        mask = (~np.isnan(y)) & (~np.isnan(y_hat))
+        y_masked = y[mask]
+        y_hat_masked = y_hat[mask]
+        return func(y_masked, y_hat_masked, *args, **kwargs)
+    return wrapper
 
-def calc_mae(y, y_hat):
-    return np.nanmean(np.abs(y - y_hat))
+@mask_nan
+def calc_nbias(y, y_hat):
+    norm_err = (y - y_hat) / np.mean(y)
+    return np.nanmean(norm_err)
 
-def calc_mse(y, y_hat):
-    return np.nanmean((y - y_hat)**2)
-
-def calc_rmse(y, y_hat):
-    return np.sqrt(calc_mse(y, y_hat))
-
+@mask_nan
+def calc_rrmse(y, y_hat):
+    relative_err = (y - y_hat) / y
+    return np.sqrt(np.nanmean(relative_err**2))
+ 
+@mask_nan
 def calc_kge(y, y_hat):
-    y, y_hat = _mask_nan(y, y_hat)
-    
-    # Calculate Pearson correlation coefficient
     correlation = np.corrcoef(y, y_hat)[0, 1]
-    
-    # Calculate mean and standard deviation
     mean_y = np.mean(y)
     mean_y_hat = np.mean(y_hat)
     std_y = np.std(y)
     std_y_hat = np.std(y_hat)
-    
-    # Calculate KGE
-    kge_value = 1 - np.sqrt((correlation - 1)**2 + (std_y_hat/std_y - 1)**2 + (mean_y_hat/mean_y - 1)**2)
-    
-    return kge_value
+    kge = 1 - np.sqrt((correlation - 1)**2 + (std_y_hat/std_y - 1)**2 + (mean_y_hat/mean_y - 1)**2) 
+    return kge
 
+@mask_nan
 def calc_nse(y, y_hat):
-    y, y_hat = _mask_nan(y,y_hat)
-
     denominator = ((y_hat - y_hat.mean())**2).sum()
     numerator = ((y - y_hat)**2).sum()
+    nse = 1 - (numerator / denominator)
+    return nse
 
-    value = 1 - numerator / denominator
+@mask_nan
+def calc_lnse(y, y_hat):
+    log_y = np.log(y)
+    log_yhat = np.log(y_hat)
+    return calc_nse(log_y, log_yhat)
 
-    return float(value)
+@mask_nan
+def calc_agreement(y, y_hat):
+    """ https://www.nature.com/articles/srep19401 """
+    corr = np.corrcoef(y, y_hat)[0,1]
+    if corr >= 0:
+        kappa = 0
+    else:
+        kappa = 2 * np.abs(np.sum((y-np.mean(y))*(y_hat-np.mean(y_hat))))
+        
+    numerator = np.mean((y - y_hat)**2)
+    denominator = np.var(y) + np.var(y_hat) + (np.mean(y) - np.mean(y_hat))**2 + kappa
+    return 1 - (numerator / denominator)
+            
+    
+

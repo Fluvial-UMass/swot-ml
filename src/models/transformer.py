@@ -41,15 +41,6 @@ class DynamicEmbedder(eqx.Module):
     """
     Embeds input data using a linear layer. Includes dropout on the embeddings.
     """
-<<<<<<< Updated upstream
-    data_embedder: eqx.nn.Linear
-    layernorm: eqx.nn.LayerNorm
-    dropout: eqx.nn.Dropout
-
-    def __init__(self, 
-                 dynamic_in_size: int, 
-                 max_length: int, 
-=======
     dynamic_embedder: eqx.nn.Linear
     positional_encoding: Union[None, jnp.ndarray]
     layernorm: eqx.nn.LayerNorm
@@ -58,38 +49,23 @@ class DynamicEmbedder(eqx.Module):
     def __init__(self,
                  seq_length: int,
                  dynamic_in_size: int,
->>>>>>> Stashed changes
                  hidden_size: int,
                  dropout_rate: float,
                  key: jax.random.PRNGKey):
-<<<<<<< Updated upstream
-        
-        self.data_embedder = eqx.nn.Linear(in_features=dynamic_in_size, out_features=hidden_size, key=key)
-=======
         keys = jax.random.split(key)
         self.dynamic_embedder = eqx.nn.Linear(in_features=dynamic_in_size, out_features=hidden_size, key=keys[0])
         self.positional_encoding = self.create_positional_encoding(seq_length, hidden_size) 
->>>>>>> Stashed changes
         self.layernorm = eqx.nn.LayerNorm(shape=(hidden_size,))
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
     def __call__(self, 
                  data: jnp.ndarray,
-<<<<<<< Updated upstream
-                 key: jax.random.PRNGKey) -> jnp.ndarray:  
-        
-        embedded = jax.vmap(self.data_embedder)(data)
-        embedded = self.dropout(embedded, key=key)
-        embedded = jax.vmap(self.layernorm)(embedded)
-        return embedded
-=======
                  key: jax.random.PRNGKey) -> jnp.ndarray: 
         embed = jax.vmap(self.dynamic_embedder)(data)
         embed += self.positional_encoding
         embed = self.dropout(embed, key=key)
         embed = jax.vmap(self.layernorm)(embed)
         return embed
->>>>>>> Stashed changes
 
     @staticmethod
     def create_positional_encoding(seq_length: int, d_model: int) -> jnp.ndarray:
@@ -102,7 +78,7 @@ class DynamicEmbedder(eqx.Module):
         pos_encoding = pos_encoding.at[:, 1::2].set(jnp.cos(angle_rads))
         return pos_encoding
 
-
+    
 def biased_dot_product_attention_weights(query, key, bias, mask = None):
     query = query / math.sqrt(query.shape[-1])
     logits = jnp.einsum("sd,Sd->sS", query, key) + bias
@@ -185,12 +161,7 @@ class AttentionBlock(eqx.Module):
     """
     attention: LogitBiasedMultiheadAttention
     layernorm: eqx.nn.LayerNorm
-<<<<<<< Updated upstream
-    static_linear: eqx.nn.Linear
-=======
->>>>>>> Stashed changes
     dropout: eqx.nn.Dropout
-    rope_embeddings: eqx.nn.RotaryPositionalEmbedding
 
     def __init__(self, 
                  hidden_size: int, 
@@ -198,49 +169,12 @@ class AttentionBlock(eqx.Module):
                  dropout_rate: float,
                  key: jax.random.PRNGKey): 
         keys = jax.random.split(key)
-<<<<<<< Updated upstream
-        
-        self.attention = eqx.nn.MultiheadAttention(
-            num_heads=num_heads, 
-            query_size=hidden_size, 
-            key_size=hidden_size, 
-            value_size=hidden_size, 
-            output_size=hidden_size, 
-            key=keys[0])
-        self.layernorm = eqx.nn.LayerNorm(shape=(hidden_size,))
-        self.static_linear = eqx.nn.Linear(in_features=static_in_size, out_features=hidden_size, key=keys[1])
-=======
 
         self.attention = LogitBiasedMultiheadAttention(num_heads, hidden_size, hidden_size, hidden_size, hidden_size, key=keys[0])
         self.layernorm = eqx.nn.LayerNorm(shape=(hidden_size,))
->>>>>>> Stashed changes
         self.dropout = eqx.nn.Dropout(dropout_rate)
-        self.rope_embeddings = eqx.nn.RotaryPositionalEmbedding(hidden_size)
 
     def __call__(self, 
-<<<<<<< Updated upstream
-                 inputs: jnp.ndarray, 
-                 static_data: jnp.ndarray,
-                 base_mask: jnp.ndarray,
-                 key: jax.random.PRNGKey) -> jnp.ndarray:
-        
-        static_embedding = self.static_linear(static_data)
-        static_embedding = jnp.expand_dims(static_embedding, axis=0)
-
-        modified_keys = inputs + static_embedding
-        modified_values = inputs + static_embedding
-
-        query_heads = self.rope_embeddings(inputs)
-        key_heads = self.rope_embeddings(modified_keys)
-        
-        irregular_mask = jnp.tile(base_mask, (inputs.shape[0], 1))
-        daily_mask = jnp.ones_like(irregular_mask)
-        multihead_mask = jnp.stack([irregular_mask, daily_mask], axis=0)
-        
-        attention_output = self.attention(query_heads, key_heads, modified_values, multihead_mask)
-        attention_output = self.dropout(attention_output, key=key)
-        result = attention_output + inputs
-=======
                  inputs: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]],
                  logit_bias: jnp.ndarray,
                  mask: jnp.ndarray,
@@ -255,7 +189,6 @@ class AttentionBlock(eqx.Module):
         attention_output = self.attention(q, k, v, logit_bias, mask)
         attention_output = self.dropout(attention_output, key=key)
         result = attention_output + q # Residual connection
->>>>>>> Stashed changes
         result = jax.vmap(self.layernorm)(result)
         return result
 
@@ -306,38 +239,16 @@ class TransformerLayer(eqx.Module):
         self.ff_block = FeedForwardBlock(hidden_size, intermediate_size, dropout_p, keys[1])
 
     def __call__(self, 
-<<<<<<< Updated upstream
-                 inputs: jnp.ndarray, 
-                 static_data: jnp.ndarray,
-                 mask: jnp.ndarray,
-                 key: jax.random.PRNGKey) -> jnp.ndarray:
-        keys = jax.random.split(key)
-        
-        attention_output = self.attention_block(inputs, static_data, mask, keys[0])
-        
-=======
                  inputs: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]],
                  logit_bias: jnp.ndarray,
                  mask: jnp.ndarray,
                  key: jax.random.PRNGKey) -> jnp.ndarray:
         keys = jax.random.split(key) 
         attention_output = self.attention_block(inputs, logit_bias, mask, keys[0])
->>>>>>> Stashed changes
         ff_keys = jax.random.split(keys[1], attention_output.shape[0])
         output = jax.vmap(self.ff_block)(attention_output, ff_keys)
         return output
 
-<<<<<<< Updated upstream
-class Encoder(eqx.Module):
-    embedder_block: EmbedderBlock
-    layers: List[TransformerLayer]
-    pooler: eqx.nn.Linear
-
-    def __init__(self, 
-                 dynamic_in_size: int, 
-                 static_in_size: int, 
-                 max_length: int, 
-=======
 class SelfAttnEncoder(eqx.Module):
     embedder: DynamicEmbedder
     layers: List[TransformerLayer]
@@ -345,36 +256,11 @@ class SelfAttnEncoder(eqx.Module):
     def __init__(self,
                  seq_length: int,
                  dynamic_size: int,
->>>>>>> Stashed changes
                  hidden_size: int, 
                  intermediate_size: int, 
                  num_layers: int, 
                  num_heads: int, 
                  dropout_p: float,
-<<<<<<< Updated upstream
-                 key: jax.random.PRNGKey): 
-        keys = jax.random.split(key, num=3)
-        
-        self.embedder_block = EmbedderBlock(dynamic_in_size, max_length, hidden_size, dropout_p, keys[0])
-        layer_keys = jax.random.split(keys[1], num=num_layers)
-        self.layers = [TransformerLayer(hidden_size, intermediate_size, num_heads, static_in_size, dropout_p, layer_key) for layer_key in layer_keys]
-        self.pooler = eqx.nn.Linear(in_features=hidden_size, out_features=hidden_size, key=keys[2])
-
-    def __call__(self, 
-                 data: dict, 
-                 key: jax.random.PRNGKey) -> jnp.ndarray:
-        keys = jax.random.split(key)
-        
-        embeddings = self.embedder_block(data['x_d'], keys[0])
-
-        x = embeddings
-        layer_keys = jax.random.split(keys[1], len(self.layers))
-        for layer, layer_key in zip(self.layers, layer_keys):
-            x = layer(x, data['x_s'], data['mask'], layer_key)
-        first_token_last_layer = x[..., 0, :]
-        pooled = self.pooler(first_token_last_layer)
-        pooled = jnp.tanh(pooled)
-=======
                  key: jax.random.PRNGKey):
         keys = jax.random.split(key, num=3)
         
@@ -449,8 +335,6 @@ class CrossAttnDecoder(eqx.Module):
         # final_token = jnp.mean(x, axis=0)
         pooled = self.pooler(final_token)
         # pooled = jnp.tanh(pooled)
-        
->>>>>>> Stashed changes
         return pooled
 
 
@@ -462,7 +346,8 @@ class EATransformer(eqx.Module):
     head: eqx.nn.Linear
 
     def __init__(self, 
-                 dynamic_in_size: int, 
+                 daily_in_size: int,
+                 irregular_in_size: int,
                  static_in_size: int, 
                  seq_length: int, 
                  hidden_size: int, 
@@ -474,19 +359,6 @@ class EATransformer(eqx.Module):
                  seed: int):
         key = jax.random.PRNGKey(seed)
         keys = jax.random.split(key, num=5)
-        
-<<<<<<< Updated upstream
-        self.encoder = Encoder(dynamic_in_size=dynamic_in_size,
-                               static_in_size=static_in_size,
-                               max_length=max_length,
-                               hidden_size=hidden_size,
-                               intermediate_size=intermediate_size,
-                               num_layers=num_layers,
-                               num_heads=num_heads,
-                               dropout_p=dropout_p,
-                               key=keys[0])
-        self.head = eqx.nn.Linear(in_features=hidden_size, out_features=out_size, key=keys[1])
-=======
         self.static_embedder = StaticEmbedder(seq_length, static_in_size, num_heads, dropout_p, keys[0])
         
         static_args = (hidden_size, intermediate_size, num_layers, num_heads, dropout_p) 
@@ -494,7 +366,6 @@ class EATransformer(eqx.Module):
         self.i_encoder = SelfAttnEncoder(seq_length, irregular_in_size, *static_args, keys[2])
         self.decoder = CrossAttnDecoder(*static_args, keys[3])
         self.head = eqx.nn.Linear(in_features=hidden_size, out_features=out_size, key=keys[4])
->>>>>>> Stashed changes
 
     def __call__(self, data: dict, key: jax.random.PRNGKey) -> jnp.ndarray:
         keys = jax.random.split(key, num=4)
@@ -503,24 +374,11 @@ class EATransformer(eqx.Module):
         mask = ~jnp.any(jnp.isnan(data['x_di']),axis=1)
         data['x_di'] = jnp.where(jnp.isnan(data['x_di']), -999.0, data['x_di'])
         # Kluge to get it running now. Will address data loader later.
-<<<<<<< Updated upstream
-        x_d = jnp.concat([data['x_dd'], data['x_di']], axis=-1)
-        data['mask'] = ~jnp.any(jnp.isnan(x_d),axis=1)
-        data['x_d'] = jnp.where(jnp.isnan(x_d), 0, x_d)
-        # position_ids = jnp.arange(data['x_d'].shape[0]).astype(jnp.int32)
-
-        # for key, value in data.items():
-        #     print(f"{key}: {value.shape}")
-        # Kluge to get it running now. Will address data loader later.
-        
-        pooled_output = self.encoder(data, key)
-=======
 
         logit_bias = self.static_embedder(data['x_s'], keys[0])
         # static_embedded = 0
         d_encoded = self.d_encoder(data['x_dd'], logit_bias, None, keys[1])
         i_encoded = self.i_encoder(data['x_di'], logit_bias, mask, keys[2])
         pooled_output = self.decoder(d_encoded, i_encoded, logit_bias, mask, keys[3])
-        
->>>>>>> Stashed changes
+
         return self.head(pooled_output)

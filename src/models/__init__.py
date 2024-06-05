@@ -20,7 +20,7 @@ def make(cfg: dict):
     elif name == "eatransformer":
         model = EATransformer(**cfg['model_args'])
     else:
-        raise ValueError(f"{cfg['model']} is not a valid model name.")
+        raise ValueError(f"{cfg['model']} is not a valid model name. Check /src/models/__init__.py for model config.")
 
     return model
     
