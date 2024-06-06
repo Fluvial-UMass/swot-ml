@@ -8,7 +8,7 @@ from tqdm.auto import tqdm
 def _predict_map(model, batch, keys):
     return jax.vmap(model)(batch, keys)
 
-def predict(model, dataloader, *, seed=0, denormalize=True, return_features=False):
+def predict(model, dataloader, *, seed=0, denormalize=True, return_dt=False):
     key = jax.random.PRNGKey(seed)
     
     # Set model to inference mode (no dropout)
@@ -18,7 +18,7 @@ def predict(model, dataloader, *, seed=0, denormalize=True, return_features=Fals
     dates = []
     y = []
     y_hat = []
-    matchups = []
+    dt = []
     for basin, date, batch in tqdm(dataloader):
         keys = jax.random.split(key, len(basin)+1)
         key = keys[0]
@@ -29,11 +29,22 @@ def predict(model, dataloader, *, seed=0, denormalize=True, return_features=Fals
         dates.extend(date)
         y.extend(batch['y'][:,-1])
         y_hat.extend(pred)
-        
-        if return_features:
-            last_obs = batch['x_di'][:,-1,:]
-            mask = (~np.any(np.isnan(last_obs),axis=1))
-            matchups.extend(mask.tolist())
+            
+        if return_dt:
+            valid_mask = ~np.isnan(batch['x_di'][:, :, 0])  # Simplifying to the first feature, since all features align
+
+            indices = np.arange(valid_mask.shape[1])
+            valid_indices_arr = np.full_like(valid_mask, -1, dtype=float)  # Start with -1 (indicating no valid data yet)
+
+            for b in range(valid_mask.shape[0]):
+                valid_indices = np.where(valid_mask[b])[0]
+                valid_indices_arr[b, valid_indices] = indices[valid_indices]
+
+            last_valid_index = np.maximum.accumulate(valid_indices_arr, axis=1) 
+            last_valid_index[last_valid_index == -1] = np.nan
+            batch_dt = last_valid_index - indices
+            dt.extend(batch_dt[:,-1])
+
         
     # Create a dataframe with multi-index
     multi_index = pd.MultiIndex.from_arrays([basins,dates],names=['basin','date'])
@@ -44,8 +55,8 @@ def predict(model, dataloader, *, seed=0, denormalize=True, return_features=Fals
         y_hat = dataloader.dataset.denormalize_target(y_hat)
     results = pd.DataFrame({'obs':  y, 'pred': y_hat}, index=multi_index)
     
-    if return_features:
-        results['matchups'] = matchups
+    if return_dt:
+        results['dt'] = dt
         
     metrics = get_all_metrics(y, y_hat)
     for key, value in metrics.items():
@@ -78,9 +89,13 @@ def calc_nbias(y, y_hat):
     return np.nanmean(norm_err)
 
 @mask_nan
+def calc_rmse(y, y_hat):
+    return np.sqrt(np.mean((y - y_hat)**2))
+    
+@mask_nan
 def calc_rrmse(y, y_hat):
-    relative_err = (y - y_hat) / y
-    return np.sqrt(np.nanmean(relative_err**2))
+    rmse = calc_rmse(y, y_hat)
+    return rmse/np.mean(y_hat)*100
  
 @mask_nan
 def calc_kge(y, y_hat):
@@ -112,8 +127,8 @@ def calc_agreement(y, y_hat):
     if corr >= 0:
         kappa = 0
     else:
-        kappa = 2 * np.abs(np.sum((y-np.mean(y))*(y_hat-np.mean(y_hat))))
-        
+        kappa = 2 * np.abs(np.mean((y-np.mean(y))*(y_hat-np.mean(y_hat))))
+
     numerator = np.mean((y - y_hat)**2)
     denominator = np.var(y) + np.var(y_hat) + (np.mean(y) - np.mean(y_hat))**2 + kappa
     return 1 - (numerator / denominator)

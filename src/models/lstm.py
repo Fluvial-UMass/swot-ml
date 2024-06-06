@@ -115,7 +115,7 @@ class EALSTMCell(eqx.Module):
         c_1 = f * c_0 + i * g
         h_1 = o * jnp.tanh(c_1)
 
-        #return state and 0 for skip_count
+        #return state
         return (h_1, c_1)
 
 class EALSTM(BaseLSTM):

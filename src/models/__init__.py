@@ -7,20 +7,23 @@ reload(transformer)
 
 from .lstm import EALSTM, TEALSTM, TAPLSTM
 from .transformer import EATransformer
+from .hybrid import Hybrid
 
 def make(cfg: dict):
     name = cfg['model'].lower()
     
     if name == "ealstm":
-        model = EALSTM(**cfg['model_args'])
+        model_fn = EALSTM
     elif name == "tealstm":
-        model = TEALSTM(**cfg['model_args'])
+        model_fn = TEALSTM
     elif name == "taplstm":
-        model = TAPLSTM(**cfg['model_args'])
+        model_fn = TAPLSTM
     elif name == "eatransformer":
-        model = EATransformer(**cfg['model_args'])
+        model_fn = EATransformer
+    elif name == "hybrid":
+        model_fn = Hybrid
     else:
         raise ValueError(f"{cfg['model']} is not a valid model name. Check /src/models/__init__.py for model config.")
 
-    return model
+    return model_fn(**cfg['model_args'])
     

@@ -74,9 +74,12 @@ class Trainer:
 
         # Setup logging
         if cfg['log']:
-            current_date = datetime.now().strftime("%Y%m%d_%H%M")
+            current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
             if log_parent is not None:
-                self.log_dir = log_parent / current_date
+                if cfg.get('cfg_path') is not None:
+                     self.log_dir = log_parent / f"{cfg.get('cfg_path').stem}_{current_date}"
+                else:
+                    self.log_dir = log_parent / current_date
             else:     
                 self.log_dir = Path(f"../runs/notebook/{current_date}")
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -223,16 +226,16 @@ class Trainer:
             std_loss = loss_arr.std()
             z_score = ((loss-mean_loss)/std_loss)
             if loss is not None and z_score > 5:
-                error_str = f"Anomalous batch loss ({loss:0.4f}, z-score of {z_score:0.1f})."
+                warning_str = f"Anomalous batch loss ({loss:0.4f}, z-score of {z_score:0.1f})."
                 if self.cfg['log']:
-                    error_dir = self.log_dir / "anomalies" / f"epoch{self.epoch}_batch{pbar.n}"
-                    self.save_state(error_dir)
+                    warning_dir = self.log_dir / "anomalies" / f"epoch{self.epoch}_batch{pbar.n}"
+                    self.save_state(warning_dir)
 
-                    with open(error_dir / "data.pkl", "wb") as f:
+                    with open(warning_dir / "data.pkl", "wb") as f:
                         pickle.dump(data_tuple, f)
-                    error_str += f"See {error_dir.relative_to(self.log_dir)} for data and model state."
-                    logging.error(error_str)
-                print(error_str)
+                    warning_str += f"See {warning_dir.relative_to(self.log_dir)} for data and model state."
+                    logging.warning(warning_str)
+                print(warning_str)
 
             if consecutive_exceptions >= 1:
                 raise RuntimeError(f"Too many consecutive exceptions ({consecutive_exceptions})")
