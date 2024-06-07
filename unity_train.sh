@@ -1,6 +1,6 @@
 #!/bin/bash
 # SLURM directives
-#SBATCH -c 6 # Number of Cores per Task
+#SBATCH -c 4 # Number of Cores per Task
 #SBATCH --mem=64G  # Requested Memory
 #SBATCH -p cpu # Partition     
 #SBATCH -t 24:00:00  # Job time limit

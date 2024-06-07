@@ -225,7 +225,7 @@ class Trainer:
             mean_loss = loss_arr.mean()
             std_loss = loss_arr.std()
             z_score = ((loss-mean_loss)/std_loss)
-            if loss is not None and z_score > 5:
+            if loss is not None and (z_score > 5) and (pbar.n >= 10):
                 warning_str = f"Anomalous batch loss ({loss:0.4f}, z-score of {z_score:0.1f})."
                 if self.cfg['log']:
                     warning_dir = self.log_dir / "anomalies" / f"epoch{self.epoch}_batch{pbar.n}"
@@ -237,7 +237,7 @@ class Trainer:
                     logging.warning(warning_str)
                 print(warning_str)
 
-            if consecutive_exceptions >= 1:
+            if consecutive_exceptions >= 3:
                 raise RuntimeError(f"Too many consecutive exceptions ({consecutive_exceptions})")
 
             if (pbar.n+1) == pbar.total:
