@@ -12,13 +12,15 @@ import jax.sharding as jshard
 from torch.utils.data import Dataset, DataLoader
 
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 class TAPDataLoader(DataLoader):
     def __init__(self, cfg, dataset):    
         num_workers = cfg.get('num_workers', 1)
         persistent_workers = False if num_workers==0 else cfg.get('persistent_workers',True)
         
         super().__init__(dataset,
-                         collate_fn=self.collate_batch,
+                         collate_fn = self.collate_fn,
                          shuffle=cfg.get('shuffle', True),
                          batch_size=cfg.get('batch_size', 1),
                          num_workers=num_workers,
@@ -36,19 +38,11 @@ class TAPDataLoader(DataLoader):
         backend = cfg.get('backend', None)
         num_devices = cfg.get('num_devices', None)
         self.set_jax_sharding(backend, num_devices)
-
-    @staticmethod
-    def collate_batch(sample):
-        """Collates sample data into batched data."""
-        basin = [item['basin'] for item in sample]
-        date = [item['date'] for item in sample]
-        x_dd = jnp.stack([item['x_dd'] for item in sample])
-        x_di = jnp.stack([item['x_di'] for item in sample])
-        x_s = jnp.stack([item['x_s'] for item in sample])
-        y = jnp.stack([item['y'] for item in sample])
         
-        batch = {'x_dd':x_dd, 'x_di':x_di, 'x_s':x_s, 'y': y}
-        return basin, date, batch
+    @staticmethod
+    def collate_fn(sample):
+        # I can't figure out how to just not collate. Can't even use lambdas because of multiprocessing.
+        return sample
 
     def set_mode(self, *, data_subset:str=None, basin_subset:list=None):
         # Use existing values if None provided.
@@ -108,12 +102,14 @@ class TAPDataset(Dataset):
         
         # Validate the feature dict
         features = cfg['features']
-        if not isinstance(features.get('daily'), list):
-            raise ValueError("features_dict must contain a list of daily features at a minimum.")
-        self.daily_features = features['daily']
-        self.target = features['target']
+        for key, value in features.items():
+            if not isinstance(value, list) and value is not None:
+                raise ValueError(f"All feature dicts must contain a list. {key} is not a list.")
         
-        #Not required for simpler models. Returns None if missing from features.
+        # These are required for all models.
+        self.target = features['target']
+        self.daily_features = features['daily']
+        # These are not and can pass None
         self.irregular_features = features.get('irregular')
         self.static_features = features.get('static') 
         
@@ -154,7 +150,7 @@ class TAPDataset(Dataset):
             ds['date'] = ds['date'].astype('datetime64[ns]')
     
             # Filter to keep only the necessary features and the target variable
-            ds = ds[[*self.daily_features, *self.irregular_features, self.target]]
+            ds = ds[[*self.daily_features, *self.irregular_features, *self.target]]
 
             # Replace negative values with NaN in specific columns without explicit loop
             for col in self.cfg['log_norm_cols']:
@@ -163,20 +159,26 @@ class TAPDataset(Dataset):
             if self.cfg['clip_target_to_zero']:
                 ds[self.target] = ds[self.target].where(ds[self.target] >= 0, np.nan)
 
-            # Testing if this is causing an issue
+            # Testing if this nans are causing an issue
             for col in self.daily_features:
                 ds[col] = ds[col].where(~np.isnan(ds[col]), 0)
+                
+            # Apply rolling means at 1 or more intervals.    
+            window_sizes = self.cfg.get('add_rolling_means')
+            if window_sizes is not None:
+                ds = self.add_smoothed_features(ds, window_sizes)
                 
             # Component masks for creating data indices
             is_train = ds['date'] < self.cfg['split_time']
             valid_sequence = ds['date'] >= min_train_date
             valid_irregular = (~np.isnan(ds[self.irregular_features])).to_array().all(dim='variable')
-            valid_target = ~np.isnan(ds[self.target])
+            valid_target = (~np.isnan(ds[self.target])).to_array().any(dim='variable')
 
             # Create valid data indices for this basin
             masks = [('pre-train', is_train & valid_sequence & valid_irregular & valid_target),
                      ('train', is_train & valid_sequence & valid_target),
-                     ('test', ~is_train & valid_sequence)]
+                     ('test', ~is_train & valid_sequence & valid_target),
+                     ('predict', ~is_train & valid_sequence)]
             for key, mask in masks:
                 self.indices[key][basin] = ds['date'][mask].values
     
@@ -231,17 +233,30 @@ class TAPDataset(Dataset):
         date_ranges = {date: pd.date_range(end=date, periods=self.cfg['sequence_length'], freq='D').values for date in unique_dates}
         return date_ranges
 
-    def __getitem__(self, idx):
+    
+    def __getitems__(self, ids):
         """Generate one batch of data."""
-        basin, date = self.basin_index_pairs[idx]
-        sequence_dates = self.date_ranges[date]
-        x_dd = self.x_d.sel(basin=basin, date=sequence_dates)[self.daily_features].to_array().values.T
-        x_di = self.x_d.sel(basin=basin, date=sequence_dates)[self.irregular_features].to_array().values.T
-        x_s = self.x_s[basin]
-        y = self.x_d.sel(basin=basin, date=sequence_dates)[self.target].values
+        # Prepare to collect all basin and date information for the indices
+        basins = [self.basin_index_pairs[idx][0] for idx in ids]
+        dates = [self.basin_index_pairs[idx][1] for idx in ids]
+        sequenced_dates = [self.date_ranges[date] for date in dates]
 
-        sample = {'basin': basin, 'date': date, 'x_dd': x_dd, 'x_di': x_di, 'x_s': x_s, 'y': y}
-        return sample
+        # Convert to xarray-friendly formats
+        basins_da = xr.DataArray(basins, dims="sample")
+        sequenced_dates_da = xr.DataArray(sequenced_dates, dims=["sample", "time"])
+
+        ds = self.x_d.sel(basin=basins_da, date=sequenced_dates_da)
+        x_dd = np.moveaxis(ds[self.daily_features].to_array().values,0,2)
+        x_di = np.moveaxis(ds[self.irregular_features].to_array().values,0,2)
+        x_s = np.array([self.x_s[b] for b in basins])
+        y = np.moveaxis(ds[self.target].to_array().values,0,2)
+
+        batch = { 'x_dd': jnp.array(x_dd), 
+                 'x_di': jnp.array(x_di), 
+                 'x_s': jnp.array(x_s), 
+                 'y': jnp.array(y)}
+        
+        return basins, dates, batch
 
     def _normalize_data(self, ds):
         """
@@ -318,6 +333,18 @@ class TAPDataset(Dataset):
 
         self.data_subset = data_subset
         self.basin_index_pairs = basin_index_pairs
+        
+    def add_smoothed_features(self, ds, window_sizes):
+        new_ds = ds.copy()
+        data_vars = ds.data_vars
+        for window_size in window_sizes:
+            # Apply rolling mean and rename variables
+            for var_name in data_vars:
+                # Perform rolling operation
+                smoothed_var = ds[var_name].rolling(date=window_size, min_periods=1, center=False).mean(skipna=True)
+                # Assign to new dataset with a new variable name
+                new_ds[f"{var_name}_smooth{window_size}"] = smoothed_var
+        return new_ds
 
 def _get_available_devices():
     """

@@ -16,13 +16,14 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 
 import models
+
 # While testing
 from importlib import reload
 reload(models)
 
 class Trainer:
     """
-    A class to handle training of models.
+    A class to handle training of equinox models.
 
     Attributes:
         cfg (dict): Configuration dictionary.
@@ -38,7 +39,7 @@ class Trainer:
         opt_state: Optimizer state.
         filter_spec: Specification for freezing components.
     """
-    def __init__(self, cfg, dataloader, *, log_parent:Path=None, config_str=None, model=None):
+    def __init__(self, cfg, dataloader=None, *, log_parent:Path=None, config_str=None, model=None):
         """        
         Initializes optimizers, logging, and sets up the training environment.
 
@@ -60,12 +61,11 @@ class Trainer:
             cfg['num_epochs'],
             cfg['decay_rate'])
 
-        self.model = models.make(cfg) if model is None else model
-
         self.loss_list = []
         self.epoch = 0
         self.train_key = jax.random.PRNGKey(cfg['model_args']['seed']+1)
-        
+         
+        self.model = models.make(cfg) if model is None else model
         self.optim = optax.adam(self.lr_schedule(self.epoch))
         self.opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
 
@@ -74,13 +74,21 @@ class Trainer:
 
         # Setup logging
         if cfg['log']:
-            current_date = datetime.now().strftime("%Y%m%d_%H%M")
+            current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
             if log_parent is not None:
-                self.log_dir = log_parent / current_date
+                if cfg.get('cfg_path') is not None:
+                     self.log_dir = log_parent / f"{cfg.get('cfg_path').stem}_{current_date}"
+                else:
+                    self.log_dir = log_parent / current_date
             else:     
                 self.log_dir = Path(f"../runs/notebook/{current_date}")
             self.log_dir.mkdir(parents=True, exist_ok=True)
-        
+            print(f"Logging at {self.log_dir}")
+            
+            cfg_file = self.log_dir / "config.pkl"
+            with open(cfg_file, 'wb') as file:
+                pickle.dump(self.cfg, file)
+
             log_file = self.log_dir / "training.log"
             logging.basicConfig(filename=log_file, filemode='w', level=logging.INFO,
                             format='%(asctime)s - %(levelname)s - %(message)s', force=True)
@@ -97,8 +105,11 @@ class Trainer:
         Returns:
             The trained model after completing the training or upon an interruption.
         """
+        if self.dataloader is None:
+            raise RuntimeError(f"Trainer objects without a dataloader can only be used for loading model states.")
+        
         try:
-            while self.epoch <= self.num_epochs:
+            while self.epoch < self.num_epochs:
                 self.epoch += 1
                 loss, bad_grads = self._train_epoch()
 
@@ -123,7 +134,7 @@ class Trainer:
                 if self.cfg['log'] & (self.epoch % self.log_interval == 0):
                     self.save_state()
                     
-                self.loss_list.append(loss)
+                self.loss_list.append(float(loss))
         except KeyboardInterrupt:
             pass
 
@@ -148,35 +159,37 @@ class Trainer:
         lr = self.lr_schedule(self.epoch)
         self.optim = optax.adam(lr)
         consecutive_exceptions = 0
-        total_loss = 0
-        num_batches = 0
+        batch_count = 0
+        losses = []
         bad_grads = {'vanishing': {}, 'exploding':{}}
 
         pbar = tqdm(self.dataloader, disable=self.cfg['quiet'], desc=f"Epoch:{self.epoch:03.0f}")
         for data_tuple in pbar:
             basins, dates, batch = data_tuple
             batch = self.dataloader.shard_batch(batch)
+            batch_count += 1
 
             # Split and update training key for dropout
             keys = jax.random.split(self.train_key, self.cfg['batch_size']+1)
             self.train_key = keys[0]
             batch_keys = keys[1:] 
             try: 
-                step = make_step(self.model, 
-                                 batch,
-                                 batch_keys,
-                                 self.opt_state, 
-                                 self.optim, 
-                                 self.filter_spec, 
-                                 **self.cfg['step_kwargs'])
-                # Unpack the tuple
-                loss, grads, self.model, self.opt_state = step
+                loss, grads, self.model, self.opt_state = make_step(
+                    self.model, 
+                    batch,
+                    batch_keys,
+                    self.opt_state, 
+                    self.optim, 
+                    self.filter_spec, 
+                    **self.cfg['step_kwargs']
+                )
 
                 if jnp.isnan(loss):
                     raise RuntimeError(f"NaN loss encountered")
-                    
-                total_loss += loss
-                num_batches += 1
+
+                pbar.set_postfix_str(f"Loss:{loss:0.04f}")
+                
+                losses.append(loss)
                 consecutive_exceptions = 0
                 
                 # Monitor gradients
@@ -196,13 +209,14 @@ class Trainer:
                 consecutive_exceptions += 1
                 
                 if self.cfg['log']:
-                    error_dir = self.log_dir / "exceptions" / f"epoch{self.epoch}_batch{pbar.n}"
+                    error_dir = self.log_dir / "exceptions" / f"epoch{self.epoch}_batch{batch_count}"
                     self.save_state(error_dir)
 
                     with open(error_dir / "data.pkl", "wb") as f:
                         pickle.dump(data_tuple, f)
-
-                    error_str = f"{type(e).__name__} exception caught. See {error_dir} for data, model, state, and trace."
+                    with open(error_dir / "exception.txt", "w") as f:
+                        f.write(f"{str(e)}\n{traceback.format_exc()}")
+                    error_str = f"{type(e).__name__} exception caught. See {error_dir} for data, model state, and trace."
                     logging.error(error_str)
                     
                 else:
@@ -211,16 +225,34 @@ class Trainer:
 
             if consecutive_exceptions >= 3:
                 raise RuntimeError(f"Too many consecutive exceptions ({consecutive_exceptions})")
+            
+            if len(losses) > 0:
+                loss_arr = np.array(losses)
+                mean_loss = loss_arr.mean()
+                std_loss = loss_arr.std()
+                z_score = ((loss-mean_loss)/std_loss)
+                if (z_score > 10) and (len(losses) >= 10):
+                    warning_str = f"Anomalous batch loss ({loss:0.4f}, z-score of {z_score:0.1f})."
+                    if self.cfg['log']:
+                        warning_dir = self.log_dir / "anomalies" / f"epoch{self.epoch}_batch{len(losses)}"
+                        self.save_state(warning_dir)
 
-            if num_batches > 0:
-                average_loss = (total_loss / num_batches).item() #jax array to float
-                pbar.set_postfix_str(f"Loss:{average_loss:0.04f}")
+                        with open(warning_dir / "data.pkl", "wb") as f:
+                            pickle.dump(data_tuple, f)
+                        warning_str += f"See {warning_dir.relative_to(self.log_dir)} for data and model state."
+                        logging.warning(warning_str)
+                    print(warning_str)
+                    
+            if (pbar.n+1) == pbar.total:
+                pbar.set_postfix_str(f"Avg Loss:{mean_loss:0.04f}")
+                pbar.refresh()
+                
+        return mean_loss, bad_grads
+        
     
-        return average_loss, bad_grads
-
     def save_state(self, save_dir=None):
         if save_dir is None:
-            save_dir = self.log_dir / f"epoch{self.epoch}"
+            save_dir = self.log_dir / f"epoch{self.epoch:03d}"
         os.makedirs(save_dir, exist_ok=True)
             
         with open(save_dir / "model.eqx", "wb") as f:
@@ -231,38 +263,27 @@ class Trainer:
         with open(save_dir / "state.eqx", "wb") as f:
             state = {'epoch': self.epoch, 'loss_list': self.loss_list}
             state_str = json.dumps(state)
-            f.write((train_state_str + "\n").encode())
+            f.write((state_str + "\n").encode())
             eqx.tree_serialise_leaves(f, self.opt_state)
-
-    def load_state(self, save_dir:str):     
-        with open(self.log_dir / save_dir / "model.eqx", "rb") as f:
-            model_args = json.loads(f.readline().decode())
-            model = models.make(self.cfg)
-            self.model = eqx.tree_deserialise_leaves(f, model)
-
-        with open(self.log_dir / save_dir / "state.eqx", "rb") as f:
-            state = json.loads(f.readline().decode())
-            self.epoch = state['epoch']
-            self.loss_list = state['loss_list']
-            opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
-            self.opt_state = eqx.tree_deserialise_leaves(f, opt_state)
-
-        # If some data were stored alongside this record, load and return it.
-        data_path = self.log_dir / save_dir / "data.pkl"
-        if os.path.exists(data_path):
-            with open(data_path, 'rb') as file:
-                data = pickle.load(file)
-            return data
-
+   
+    def load_state(self, save_dir:str):
+        state_dir = self.log_dir / save_dir
+        cfg, model, trainer_state, opt_state, data = load_state(state_dir, cfg)
+        
+        self.model = mode
+        self.epoch = trainer_state['epoch']
+        self.loss_list = trainer_state['loss_list']
+        self.opt_state = opt_state
+        return data
+    
     def load_last_state(self):
-        epoch_regex = re.compile(r"epoch(\d+)")
-        dirs = os.listdir(self.log_dir)
-        matches = [epoch_regex.match(d) for d in dirs]
-        epochs = [int(m.group(1)) for m in matches if isinstance(m, re.Match)]
-        save_dir = f"epoch{max(epochs)}"
+        save_dir = _last_epoch_dir(self.log_dir)
         self.load_state(save_dir)
 
     def freeze_components(self, component_names=None, freeze:bool=True):
+        # Updates the filterspec to set which parmaters can be updated.
+        # Only accepts top-level element names in the pytree model. 
+        
         if isinstance(component_names, str):
                 component_names = [component_names]
             
@@ -278,17 +299,72 @@ class Trainer:
             # return True (differentiable) for any remaining components.
             else:
                 return True
-                
         self.filter_spec = jtu.tree_map_with_path(diff_filter, self.model)
+       
+    
+def load_state(state_dir, cfg=None):
+    print(f"Loading model state from {state_dir}")
+    if cfg is None:
+        cfg_file = state_dir.parent / "config.pkl"
+        with open(cfg_file, 'rb') as file:
+            cfg = pickle.load(file)        
+    lr_schedule = optax.exponential_decay(
+        cfg['initial_lr'],
+        cfg['num_epochs'],
+        cfg['decay_rate'])
+    
+    with open(state_dir / "model.eqx", "rb") as f:
+        model_args = json.loads(f.readline().decode())
+        serialized_model = models.make(cfg)
+        model = eqx.tree_deserialise_leaves(f, serialized_model)
+    
+    with open(state_dir / "state.eqx", "rb") as f:
+        trainer_state = json.loads(f.readline().decode())
+        optim = optax.adam(lr_schedule(trainer_state['epoch']))   
+        serialized_opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
+        opt_state = eqx.tree_deserialise_leaves(f, serialized_opt_state)
 
-def mse_loss(y, y_pred):
-    mse = jnp.mean(jnp.square(y[...,-1] - y_pred[...,-1]))
+    out = (cfg, model, trainer_state, opt_state)
+    # Load any data that were stored alongside this record.
+    data_path = state_dir / "data.pkl"
+    if os.path.exists(data_path):
+        with open(data_path, 'rb') as file:
+            data = pickle.load(file)
+            out = (*out, data)
+    return out
+
+
+def _last_epoch_dir(log_dir):
+    epoch_regex = re.compile(r"epoch(\d+)")
+    dirs = os.listdir(log_dir)
+    matches = [epoch_regex.match(d) for d in dirs]
+    epoch_strs = [m.group(1) for m in matches if isinstance(m, re.Match)]
+    last_epoch_idx = np.argmax([int(s) for s in epoch_strs])
+    
+    return log_dir / f"epoch{epoch_strs[last_epoch_idx]}"
+    
+def load_last_state(log_dir):
+    save_dir = _last_epoch_dir(log_dir)
+    return load_state(save_dir)
+
+    
+
+    
+    
+def mse_loss(y, y_pred, mask):
+    mse = jnp.mean(jnp.square(y - y_pred), where=mask)
     return mse
 
-# Intermittent flow modified MSE
-def mae_loss(y, y_pred, q):
-    mse = jnp.mean(jnp.abs(y[...,-1] - y_pred[...,-1]))
+def mae_loss(y, y_pred, mask):
+    mae = jnp.mean(jnp.abs(y - y_pred), where=mask)
     return mae
+
+def huber_loss(y, y_pred, mask, delta=1.0):
+    residual = y - y_pred
+    condition = jnp.abs(residual) <= delta
+    squared_loss = 0.5 * jnp.square(residual)
+    linear_loss = delta * (jnp.abs(residual) - 0.5 * delta)
+    return jnp.mean(jnp.where(condition, squared_loss, linear_loss), where=mask)
 
 @eqx.filter_value_and_grad
 def compute_loss(diff_model, static_model, data, keys, loss_name):
@@ -307,22 +383,16 @@ def compute_loss(diff_model, static_model, data, keys, loss_name):
     model = eqx.combine(diff_model, static_model)
     y_pred = jax.vmap(model)(data, keys)
 
-    # Debugging
-    def print_func(operand):
-        data, y_pred = operand
-        jax.debug.print("y: {a}, pred:{b}", a=data['y'][...,-1], b=y_pred[...,-1])
-        return None
-    is_nan = jnp.any(jnp.isnan(y_pred))
-    jax.lax.cond(is_nan,
-                 print_func,
-                 lambda *args: None,
-                 operand=(data, y_pred))
-    # Debugging
-
+    y = data['y'][:,-1,:]
+    valid_mask = ~jnp.isnan(data['y'][:,-1,:])
+    masked_y = jnp.where(valid_mask, y, 0)
+    masked_y_pred = jnp.where(valid_mask, y_pred, 0)
     if loss_name == "mse":
-        return mse_loss(data['y'], y_pred)
+        return mse_loss(masked_y, masked_y_pred, valid_mask)
     elif loss_name == "mae":
-        return mae_loss(data['y'], y_pred)
+        return mae_loss(masked_y, masked_y_pred, valid_mask)
+    elif loss_name == "huber":
+        return huber_loss(masked_y, masked_y_pred, valid_mask)
     else:
         raise ValueError("Invalid loss function name.")  
     

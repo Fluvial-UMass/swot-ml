@@ -15,10 +15,10 @@ basin_file: "metadata/site_lists/sites_test.txt"
 
 # Dictionary of exact column names in the netcdf files
 features:
-    #Daily (or consistent timescale) features in the netcdf files. 
+    # Daily (or consistent timescale) features in the netcdf files. Can not contain NaN data.
     daily:
       - "grfr_q"
-    #Irregularly-timed features in the netcdf files
+    # Irregularly-timed features in the netcdf files. NaN values are replaced and/or masked.
     irregular: 
       - "Blue"
       - "Green"
@@ -26,8 +26,9 @@ features:
       - "Nir"
       - "Swir1"
       - "Swir2"
-    #Static basin parameters from the csv file. If none, all are used.
+    #Static basin features from the csv file. If none, all are used.
     static: 
+    # Target feature
     target: "turbidity"
     
 # Start and end of join train and test periods
@@ -69,11 +70,12 @@ pin_memory: true
 # ┌────────────────────────────────┐ #
 # │             Model              │ #
 # └────────────────────────────────┘ #
-# Model name. taplstm, ealstm, tealstm
+# Model name. taplstm, ealstm, tealstm, eatransformer
 model: "taplstm"
 
 sequence_length: 30
 
+# Different for eatransformer model
 model_args:
     hidden_size: 64
     dropout: 0.4
@@ -84,23 +86,25 @@ model_args:
 # └────────────────────────────────┘ #
 num_epochs: 10
 
-# How frequently (in epochs) to save training progress
-log_interval: 5
-
 # Parameters for lr scheduler (https://optax.readthedocs.io/en/latest/api/optimizer_schedules.html#optax.exponential_decay)
 # learning_rate(epoch) = initial_lr * (decay_rate ** (epoch / num_epochs))
 initial_lr: 0.01
 decay_rate: 0.01
 
+# Params passed to model steps during training.
 step_kwargs:
     # mse and mae only right now
-    loss: "mse"
-    
+    loss: "mse" 
     # Gradient clipping to this norm
     max_grad_norm: 2
 
 # ┌────────────────────────────────┐ #
-# │             Misc.              │ #
+# │            Outputs             │ #
 # └────────────────────────────────┘ #
 # Use to declutter the slurm output (removes tqdm)
-quiet: true 
+quiet: true
+
+log: true
+
+# How frequently (in epochs) to save training progress
+log_interal: 5
