@@ -3,6 +3,8 @@ import models.lstm
 reload(models.lstm)
 import models.transformer
 reload(transformer)
+import models.hybrid
+reload(models.hybrid)
 # Above for testing while changing models scripts.
 
 from .lstm import EALSTM, TEALSTM, TAPLSTM

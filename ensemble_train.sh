@@ -1,34 +1,37 @@
 #!/bin/bash
 
-# Check if the argument is a directory or file
+# Check if the argument is a directory
 if [ -d "$1" ]; then
-  # It's a directory, initialize a count for valid files
+  # Initialize a count for valid files
   valid_files=0
 
   # Loop over each yml file
   for config_file in "$1"/*.yml; do
     if [ -f "$config_file" ]; then
-      sbatch unity_train.sh "$config_file"  # Submit a new job for each file using the submission script
       ((valid_files++))
     fi
   done
 
   # Check if no valid files were found
   if [ $valid_files -eq 0 ]; then
-    echo "Error: No valid .yml files found in the directory."
+    echo "Error: No valid .yml file found in the directory."
     exit 1
   fi
 
-elif [ -f "$1" ]; then
-  # It's a file, check if it exists
-  if [ ! -f "$1" ]; then
-    echo "Error: Configuration file does not exist."
-    exit 1
+  read -p "Found $valid_files .yml file(s). Do you want to submit all jobs? (y/n) " answer
+  if [ "$answer" != "y" ]; then
+    echo "Job submission canceled."
+    exit 0
   fi
 
-  sbatch job_submit.sh "$1"  # Submit the job using the submission script
+  # If confirmed, submit each job
+  for config_file in "$1"/*.yml; do
+    if [ -f "$config_file" ]; then
+      ./unity_train.sh "$config_file"
+    fi
+  done
   
 else
-  echo "Error: Invalid input. Please provide a valid path to yml file or directory of yml file(s)."
+  echo "Error: Invalid input. Please provide a valid directory"
   exit 1
 fi

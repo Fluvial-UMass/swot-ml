@@ -159,6 +159,7 @@ class Trainer:
         lr = self.lr_schedule(self.epoch)
         self.optim = optax.adam(lr)
         consecutive_exceptions = 0
+        batch_count = 0
         losses = []
         bad_grads = {'vanishing': {}, 'exploding':{}}
 
@@ -166,6 +167,7 @@ class Trainer:
         for data_tuple in pbar:
             basins, dates, batch = data_tuple
             batch = self.dataloader.shard_batch(batch)
+            batch_count += 1
 
             # Split and update training key for dropout
             keys = jax.random.split(self.train_key, self.cfg['batch_size']+1)
@@ -207,7 +209,7 @@ class Trainer:
                 consecutive_exceptions += 1
                 
                 if self.cfg['log']:
-                    error_dir = self.log_dir / "exceptions" / f"epoch{self.epoch}_batch{pbar.n}"
+                    error_dir = self.log_dir / "exceptions" / f"epoch{self.epoch}_batch{batch_count}"
                     self.save_state(error_dir)
 
                     with open(error_dir / "data.pkl", "wb") as f:
@@ -221,25 +223,26 @@ class Trainer:
                     error_str = f"{str(e)}\n{traceback.format_exc()}"
                 print(error_str)
 
-            loss_arr = np.array(losses)
-            mean_loss = loss_arr.mean()
-            std_loss = loss_arr.std()
-            z_score = ((loss-mean_loss)/std_loss)
-            if loss is not None and (z_score > 5) and (pbar.n >= 10):
-                warning_str = f"Anomalous batch loss ({loss:0.4f}, z-score of {z_score:0.1f})."
-                if self.cfg['log']:
-                    warning_dir = self.log_dir / "anomalies" / f"epoch{self.epoch}_batch{pbar.n}"
-                    self.save_state(warning_dir)
-
-                    with open(warning_dir / "data.pkl", "wb") as f:
-                        pickle.dump(data_tuple, f)
-                    warning_str += f"See {warning_dir.relative_to(self.log_dir)} for data and model state."
-                    logging.warning(warning_str)
-                print(warning_str)
-
             if consecutive_exceptions >= 3:
                 raise RuntimeError(f"Too many consecutive exceptions ({consecutive_exceptions})")
+            
+            if len(losses) > 0:
+                loss_arr = np.array(losses)
+                mean_loss = loss_arr.mean()
+                std_loss = loss_arr.std()
+                z_score = ((loss-mean_loss)/std_loss)
+                if (z_score > 10) and (len(losses) >= 10):
+                    warning_str = f"Anomalous batch loss ({loss:0.4f}, z-score of {z_score:0.1f})."
+                    if self.cfg['log']:
+                        warning_dir = self.log_dir / "anomalies" / f"epoch{self.epoch}_batch{len(losses)}"
+                        self.save_state(warning_dir)
 
+                        with open(warning_dir / "data.pkl", "wb") as f:
+                            pickle.dump(data_tuple, f)
+                        warning_str += f"See {warning_dir.relative_to(self.log_dir)} for data and model state."
+                        logging.warning(warning_str)
+                    print(warning_str)
+                    
             if (pbar.n+1) == pbar.total:
                 pbar.set_postfix_str(f"Avg Loss:{mean_loss:0.04f}")
                 pbar.refresh()
@@ -344,22 +347,24 @@ def load_last_state(log_dir):
     save_dir = _last_epoch_dir(log_dir)
     return load_state(save_dir)
 
-        
-        
-def mse_loss(y, y_pred):
-    mse = jnp.mean(jnp.square(y[...,-1] - y_pred[...,-1]))
+    
+
+    
+    
+def mse_loss(y, y_pred, mask):
+    mse = jnp.mean(jnp.square(y - y_pred), where=mask)
     return mse
 
-def mae_loss(y, y_pred):
-    mae = jnp.mean(jnp.abs(y[...,-1] - y_pred[...,-1]))
+def mae_loss(y, y_pred, mask):
+    mae = jnp.mean(jnp.abs(y - y_pred), where=mask)
     return mae
 
-def huber_loss(y, y_pred, delta=1.0):
-    residual = y[..., -1] - y_pred[..., -1]
+def huber_loss(y, y_pred, mask, delta=1.0):
+    residual = y - y_pred
     condition = jnp.abs(residual) <= delta
     squared_loss = 0.5 * jnp.square(residual)
     linear_loss = delta * (jnp.abs(residual) - 0.5 * delta)
-    return jnp.mean(jnp.where(condition, squared_loss, linear_loss))
+    return jnp.mean(jnp.where(condition, squared_loss, linear_loss), where=mask)
 
 @eqx.filter_value_and_grad
 def compute_loss(diff_model, static_model, data, keys, loss_name):
@@ -378,12 +383,16 @@ def compute_loss(diff_model, static_model, data, keys, loss_name):
     model = eqx.combine(diff_model, static_model)
     y_pred = jax.vmap(model)(data, keys)
 
+    y = data['y'][:,-1,:]
+    valid_mask = ~jnp.isnan(data['y'][:,-1,:])
+    masked_y = jnp.where(valid_mask, y, 0)
+    masked_y_pred = jnp.where(valid_mask, y_pred, 0)
     if loss_name == "mse":
-        return mse_loss(data['y'], y_pred)
+        return mse_loss(masked_y, masked_y_pred, valid_mask)
     elif loss_name == "mae":
-        return mae_loss(data['y'], y_pred)
+        return mae_loss(masked_y, masked_y_pred, valid_mask)
     elif loss_name == "huber":
-        return huber_loss(data['y'], y_pred)
+        return huber_loss(masked_y, masked_y_pred, valid_mask)
     else:
         raise ValueError("Invalid loss function name.")  
     

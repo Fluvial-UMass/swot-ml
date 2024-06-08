@@ -22,7 +22,7 @@ class BaseLSTM(eqx.Module):
     dropout: eqx.nn.Dropout
     dense: eqx.nn.Linear = None
 
-    def __init__(self, in_size, out_size, hidden_size, *, key, **kwargs):
+    def __init__(self, in_size, hidden_size, dense_size, dropout, *, key):
         """
         Initializes the BaseLSTM model.
     
@@ -34,15 +34,14 @@ class BaseLSTM(eqx.Module):
             dropout (float, default 0): Fraction of neurons to reset to 0 during training. 
             dense (bool, default True): If True, a linear (dense) layer is added for output transformation.
         """
-        dropout = kwargs.get('dropout', 0)
-        dense = kwargs.get('dense', True)
-        
         ckey, lkey = jrandom.split(key,2)
         self.hidden_size = hidden_size
         self.cell = eqx.nn.LSTMCell(in_size, hidden_size, key=ckey)
         self.dropout = eqx.nn.Dropout(dropout)
-        if dense:
-            self.dense = eqx.nn.Linear(hidden_size, out_size, key=lkey)
+        if dense_size is not None:
+            self.dense = eqx.nn.Linear(hidden_size, dense_size, key=lkey)
+        else:
+            self.dense = None
 
     def __call__(self, data, key):
         raise NotImplementedError("Subclasses must implement this method.")
@@ -69,8 +68,8 @@ class LSTM(BaseLSTM):
 class EALSTMCell(eqx.Module):
     """
     Am Entity-Aware LSTM (TEALSTM) cell for processing time series data with
-    dynamic and static features. This cell modified the classic LSTM cell by:
-    1. Controlling the input gate with an array of static entity features.
+    dynamic and static features. This cell modified the classic LSTM cell by 
+    controlling the input gate with an array of static entity features.
 
     Attributes:
         weight_ih (jax.Array): Input weights for input, forget, and output gates.
@@ -83,7 +82,7 @@ class EALSTMCell(eqx.Module):
     bias: jax.Array
     input_linear: eqx.nn.Linear
     
-    def __init__(self, dynamic_input_size, static_input_size, out_size, hidden_size, *, key):
+    def __init__(self, dynamic_input_size, static_input_size, hidden_size, *, key):
         wkey, bkey, ikey, dkey = jrandom.split(key, 4)
         self.weight_ih = jax.nn.initializers.glorot_normal()(wkey, (3 * hidden_size, dynamic_input_size))
         self.weight_hh = jax.nn.initializers.glorot_normal()(wkey, (3 * hidden_size, hidden_size))
@@ -122,9 +121,9 @@ class EALSTM(BaseLSTM):
     """
     Entity-Aware LSTM (TEALSTM) model for processing time series data with dynamic and static features.
     """
-    def __init__(self, dynamic_in_size, static_in_size, out_size, hidden_size, *, key, **kwargs):
-        super().__init__(dynamic_in_size, out_size, hidden_size, key=key, **kwargs)
-        self.cell = EALSTMCell(dynamic_in_size, static_in_size, out_size, hidden_size, key=key)
+    def __init__(self, dynamic_in_size, static_in_size, hidden_size, dense_size, dropout, *, key):
+        super().__init__(dynamic_in_size, hidden_size, dense_size, dropout, key=key)
+        self.cell = EALSTMCell(dynamic_in_size, static_in_size, hidden_size, key=key)
 
     def __call__(self, data):
         """
@@ -176,7 +175,7 @@ class TEALSTMCell(eqx.Module):
     weight_decomp: jax.Array
     bias_decomp: jax.Array
     
-    def __init__(self, dynamic_in_size, static_in_size, out_size, hidden_size, *, key):
+    def __init__(self, dynamic_in_size, static_in_size, hidden_size, *, key):
         wkey, bkey, ikey, dkey = jrandom.split(key, 4)
         self.weight_ih = jax.nn.initializers.glorot_normal()(wkey, (3 * hidden_size, dynamic_in_size))
         self.weight_hh = jax.nn.initializers.glorot_normal()(wkey, (3 * hidden_size, hidden_size))
@@ -252,10 +251,9 @@ class TEALSTM(BaseLSTM):
     Time- and Entity-Aware LSTM (TEALSTM) model for processing time series data with
     dynamic and static features.
     """
-    
-    def __init__(self, dynamic_in_size, static_in_size, out_size, hidden_size, *, key, **kwargs):
-        super().__init__(dynamic_in_size, out_size, hidden_size, key=key, **kwargs)
-        self.cell = TEALSTMCell(dynamic_in_size, static_in_size, out_size, hidden_size, key=key)
+    def __init__(self, dynamic_in_size, static_in_size, hidden_size,  dense_size, dropout, *, key):
+        super().__init__(dynamic_in_size, hidden_size, dense_size, dropout, key=key)
+        self.cell = TEALSTMCell(dynamic_in_size, static_in_size, hidden_size, key=key)
 
     def __call__(self, data, key):
         """
@@ -304,20 +302,18 @@ class TAPLSTM(eqx.Module):
     dense: eqx.nn.MLP
     dropout: eqx.nn.Dropout
 
-    def __init__(self, *, daily_in_size, irregular_in_size, static_in_size, out_size, hidden_size, seed, dropout):
+    def __init__(self, *, daily_in_size, irregular_in_size, static_in_size, dense_size, hidden_size, seed, dropout):
         key = jax.random.PRNGKey(seed)
         keys = jrandom.split(key, 4)
-        self.ealstm_d = EALSTM(daily_in_size, static_in_size, out_size, hidden_size, 
-                               key=keys[0], dropout=0, dense=False)
-        self.tealstm_i = TEALSTM(irregular_in_size, static_in_size, out_size, hidden_size, 
-                                 key=keys[1], dropout=0, dense=False)
+        self.ealstm_d = EALSTM(daily_in_size, static_in_size, hidden_size, None, dropout, key=keys[0])
+        self.tealstm_i = TEALSTM(irregular_in_size, static_in_size, hidden_size, None, dropout, key=keys[1])
         
         # self.mlp_attention = eqx.nn.MLP(in_size=static_in_size, out_size=1, width_size=hidden_size, 
         #                                 depth=3, key=keys[2])
         # self.dense = eqx.nn.Linear(2 * hidden_size, out_size, use_bias=True, key=keys[3])
         
         self.dense = eqx.nn.MLP(in_size=(2 * hidden_size) + static_in_size + 1, 
-                                       out_size=out_size, 
+                                       out_size=dense_size, 
                                        width_size=hidden_size, 
                                        depth=2, 
                                        key=keys[2])

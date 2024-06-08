@@ -29,7 +29,7 @@ def format_config(cfg):
 
 
 def set_model_data_args(cfg, dataset):
-    cfg['model_args']['out_size'] = 1
+    cfg['model_args']['out_size'] = len(dataset.target)
     
     model_name = cfg['model'].lower()
     if model_name in ["eatransformer", "hybrid"]:

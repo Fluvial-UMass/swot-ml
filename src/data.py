@@ -102,12 +102,14 @@ class TAPDataset(Dataset):
         
         # Validate the feature dict
         features = cfg['features']
-        if not isinstance(features.get('daily'), list):
-            raise ValueError("features_dict must contain a list of daily features at a minimum.")
-        self.daily_features = features['daily']
-        self.target = features['target']
+        for key, value in features.items():
+            if not isinstance(value, list) and value is not None:
+                raise ValueError(f"All feature dicts must contain a list. {key} is not a list.")
         
-        #Not required for simpler models. Returns None if missing from features.
+        # These are required for all models.
+        self.target = features['target']
+        self.daily_features = features['daily']
+        # These are not and can pass None
         self.irregular_features = features.get('irregular')
         self.static_features = features.get('static') 
         
@@ -148,7 +150,7 @@ class TAPDataset(Dataset):
             ds['date'] = ds['date'].astype('datetime64[ns]')
     
             # Filter to keep only the necessary features and the target variable
-            ds = ds[[*self.daily_features, *self.irregular_features, self.target]]
+            ds = ds[[*self.daily_features, *self.irregular_features, *self.target]]
 
             # Replace negative values with NaN in specific columns without explicit loop
             for col in self.cfg['log_norm_cols']:
@@ -170,7 +172,7 @@ class TAPDataset(Dataset):
             is_train = ds['date'] < self.cfg['split_time']
             valid_sequence = ds['date'] >= min_train_date
             valid_irregular = (~np.isnan(ds[self.irregular_features])).to_array().all(dim='variable')
-            valid_target = ~np.isnan(ds[self.target])
+            valid_target = (~np.isnan(ds[self.target])).to_array().any(dim='variable')
 
             # Create valid data indices for this basin
             masks = [('pre-train', is_train & valid_sequence & valid_irregular & valid_target),
@@ -231,17 +233,6 @@ class TAPDataset(Dataset):
         date_ranges = {date: pd.date_range(end=date, periods=self.cfg['sequence_length'], freq='D').values for date in unique_dates}
         return date_ranges
 
-    def __getitem__(self, idx):
-        """Generate one sequence of data."""
-        basin, date = self.basin_index_pairs[idx]
-        sequence_dates = self.date_ranges[date]
-        x_dd = self.x_d.sel(basin=basin, date=sequence_dates)[self.daily_features].to_array().values.T
-        x_di = self.x_d.sel(basin=basin, date=sequence_dates)[self.irregular_features].to_array().values.T
-        x_s = self.x_s[basin]
-        y = self.x_d.sel(basin=basin, date=sequence_dates)[self.target].values
-
-        sample = {'basin': basin, 'date': date, 'x_dd': x_dd, 'x_di': x_di, 'x_s': x_s, 'y': y}
-        return sample
     
     def __getitems__(self, ids):
         """Generate one batch of data."""
@@ -258,7 +249,7 @@ class TAPDataset(Dataset):
         x_dd = np.moveaxis(ds[self.daily_features].to_array().values,0,2)
         x_di = np.moveaxis(ds[self.irregular_features].to_array().values,0,2)
         x_s = np.array([self.x_s[b] for b in basins])
-        y = ds[self.target].values
+        y = np.moveaxis(ds[self.target].to_array().values,0,2)
 
         batch = { 'x_dd': jnp.array(x_dd), 
                  'x_di': jnp.array(x_di), 

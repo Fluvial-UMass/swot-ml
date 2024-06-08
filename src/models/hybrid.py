@@ -8,6 +8,11 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import numpy as np
 
+from importlib import reload
+import models.lstm, models.transformer
+reload(models.lstm)
+reload(models.transformer)
+
 from .lstm import BaseLSTM, EALSTMCell, TEALSTMCell
 from .transformer import StaticEmbedder, CrossAttnDecoder
 
@@ -15,9 +20,9 @@ class EALSTM(BaseLSTM):
     """
     Entity-Aware LSTM (TEALSTM) model for processing time series data with dynamic and static features.
     """
-    def __init__(self, dynamic_in_size, static_in_size, out_size, hidden_size, *, key, **kwargs):
-        super().__init__(dynamic_in_size, out_size, hidden_size, key=key, **kwargs)
-        self.cell = EALSTMCell(dynamic_in_size, static_in_size, out_size, hidden_size, key=key)
+    def __init__(self, dynamic_in_size, static_in_size, hidden_size, dropout, *, key):
+        super().__init__(dynamic_in_size, hidden_size, None, dropout, key=key)
+        self.cell = EALSTMCell(dynamic_in_size, static_in_size, hidden_size, key=key)
 
     def __call__(self, data, key):
         """
@@ -51,9 +56,9 @@ class TEALSTM(BaseLSTM):
     dynamic and static features.
     """
     
-    def __init__(self, dynamic_in_size, static_in_size, out_size, hidden_size, *, key, **kwargs):
-        super().__init__(dynamic_in_size, out_size, hidden_size, key=key, **kwargs)
-        self.cell = TEALSTMCell(dynamic_in_size, static_in_size, out_size, hidden_size, key=key)
+    def __init__(self, dynamic_in_size, static_in_size, hidden_size, dropout, *, key):
+        super().__init__(dynamic_in_size, hidden_size, None, dropout, key=key)
+        self.cell = TEALSTMCell(dynamic_in_size, static_in_size, hidden_size, key=key)
 
     def __call__(self, data, key):
         """
@@ -87,17 +92,18 @@ class Hybrid(eqx.Module):
     static_embedder: StaticEmbedder
     decoder: CrossAttnDecoder
     head: eqx.nn.Linear
+    
 
     def __init__(self, *, daily_in_size, irregular_in_size, static_in_size, out_size, seq_length, hidden_size, num_layers, num_heads, seed, dropout):
         key = jax.random.PRNGKey(seed)
         keys = jrandom.split(key, 5)
-        self.ealstm_d = EALSTM(daily_in_size, static_in_size, out_size, hidden_size, 
-                               key=keys[0], dropout=dropout, dense=False)
-        self.tealstm_i = TEALSTM(irregular_in_size, static_in_size, out_size, hidden_size, 
-                                 key=keys[1], dropout=dropout, dense=False)
+        self.ealstm_d = EALSTM(daily_in_size, static_in_size, hidden_size, dropout, key=keys[0])
+        self.tealstm_i = TEALSTM(irregular_in_size, static_in_size, hidden_size, dropout, key=keys[1])
         
         self.static_embedder = StaticEmbedder(seq_length, static_in_size, num_heads, dropout, keys[2])
         self.decoder = CrossAttnDecoder(hidden_size, hidden_size, num_layers, num_heads, dropout, keys[3])
+        
+        #have to make seperate heads in a list rather than wider output dim so that we can selectively freeze them.
         self.head = eqx.nn.Linear(in_features=hidden_size, out_features=out_size, key=keys[4])
 
     def __call__(self, data, key):
