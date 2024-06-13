@@ -13,18 +13,18 @@ import traceback
 from tqdm.auto import tqdm
 from pathlib import Path
 from datetime import datetime
-import matplotlib.pyplot as plt
 
-import models
-
-# While testing
 from importlib import reload
+import models
+import train.step
 reload(models)
+reload(train.step)
+
+from .step import make_step
+
 
 class Trainer:
     """
-    A class to handle training of equinox models.
-
     Attributes:
         cfg (dict): Configuration dictionary.
         dataloader: DataLoader object.
@@ -39,7 +39,7 @@ class Trainer:
         opt_state: Optimizer state.
         filter_spec: Specification for freezing components.
     """
-    def __init__(self, cfg, dataloader=None, *, log_parent:Path=None, config_str=None, model=None):
+    def __init__(self, cfg, dataloader, *, log_parent:Path=None, continue_from:Path=None):
         """        
         Initializes optimizers, logging, and sets up the training environment.
 
@@ -47,12 +47,14 @@ class Trainer:
             cfg (dict): Configuration dictionary.
             dataloader: DataLoader object.
             log_parent (Path, optional): Parent directory for logging.
-            config_str (str, optional): Configuration string for logging.
-            model (eqx.Module, optional): Pre-initialized model.
+            continue_from (Path, optional): Directory that contains epoch data
         """
         self.cfg = cfg
         self.dataloader = dataloader
         
+        if cfg['log']: 
+            self.setup_logging(log_parent, continue_from)
+
         self.num_epochs = cfg['num_epochs']
         self.log_interval = cfg.get('log_interval', 5)
         
@@ -61,39 +63,42 @@ class Trainer:
             cfg['num_epochs'],
             cfg['decay_rate'])
 
-        self.loss_list = []
-        self.epoch = 0
         self.train_key = jax.random.PRNGKey(cfg['model_args']['seed']+1)
-         
-        self.model = models.make(cfg) if model is None else model
+
+        if continue_from:
+            self.load_last_state(continue_from)
+        else:
+            self.model = models.make(cfg)
+            self.loss_list = []
+            self.epoch = 0
+
         self.optim = optax.adam(self.lr_schedule(self.epoch))
         self.opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
 
-        #unfreeze everything
+        # Set filterspec to train all components.
         self.freeze_components(None, False)
-
-        # Setup logging
-        if cfg['log']:
-            current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
-            if log_parent is not None:
-                if cfg.get('cfg_path') is not None:
-                     self.log_dir = log_parent / f"{cfg.get('cfg_path').stem}_{current_date}"
-                else:
-                    self.log_dir = log_parent / current_date
-            else:     
-                self.log_dir = Path(f"../runs/notebook/{current_date}")
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            print(f"Logging at {self.log_dir}")
             
-            cfg_file = self.log_dir / "config.pkl"
-            with open(cfg_file, 'wb') as file:
-                pickle.dump(self.cfg, file)
+    def setup_logging(self, log_parent:Path, continue_from:Path):
+        current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if log_parent and continue_from:
+            raise ValueError("Do not pass both log_dir and log_parent to Trainer init.")
+        elif log_parent:
+            self.log_dir = log_parent / f"{self.cfg.get('cfg_path').stem}_{current_date}"
+        elif continue_from:
+            self.log_dir = continue_from
+        else:     
+            self.log_dir = Path(f"../runs/notebook/{current_date}")
+            
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Logging at {self.log_dir}")
+        
+        cfg_file = self.log_dir / "config.pkl"
+        with open(cfg_file, 'wb') as file:
+            pickle.dump(self.cfg, file)
 
-            log_file = self.log_dir / "training.log"
-            logging.basicConfig(filename=log_file, filemode='w', level=logging.INFO,
-                            format='%(asctime)s - %(levelname)s - %(message)s', force=True)
-            if config_str is not None:
-                logging.info("Run Configuration\n"+config_str)
+        log_file = self.log_dir / "training.log"
+        logging.basicConfig(filename=log_file, filemode='w', level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 
     def start_training(self):
         """
@@ -105,9 +110,6 @@ class Trainer:
         Returns:
             The trained model after completing the training or upon an interruption.
         """
-        if self.dataloader is None:
-            raise RuntimeError(f"Trainer objects without a dataloader can only be used for loading model states.")
-        
         try:
             while self.epoch < self.num_epochs:
                 self.epoch += 1
@@ -138,15 +140,11 @@ class Trainer:
         except KeyboardInterrupt:
             pass
 
-        # Cleanup and return 
         print("Training finished or interrupted. Model state saved.")
         if self.cfg['log']:
             if self.epoch % self.log_interval != 0:
                 self.save_state()
             logging.info("~~~ training stopped ~~~")
-            
-        plt.plot(self.loss_list)
-        plt.show()
     
     def _train_epoch(self):
         """
@@ -188,7 +186,6 @@ class Trainer:
                     raise RuntimeError(f"NaN loss encountered")
 
                 pbar.set_postfix_str(f"Loss:{loss:0.04f}")
-                
                 losses.append(loss)
                 consecutive_exceptions = 0
                 
@@ -207,7 +204,6 @@ class Trainer:
 
             except Exception as e:
                 consecutive_exceptions += 1
-                
                 if self.cfg['log']:
                     error_dir = self.log_dir / "exceptions" / f"epoch{self.epoch}_batch{batch_count}"
                     self.save_state(error_dir)
@@ -225,29 +221,11 @@ class Trainer:
 
             if consecutive_exceptions >= 3:
                 raise RuntimeError(f"Too many consecutive exceptions ({consecutive_exceptions})")
-            
-            if len(losses) > 0:
-                loss_arr = np.array(losses)
-                mean_loss = loss_arr.mean()
-                std_loss = loss_arr.std()
-                z_score = ((loss-mean_loss)/std_loss)
-                if (z_score > 10) and (len(losses) >= 10):
-                    warning_str = f"Anomalous batch loss ({loss:0.4f}, z-score of {z_score:0.1f})."
-                    if self.cfg['log']:
-                        warning_dir = self.log_dir / "anomalies" / f"epoch{self.epoch}_batch{len(losses)}"
-                        self.save_state(warning_dir)
-
-                        with open(warning_dir / "data.pkl", "wb") as f:
-                            pickle.dump(data_tuple, f)
-                        warning_str += f"See {warning_dir.relative_to(self.log_dir)} for data and model state."
-                        logging.warning(warning_str)
-                    print(warning_str)
                     
-            if (pbar.n+1) == pbar.total:
-                pbar.set_postfix_str(f"Avg Loss:{mean_loss:0.04f}")
-                pbar.refresh()
-                
-        return mean_loss, bad_grads
+        pbar.set_postfix_str(f"Avg Loss:{np.mean(losses):0.04f}")
+        pbar.refresh()
+        
+        return np.mean(losses), bad_grads
         
     
     def save_state(self, save_dir=None):
@@ -266,24 +244,22 @@ class Trainer:
             f.write((state_str + "\n").encode())
             eqx.tree_serialise_leaves(f, self.opt_state)
    
-    def load_state(self, save_dir:str):
-        state_dir = self.log_dir / save_dir
-        cfg, model, trainer_state, opt_state, data = load_state(state_dir, cfg)
+    def load_state(self, epoch_dir:Path):
+        cfg, model, trainer_state, opt_state, data = load_state(epoch_dir, self.cfg)
         
-        self.model = mode
+        self.model = model
         self.epoch = trainer_state['epoch']
         self.loss_list = trainer_state['loss_list']
         self.opt_state = opt_state
         return data
     
-    def load_last_state(self):
-        save_dir = _last_epoch_dir(self.log_dir)
-        self.load_state(save_dir)
+    def load_last_state(self, log_dir:Path):
+        epoch_dir = _last_epoch_dir(log_dir)
+        self.load_state(epoch_dir)
 
     def freeze_components(self, component_names=None, freeze:bool=True):
         # Updates the filterspec to set which parmaters can be updated.
         # Only accepts top-level element names in the pytree model. 
-        
         if isinstance(component_names, str):
                 component_names = [component_names]
             
@@ -331,6 +307,8 @@ def load_state(state_dir, cfg=None):
         with open(data_path, 'rb') as file:
             data = pickle.load(file)
             out = (*out, data)
+    else:
+        out = (*out, None)
     return out
 
 
@@ -346,116 +324,6 @@ def _last_epoch_dir(log_dir):
 def load_last_state(log_dir):
     save_dir = _last_epoch_dir(log_dir)
     return load_state(save_dir)
-
-    
-
-    
-    
-def mse_loss(y, y_pred, mask):
-    mse = jnp.mean(jnp.square(y - y_pred), where=mask)
-    return mse
-
-def mae_loss(y, y_pred, mask):
-    mae = jnp.mean(jnp.abs(y - y_pred), where=mask)
-    return mae
-
-def huber_loss(y, y_pred, mask, delta=1.0):
-    residual = y - y_pred
-    condition = jnp.abs(residual) <= delta
-    squared_loss = 0.5 * jnp.square(residual)
-    linear_loss = delta * (jnp.abs(residual) - 0.5 * delta)
-    return jnp.mean(jnp.where(condition, squared_loss, linear_loss), where=mask)
-
-@eqx.filter_value_and_grad
-def compute_loss(diff_model, static_model, data, keys, loss_name):
-    """
-    Computes the loss between the model predictions and the targets using the specified loss function.
-
-    Args:
-        diff_model (equinox.Module): differentiable components of model.
-        static_model (equinox.Module): static components of model.
-        data (dict): Dictionary containing all input data.
-        loss_name (str): The name of the loss function to use.
-
-    Returns:
-        float: The computed loss.
-    """
-    model = eqx.combine(diff_model, static_model)
-    y_pred = jax.vmap(model)(data, keys)
-
-    y = data['y'][:,-1,:]
-    valid_mask = ~jnp.isnan(data['y'][:,-1,:])
-    masked_y = jnp.where(valid_mask, y, 0)
-    masked_y_pred = jnp.where(valid_mask, y_pred, 0)
-    if loss_name == "mse":
-        return mse_loss(masked_y, masked_y_pred, valid_mask)
-    elif loss_name == "mae":
-        return mae_loss(masked_y, masked_y_pred, valid_mask)
-    elif loss_name == "huber":
-        return huber_loss(masked_y, masked_y_pred, valid_mask)
-    else:
-        raise ValueError("Invalid loss function name.")  
-    
-def clip_gradients(grads, max_norm):
-    """
-    Clip gradients to prevent them from exceeding a maximum norm.
-
-    Args:
-        grads (jax.grad): The gradients to be clipped.
-        max_norm (float): The maximum norm for clipping.
-        
-    Returns:
-        jax.grad: The clipped gradients.
-    """
-    total_norm = jtu.tree_reduce(lambda x, y: x + y, jtu.tree_map(lambda x: jnp.sum(x ** 2), grads))
-    total_norm = jnp.sqrt(total_norm)
-    scale = jnp.minimum(max_norm / total_norm, 1.0)
-    return jax.tree_map(lambda g: scale * g, grads)
-
-
-def l2_regularization(model, weight_decay):
-    """
-    Computes the L2 regularization term for a pytree model.
-
-    Args:
-        model: A pytree model where tunable parameters are inexact arrays
-        weight_decay (float): The weight decay coefficient (lambda) for L2 regularization.
-
-    Returns:
-        float: The L2 regularization term.
-    """
-    params = eqx.filter(model, eqx.is_inexact_array)
-    sum_l2 = jtu.tree_reduce(lambda x, y: x + jnp.sum(jnp.square(y)), params, 0)
-    return 0.5 * weight_decay * sum_l2
-
-@eqx.filter_jit    
-def make_step(model, data, keys, opt_state, optim, filter_spec, loss="mse", max_grad_norm=None, l2_weight=None):
-    """
-    Performs a single optimization step, updating the model parameters.
-
-    Args:
-        model (equinox.Module): Equinox model that takes in single dict of data arrays
-        data (dict): Dictionary of batched data arrays for model input
-        opt_state: The state of the optimizer.
-        optim: The optimizer.
-        filter_spec (pytree): Pytree filter spec following structure of model. True elements will be updated.
-        max_grad_norm (float, optional): The maximum norm for clipping gradients. Defaults to None.
-        l2_reg (float, optional): The L2 regularization strength. Defaults to None.
-
-    Returns:
-        tuple: A tuple containing the loss, updated model, and updated optimizer state.
-    """
-    diff_model, static_model = eqx.partition(model, filter_spec)
-    loss, grads = compute_loss(diff_model, static_model, data, keys, loss)
-    
-    if max_grad_norm is not None:
-        grads = clip_gradients(grads, max_grad_norm)
-    if l2_weight is not None:
-        loss += l2_regularization(model, l2_weight)
-        
-    updates, opt_state = optim.update(grads, opt_state)
-    model = eqx.apply_updates(model, updates)
-    return loss, grads, model, opt_state
 
 
 

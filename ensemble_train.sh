@@ -26,9 +26,7 @@ if [ -d "$1" ]; then
 
   # If confirmed, submit each job
   for config_file in "$1"/*.yml; do
-    if [ -f "$config_file" ]; then
-      ./unity_train.sh "$config_file"
-    fi
+      ./unity_train.sh --train "$config_file"
   done
   
 else

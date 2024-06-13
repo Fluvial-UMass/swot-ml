@@ -1,14 +1,17 @@
-import sys
 import yaml
 import numpy as np
 from pathlib import Path
 
 def read_config(yml_path):
+    if not isinstance(yml_path, Path):
+        yml_path = Path(yml_path)
+
     with open(yml_path, 'r') as f:
         raw_cfg = yaml.safe_load(f)
-    raw_cfg['cfg_path'] = yml_path
+
     cfg = format_config(raw_cfg)
-    
+    cfg['cfg_path'] = yml_path
+
     cfg_str = yaml.dump(raw_cfg, default_flow_style=False)
     
     return cfg, cfg_str
@@ -49,5 +52,5 @@ def set_model_data_args(cfg, dataset):
         cfg['model_args']['static_in_size'] = len(dataset.static_features)
     else:
         raise ValueError("Invalid model name")
-        
+    
     return cfg

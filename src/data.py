@@ -1,4 +1,7 @@
 import os
+import hashlib
+import yaml
+import pickle
 from collections import defaultdict
 from pathlib import Path
 from tqdm.auto import tqdm
@@ -11,8 +14,6 @@ import jax.tree_util as jutil
 import jax.sharding as jshard
 from torch.utils.data import Dataset, DataLoader
 
-
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 class TAPDataLoader(DataLoader):
     def __init__(self, cfg, dataset):    
@@ -113,6 +114,12 @@ class TAPDataset(Dataset):
         self.irregular_features = features.get('irregular')
         self.static_features = features.get('static') 
         
+        exclude_target = cfg.get('exclude_target_from_index',[])
+        if isinstance(exclude_target, list) and len(exclude_target) > 0:
+            self.targets_to_index = [item for item in self.target if item not in exclude_target]
+        else:
+            self.targets_to_index = self.target
+        
         with open(self.cfg['basin_file'], 'r') as file:
             basin_list = file.readlines()
             basin_list = [basin.strip() for basin in basin_list]
@@ -121,7 +128,7 @@ class TAPDataset(Dataset):
         self.log_pad = 0.001
 
         self.x_s, self.attributes_scale = self._load_attributes()
-        self.x_d, self.scale = self._load_basin_data()
+        self.x_d, self.indices, self.scale = self._load_or_read_basin_data()
         self.date_ranges = self._precompute_date_ranges()
         self.update_indices(data_subset='train')
 
@@ -130,6 +137,23 @@ class TAPDataset(Dataset):
         Returns the number of valid sequences in the dataset.
         """
         return len(self.basin_index_pairs)
+    
+    def _load_or_read_basin_data(self):
+        data_hash = self.get_data_hash()
+        data_file = self.cfg.get('data_dir') / "runtime_cache" / f"{data_hash}.pkl"
+        # If data from this cfg hash exists, read it in.
+        if data_file.is_file():
+            print("Using cached basin dataset file.")
+            with open(data_file, 'rb') as file:
+                data_tuple = pickle.load(file)
+            # Else load the dataset and save it.
+        else:
+            data_tuple = self._load_basin_data()
+            # Save our new loaded data
+            with open(data_file, 'wb') as file:
+                pickle.dump((data_tuple), file)
+            
+        return data_tuple
     
     def _load_basin_data(self):
         """
@@ -142,7 +166,7 @@ class TAPDataset(Dataset):
         min_train_date = (np.datetime64(self.cfg['time_slice'].start) +
                           np.timedelta64(self.cfg['sequence_length'], 'D'))  
 
-        self.indices = defaultdict(dict)
+        indices = defaultdict(dict)
         ds_list = []
         for basin in tqdm(self.basins, disable=self.cfg['quiet'], desc="Loading Basins"):
             file_path = f"{self.cfg['data_dir']}/time_series/{basin}.nc"
@@ -155,9 +179,11 @@ class TAPDataset(Dataset):
             # Replace negative values with NaN in specific columns without explicit loop
             for col in self.cfg['log_norm_cols']:
                 ds[col] = ds[col].where(ds[col] >= 0, np.nan)
+                
             # Repetitive if target is in log_norm_cols, but not a problem. 
             if self.cfg['clip_target_to_zero']:
-                ds[self.target] = ds[self.target].where(ds[self.target] >= 0, np.nan)
+                for col in self.target:
+                    ds[col] = ds[col].where(ds[col] >= 0, np.nan)
 
             # Testing if this nans are causing an issue
             for col in self.daily_features:
@@ -172,7 +198,7 @@ class TAPDataset(Dataset):
             is_train = ds['date'] < self.cfg['split_time']
             valid_sequence = ds['date'] >= min_train_date
             valid_irregular = (~np.isnan(ds[self.irregular_features])).to_array().all(dim='variable')
-            valid_target = (~np.isnan(ds[self.target])).to_array().any(dim='variable')
+            valid_target = (~np.isnan(ds[self.targets_to_index])).to_array().any(dim='variable')
 
             # Create valid data indices for this basin
             masks = [('pre-train', is_train & valid_sequence & valid_irregular & valid_target),
@@ -180,7 +206,7 @@ class TAPDataset(Dataset):
                      ('test', ~is_train & valid_sequence & valid_target),
                      ('predict', ~is_train & valid_sequence)]
             for key, mask in masks:
-                self.indices[key][basin] = ds['date'][mask].values
+                indices[key][basin] = ds['date'][mask].values
     
             ds = ds.assign_coords({'basin': basin})
             ds_list.append(ds)
@@ -189,7 +215,7 @@ class TAPDataset(Dataset):
         ds = ds.drop_duplicates('basin')
         x_d, scale = self._normalize_data(ds)
         
-        return x_d, scale
+        return x_d, indices, scale
 
     def _load_attributes(self):
         """
@@ -304,16 +330,21 @@ class TAPDataset(Dataset):
         Returns:
             np.ndarray or jnp.ndarray: Denormalized target data.
         """
-        # Retrieve the normalization parameters for the target variable
-        offset = self.scale[self.target]['offset']
-        scale = self.scale[self.target]['scale']
-        log_norm = self.scale[self.target]['log_norm']
+        y = np.empty_like(y_normalized)
+        
+        for i in range(len(self.target)):
+            # Retrieve the normalization parameters for the target variable
+            target = self.target[i]
+            offset = self.scale[target]['offset']
+            scale = self.scale[target]['scale']
+            log_norm = self.scale[target]['log_norm']
 
-        # Reverse the normalization process
-        if log_norm:
-            return np.exp(y_normalized + offset) - self.log_pad
-        else:
-            return y_normalized * scale + offset
+            # Reverse the normalization process
+            if log_norm:
+                y[:,i] = np.exp(y_normalized[:,i] + offset) - self.log_pad
+            else:
+                y[:,i] = y_normalized[:,i] * scale + offset
+        return y
       
     def update_indices(self, *,
                        data_subset:str,
@@ -345,6 +376,19 @@ class TAPDataset(Dataset):
                 # Assign to new dataset with a new variable name
                 new_ds[f"{var_name}_smooth{window_size}"] = smoothed_var
         return new_ds
+    
+    def get_data_hash(self):
+        data_keys = ['data_dir', 'basin_file','features', 'exclude_target_from_index',
+                    'time_slice', 'split_time', 'add_rolling_means', 'log_norm_cols',
+                    'range_norm_cols', 'clip_target_to_zero', 'sequence_length']
+        data_config = {k: self.cfg.get(k) for k in data_keys}
+
+        """Generate a SHA256 hash for the contents of the dict."""
+        hasher = hashlib.sha256()
+        # Convert the dictionary to a sorted, consistent string representation
+        dict_str = yaml.dump(data_config, sort_keys=True)
+        hasher.update(dict_str.encode('utf-8'))
+        return hasher.hexdigest()
 
 def _get_available_devices():
     """

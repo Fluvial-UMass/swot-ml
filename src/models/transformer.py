@@ -154,11 +154,11 @@ class TransformerLayer(eqx.Module):
                  hidden_size: int, 
                  intermediate_size: int, 
                  num_heads: int, 
-                 dropout_p: float,
+                 dropout: float,
                  key: jax.random.PRNGKey):
         keys = jax.random.split(key)
-        self.attention_block = AttentionBlock(hidden_size, num_heads, dropout_p, keys[0])
-        self.ff_block = FeedForwardBlock(hidden_size, intermediate_size, dropout_p, keys[1])
+        self.attention_block = AttentionBlock(hidden_size, num_heads, dropout, keys[0])
+        self.ff_block = FeedForwardBlock(hidden_size, intermediate_size, dropout, keys[1])
 
     def __call__(self, 
                  inputs: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]],
@@ -182,14 +182,14 @@ class SelfAttnEncoder(eqx.Module):
                  intermediate_size: int, 
                  num_layers: int, 
                  num_heads: int, 
-                 dropout_p: float,
+                 dropout: float,
                  key: jax.random.PRNGKey):
         keys = jax.random.split(key, num=3)
         
-        self.embedder = DynamicEmbedder(seq_length, dynamic_size, hidden_size, dropout_p, keys[0])
+        self.embedder = DynamicEmbedder(seq_length, dynamic_size, hidden_size, dropout, keys[0])
         
         layer_keys = jax.random.split(keys[1], num=num_layers)
-        layer_args = (hidden_size, intermediate_size, num_heads, dropout_p)
+        layer_args = (hidden_size, intermediate_size, num_heads, dropout)
         self.layers = [TransformerLayer(*layer_args, k) for k in layer_keys]
 
     def __call__(self, 
@@ -220,12 +220,12 @@ class CrossAttnDecoder(eqx.Module):
                  intermediate_size: int, 
                  num_layers: int, 
                  num_heads: int, 
-                 dropout_p: float,
+                 dropout: float,
                  key: jax.random.PRNGKey):
         keys = jax.random.split(key)
 
         layer_keys = jax.random.split(keys[0], num=num_layers)
-        layer_args = (hidden_size, intermediate_size, num_heads, dropout_p)
+        layer_args = (hidden_size, intermediate_size, num_heads, dropout)
         self.layers = [TransformerLayer(*layer_args, k) for k in layer_keys]
         
         self.pooler = eqx.nn.Linear(in_features=hidden_size, out_features=hidden_size, key=keys[1])
@@ -276,13 +276,13 @@ class EATransformer(eqx.Module):
                  num_layers: int, 
                  num_heads: int, 
                  out_size: int,
-                 dropout_p: float, 
+                 dropout: float, 
                  seed: int):
         key = jax.random.PRNGKey(seed)
         keys = jax.random.split(key, num=5)
-        self.static_embedder = StaticEmbedder(seq_length, static_in_size, num_heads, dropout_p, keys[0])
+        self.static_embedder = StaticEmbedder(seq_length, static_in_size, num_heads, dropout, keys[0])
         
-        static_args = (hidden_size, intermediate_size, num_layers, num_heads, dropout_p) 
+        static_args = (hidden_size, intermediate_size, num_layers, num_heads, dropout) 
         self.d_encoder = SelfAttnEncoder(seq_length, daily_in_size, *static_args, keys[1])
         self.i_encoder = SelfAttnEncoder(seq_length, irregular_in_size, *static_args, keys[2])
         self.decoder = CrossAttnDecoder(*static_args, keys[3])
