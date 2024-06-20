@@ -251,6 +251,7 @@ class CrossAttnDecoder(eqx.Module):
         x = (q, k, v)
         for layer, layer_key in zip(self.layers, layer_keys):
             x = layer(x, logit_bias, mask, layer_key)
+            mask = None
 
         final_token = x[-1, :]
         # final_token = jnp.mean(x, axis=0)

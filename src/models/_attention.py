@@ -61,7 +61,7 @@ class LogitBiasedMHA(eqx.nn.MultiheadAttention):
         if (logit_bias.shape != (query_seq_length, self.num_heads*kv_seq_length)):
             raise ValueError(
                 f"Logit bias must have shape (query_seq_length, num_heads * kv_seq_length)",
-                f"({query.shape[0]},{key.shape[0]}). Got {mask.shape}."
+                f"({query.shape[0]},{key_.shape[0]}). Got {mask.shape}."
             )
             
         query_heads = self._project(self.query_proj, query)
