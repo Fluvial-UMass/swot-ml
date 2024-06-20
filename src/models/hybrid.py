@@ -92,7 +92,6 @@ class Hybrid(eqx.Module):
     static_embedder: StaticEmbedder
     decoder: CrossAttnDecoder
     head: eqx.nn.Linear
-    
 
     def __init__(self, *, daily_in_size, irregular_in_size, static_in_size, out_size, seq_length, hidden_size, num_layers, num_heads, seed, dropout):
         key = jax.random.PRNGKey(seed)

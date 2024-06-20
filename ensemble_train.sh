@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# Check if the first argument is --gpu
+gpu_flag=""
+if [ "$1" == "--gpu" ]; then
+  gpu_flag="--gpu"
+  shift # Shift the arguments so that $1 becomes the directory path
+fi
+
+
 # Check if the argument is a directory
 if [ -d "$1" ]; then
   # Initialize a count for valid files
@@ -26,7 +34,7 @@ if [ -d "$1" ]; then
 
   # If confirmed, submit each job
   for config_file in "$1"/*.yml; do
-      ./unity_train.sh --train "$config_file"
+      ./unity_train.sh $gpu_flag --train "$config_file"
   done
   
 else

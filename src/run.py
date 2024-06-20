@@ -8,6 +8,7 @@ mp.freeze_support()
 
 import argparse
 from pathlib import Path
+import pickle
 
 from config import read_config, set_model_data_args
 from data import TAPDataset, TAPDataLoader
@@ -24,7 +25,7 @@ def start_training(yml_file):
     trainer = Trainer(cfg, dataloader, log_parent=yml_file.parent)
     trainer.start_training()
 
-    return cfg, trainer
+    return cfg, trainer.model, trainer.log_dir, dataset
 
 def continue_training(run_dir):
     state = load_last_state(run_dir)
@@ -36,23 +37,37 @@ def continue_training(run_dir):
     trainer = Trainer(cfg, dataloader, continue_from=run_dir)
     trainer.start_training()
 
-    return cfg, trainer
+    return cfg, trainer.model, dataset
 
-def test_model(cfg, trainer):
+
+def load_model(run_dir):
+    state = load_last_state(run_dir)
+    cfg = state[0]
+    model = state[1]
+    dataset = TAPDataset(cfg) 
+
+    return cfg, model, dataset
+
+
+def test_model(cfg, model, dataset, log_dir):
     cfg['data_subset'] = 'test'
-    dataloader = TAPDataLoader(cfg, trainer.dataloader.dataset)
+    dataloader = TAPDataLoader(cfg, dataset)
 
-    results = predict(trainer.model, dataloader, seed=0, denormalize=True)
+    results = predict(model, dataloader, seed=0, denormalize=True)
     bulk_metrics = get_all_metrics(results)
     basin_metrics = get_basin_metrics(results)
+    
+    with open(log_dir / "test_data.pkl", 'wb') as f:
+        pickle.dump((results, bulk_metrics, basin_metrics), f)
 
-    return results, (bulk_metrics, basin_metrics)
+    return results, bulk_metrics, basin_metrics
 
-def make_plots(cfg, results, metrics, trainer):
-    bulk_metrics, basin_metrics = metrics
+def make_plots(cfg, results, bulk_metrics, basin_metrics, log_dir):
+    fig_dir = log_dir / "figures"
+    fig_dir.mkdir(exist_ok=True)
 
-    fig = mosaic_scatter(cfg, results, bulk_metrics, str(trainer.log_dir))
-    fig.savefig(trainer.log_dir / f"epoch{trainer.epoch:03d}_density_scatter.png",  dpi=300)
+    fig = mosaic_scatter(cfg, results, bulk_metrics, str(log_dir))
+    fig.savefig(fig_dir / f"density_scatter.png",  dpi=300)
 
     metric_args = {
     'nBias':{'range':[-1,1]},
@@ -63,18 +78,21 @@ def make_plots(cfg, results, metrics, trainer):
     'num_obs':{'log':True}}
     figs = basin_metric_histograms(basin_metrics, metric_args)
     for target, fig in figs.items():
-        fig.savefig(trainer.log_dir / f"epoch{trainer.epoch:03d}_{target}_metrics_hist_.png",  dpi=300)
+        fig.savefig(fig_dir / f"{target}_metrics_hist_.png",  dpi=300)
 
 def main(args):
     if args.train:
         yml_file = Path(args.train).resolve()
-        cfg, trainer = start_training(yml_file)
+        cfg, model, run_dir, dataset = start_training(yml_file)
     elif args.continue_training:
         run_dir = Path(args.continue_training).resolve()
-        cfg, trainer = continue_training(run_dir)
+        cfg, model, dataset = continue_training(run_dir)
+    elif args.test:
+        run_dir = Path(args.test).resolve()
+        cfg, model, dataset = load_model(run_dir)
 
-    results, metrics = test_model(cfg, trainer)
-    make_plots(cfg, results, metrics, trainer)
+    results, bulk_metrics, basin_metrics = test_model(cfg, model, dataset, run_dir)
+    make_plots(cfg, results, bulk_metrics, basin_metrics, run_dir)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run training or continue training based on the command line arguments.")
@@ -88,5 +106,8 @@ if __name__ == '__main__':
                        dest='continue_training', 
                        type=str, 
                        help='Directory path to continue training.')
+    group.add_argument('--test',  
+                       type=str, 
+                       help='Path to directory with model to test.')
     args = parser.parse_args()
     main(args)

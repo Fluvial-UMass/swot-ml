@@ -107,4 +107,4 @@ quiet: true
 log: true
 
 # How frequently (in epochs) to save training progress
-log_interal: 5
+log_interval: 5
