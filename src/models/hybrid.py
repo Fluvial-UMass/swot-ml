@@ -8,13 +8,8 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import numpy as np
 
-from importlib import reload
-import models.lstm, models.transformer
-reload(models.lstm)
-reload(models.transformer)
-
-from .lstm import BaseLSTM, EALSTMCell, TEALSTMCell
-from .transformer import StaticEmbedder, CrossAttnDecoder
+from models.lstm import BaseLSTM, EALSTMCell, TEALSTMCell
+from models.transformer import StaticEmbedder, CrossAttnDecoder
 
 class EALSTM(BaseLSTM):
     """
@@ -92,7 +87,6 @@ class Hybrid(eqx.Module):
     static_embedder: StaticEmbedder
     decoder: CrossAttnDecoder
     head: eqx.nn.Linear
-    
 
     def __init__(self, *, daily_in_size, irregular_in_size, static_in_size, out_size, seq_length, hidden_size, num_layers, num_heads, seed, dropout):
         key = jax.random.PRNGKey(seed)

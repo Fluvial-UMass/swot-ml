@@ -1,10 +1,8 @@
 import equinox as eqx
-import optax
 import jax
 import jax.lax as lax
 import jax.numpy as jnp
 import jax.random as jrandom
-import numpy as np
 
 
 class BaseLSTM(eqx.Module):
@@ -51,14 +49,14 @@ class LSTM(BaseLSTM):
     """
     Standard LSTM model built on the BaseLSTM class.
     """
-    def __init__(self, in_size, out_size, hidden_size, *, key, **kwargs):
-        super().__init__(in_size, out_size, hidden_size, key=key, **kwargs)
+    def __init__(self, in_size, hidden_size, out_size, *, key, **kwargs):
+        super().__init__(in_size, hidden_size, out_size, key=key, **kwargs)
 
-    def __call__(self, data, key):
+    def __call__(self, x_d, key):
         def scan_fn(state, xd):
             return self.cell(xd, state), None
         init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
-        (out, _), _ = jax.lax.scan(scan_fn, init_state, data['x_dd'])
+        (out, _), _ = jax.lax.scan(scan_fn, init_state, x_d)
 
         if self.dense is not None:
             out = self.dense(out)
@@ -118,14 +116,16 @@ class EALSTMCell(eqx.Module):
         return (h_1, c_1)
 
 class EALSTM(BaseLSTM):
+    return_all: bool
     """
     Entity-Aware LSTM (TEALSTM) model for processing time series data with dynamic and static features.
     """
-    def __init__(self, dynamic_in_size, static_in_size, hidden_size, dense_size, dropout, *, key):
+    def __init__(self, dynamic_in_size, static_in_size, hidden_size, dense_size, dropout, *, return_all=False, key):
         super().__init__(dynamic_in_size, hidden_size, dense_size, dropout, key=key)
         self.cell = EALSTMCell(dynamic_in_size, static_in_size, hidden_size, key=key)
+        self.return_all = return_all
 
-    def __call__(self, data):
+    def __call__(self, x_d, x_s, key):
         """
         Forward pass of the TEALSTM module.
 
@@ -138,14 +138,18 @@ class EALSTM(BaseLSTM):
             Output of the TEALSTM module and final skip count.
         """
         # Input gate is based on static watershed features
-        i = jax.nn.sigmoid(self.cell.input_linear(data['x_s']))
+        i = jax.nn.sigmoid(self.cell.input_linear(x_s))
         
-        def scan_fn(state, x_d, key):
-            new_state = self.cell(state, x_d, i)
-            return new_state, None
+        def scan_fn(state, x):
+            new_state = self.cell(state, x, i)
+            # Return new_state for the next step, and only the hidden state for accumulation
+            return new_state, new_state[0]
 
         init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
-        (out, _), _ = jax.lax.scan(scan_fn, init_state, data['x_dd'])
+        (final_state, _), all_states = jax.lax.scan(scan_fn, init_state, x_d)
+
+        out = all_states if self.return_all else final_state
+        out = self.dropout(out, key=key)
 
         if self.dense is not None:
             out = self.dense(out)
@@ -255,7 +259,7 @@ class TEALSTM(BaseLSTM):
         super().__init__(dynamic_in_size, hidden_size, dense_size, dropout, key=key)
         self.cell = TEALSTMCell(dynamic_in_size, static_in_size, hidden_size, key=key)
 
-    def __call__(self, data, key):
+    def __call__(self, x_d, x_s, key):
         """
         Forward pass of the TEALSTM module.
 
@@ -268,15 +272,17 @@ class TEALSTM(BaseLSTM):
             Output of the TEALSTM module and final skip count.
         """
         # Input gate is based on static watershed features
-        i = jax.nn.sigmoid(self.cell.input_linear(data['x_s']))
+        i = jax.nn.sigmoid(self.cell.input_linear(x_s))
         
-        def scan_fn(state, x_d):
+        def scan_fn(state, x):
             skip_count = state[2]
-            new_state, skip_count = self.cell(state[:2], x_d, i, skip_count)
+            new_state, skip_count = self.cell(state[:2], x, i, skip_count)
             return (*new_state, skip_count), None
 
         init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size), int(0))
-        (out, _, skip_count), _ = jax.lax.scan(scan_fn, init_state, data['x_di'])
+        (out, _, skip_count), _ = jax.lax.scan(scan_fn, init_state, x_d)
+
+        out = self.dropout(out, key=key)
 
         if self.dense is not None:
             out = self.dense(out)
@@ -320,8 +326,8 @@ class TAPLSTM(eqx.Module):
         self.dropout = eqx.nn.Dropout(dropout)
 
     def __call__(self, data, key):
-        d_out = self.ealstm_d(data)
-        i_out, skip_count = self.tealstm_i(data)
+        d_out = self.ealstm_d(data['x_dd'],data['x_s'])
+        i_out, skip_count = self.tealstm_i(data['x_di'],data['x_s'])
         dt = skip_count + 1 # skip = 0 is still a dt of 1
 
         # # Compute the attention decay parameter based on static features
