@@ -49,8 +49,8 @@ class LSTM(BaseLSTM):
     """
     Standard LSTM model built on the BaseLSTM class.
     """
-    def __init__(self, in_size, out_size, hidden_size, *, key, **kwargs):
-        super().__init__(in_size, out_size, hidden_size, key=key, **kwargs)
+    def __init__(self, in_size, hidden_size, out_size, *, key, **kwargs):
+        super().__init__(in_size, hidden_size, out_size, key=key, **kwargs)
 
     def __call__(self, x_d, key):
         def scan_fn(state, xd):
@@ -116,12 +116,14 @@ class EALSTMCell(eqx.Module):
         return (h_1, c_1)
 
 class EALSTM(BaseLSTM):
+    return_all: bool
     """
     Entity-Aware LSTM (TEALSTM) model for processing time series data with dynamic and static features.
     """
-    def __init__(self, dynamic_in_size, static_in_size, hidden_size, dense_size, dropout, *, key):
+    def __init__(self, dynamic_in_size, static_in_size, hidden_size, dense_size, dropout, *, return_all=False, key):
         super().__init__(dynamic_in_size, hidden_size, dense_size, dropout, key=key)
         self.cell = EALSTMCell(dynamic_in_size, static_in_size, hidden_size, key=key)
+        self.return_all = return_all
 
     def __call__(self, x_d, x_s, key):
         """
@@ -140,12 +142,14 @@ class EALSTM(BaseLSTM):
         
         def scan_fn(state, x):
             new_state = self.cell(state, x, i)
-            return new_state, None
+            # Return new_state for the next step, and only the hidden state for accumulation
+            return new_state, new_state[0]
 
         init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size))
-        (out, _), _ = jax.lax.scan(scan_fn, init_state, x_d)
+        (final_state, _), all_states = jax.lax.scan(scan_fn, init_state, x_d)
 
-        out = self.dropout(out, key)
+        out = all_states if self.return_all else final_state
+        out = self.dropout(out, key=key)
 
         if self.dense is not None:
             out = self.dense(out)

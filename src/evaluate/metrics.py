@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import sklearn.metrics as skm
 
 log_pad = 0.001
 
@@ -37,8 +38,11 @@ def get_all_metrics(df, disp=False):
         y_hat = df[('pred', feature)]
         metrics[feature] = {
             'num_obs': np.sum(~np.isnan(y)),
+            'R2': mask_nan(skm.r2_score)(y,y_hat),
+            'MAPE': mask_nan(skm.mean_absolute_percentage_error)(y, y_hat),
             'nBias': calc_nbias(y, y_hat),
             'RE': calc_rel_err(y, y_hat),
+            'RMSE': calc_rmse(y, y_hat),
             'rRMSE': calc_rrmse(y, y_hat),
             'KGE': calc_kge(y, y_hat),
             'NSE': calc_nse(y, y_hat),

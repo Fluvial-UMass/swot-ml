@@ -22,7 +22,7 @@ def mosaic_scatter(cfg, results, metrics, title_str):
         ax.plot([min_val, max_val], [min_val, max_val], 'r--')
         
         textstr = '\n'.join([f"{key}: {metrics[target][key]:0.2f}" 
-                             for key in ['nBias', 'RE', 'rRMSE', 'Agreement']])
+                             for key in ['R2', 'MAPE', 'rRMSE', 'Agreement']])
         props = dict(boxstyle='round', facecolor='white', alpha=0.5)
         ax.text(0, -0.4, textstr, transform=ax.transAxes, fontsize=10,
                 verticalalignment='top', bbox=props)

@@ -34,7 +34,7 @@ if [ -d "$1" ]; then
 
   # If confirmed, submit each job
   for config_file in "$1"/*.yml; do
-      ./unity_train.sh $gpu_flag --train "$config_file"
+      ./run.sh $gpu_flag --train "$config_file"
   done
   
 else

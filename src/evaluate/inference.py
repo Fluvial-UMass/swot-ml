@@ -8,7 +8,7 @@ from tqdm.auto import tqdm
 def _model_map(model, batch, keys):
     return jax.vmap(model)(batch, keys)
 
-def predict(model, dataloader, *, seed=0, denormalize=True, return_dt=False):
+def predict(model, dataloader, *, seed=0, quiet=False, denormalize=True, return_dt=False):
     key = jax.random.PRNGKey(seed)
     
     # Set model to inference mode (no dropout)
@@ -19,7 +19,7 @@ def predict(model, dataloader, *, seed=0, denormalize=True, return_dt=False):
     y = []
     y_hat = []
     dt = []
-    for basin, date, batch in tqdm(dataloader):
+    for basin, date, batch in tqdm(dataloader, disable=quiet):
         keys = jax.random.split(key, len(basin)+1)
         key = keys[0]
         batch_keys = keys[1:] 

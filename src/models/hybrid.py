@@ -8,13 +8,8 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import numpy as np
 
-from importlib import reload
-import models.lstm, models.transformer
-reload(models.lstm)
-reload(models.transformer)
-
-from .lstm import BaseLSTM, EALSTMCell, TEALSTMCell
-from .transformer import StaticEmbedder, CrossAttnDecoder
+from models.lstm import BaseLSTM, EALSTMCell, TEALSTMCell
+from models.transformer import StaticEmbedder, CrossAttnDecoder
 
 class EALSTM(BaseLSTM):
     """

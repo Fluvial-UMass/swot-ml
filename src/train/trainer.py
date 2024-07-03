@@ -61,7 +61,8 @@ class Trainer:
         self.lr_schedule = optax.exponential_decay(
             cfg['initial_lr'],
             cfg['num_epochs'],
-            cfg['decay_rate'])
+            cfg['decay_rate'],
+            cfg.get('transition_begin',0))
 
         self.train_key = jax.random.PRNGKey(cfg['model_args']['seed']+1)
 
@@ -80,9 +81,7 @@ class Trainer:
             
     def setup_logging(self, log_parent:Path, continue_from:Path):
         current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if log_parent and continue_from:
-            raise ValueError("Do not pass both log_dir and log_parent to Trainer init.")
-        elif log_parent:
+        if log_parent:
             self.log_dir = log_parent / f"{self.cfg.get('cfg_path').stem}_{current_date}"
         elif continue_from:
             self.log_dir = continue_from
@@ -93,14 +92,14 @@ class Trainer:
         print(f"Logging at {self.log_dir}")
         
         cfg_file = self.log_dir / "config.pkl"
-        with open(cfg_file, 'wb') as file:
+        with open(cfg_file, 'ab') as file:
             pickle.dump(self.cfg, file)
 
         log_file = self.log_dir / "training.log"
         logging.basicConfig(filename=log_file, filemode='w', level=logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 
-    def start_training(self):
+    def start_training(self, stop_at=np.inf):
         """
         Starts or continues training the model.
 
@@ -111,7 +110,7 @@ class Trainer:
             The trained model after completing the training or upon an interruption.
         """
         try:
-            while self.epoch < self.num_epochs:
+            while (self.epoch < self.num_epochs) and (self.epoch < stop_at):
                 self.epoch += 1
                 loss, bad_grads = self._train_epoch()
 
@@ -171,53 +170,53 @@ class Trainer:
             keys = jax.random.split(self.train_key, self.cfg['batch_size']+1)
             self.train_key = keys[0]
             batch_keys = keys[1:] 
-            try: 
-                loss, grads, self.model, self.opt_state = make_step(
-                    self.model, 
-                    batch,
-                    batch_keys,
-                    self.opt_state, 
-                    self.optim, 
-                    self.filter_spec, 
-                    **self.cfg['step_kwargs']
-                )
+            # try: 
+            loss, grads, self.model, self.opt_state = make_step(
+                self.model, 
+                batch,
+                batch_keys,
+                self.opt_state, 
+                self.optim, 
+                self.filter_spec, 
+                **self.cfg['step_kwargs']
+            )
 
-                if jnp.isnan(loss):
-                    raise RuntimeError(f"NaN loss encountered")
+            if jnp.isnan(loss):
+                raise RuntimeError(f"NaN loss encountered")
 
-                pbar.set_postfix_str(f"Loss:{loss:0.04f}")
-                losses.append(loss)
-                consecutive_exceptions = 0
-                
-                # Monitor gradients
-                grad_norms = jtu.tree_map(jnp.linalg.norm, grads)
-                grad_norms = jtu.tree_leaves_with_path(grad_norms)
-                # Check each gradient norm
-                for keypath, norm in grad_norms:
-                    tree_key = jtu.keystr(keypath)
-                    type_key = 'vanishing' if norm < 1e-6 else 'exploding' if norm > 1e3 else None
-                    if type_key is not None:
-                        if tree_key not in bad_grads[type_key]:
-                            bad_grads[type_key][tree_key] = 1
-                        else:
-                            bad_grads[type_key][tree_key] += 1
+            pbar.set_postfix_str(f"Loss:{loss:0.04f}")
+            losses.append(loss)
+            consecutive_exceptions = 0
+            
+            # Monitor gradients
+            grad_norms = jtu.tree_map(jnp.linalg.norm, grads)
+            grad_norms = jtu.tree_leaves_with_path(grad_norms)
+            # Check each gradient norm
+            for keypath, norm in grad_norms:
+                tree_key = jtu.keystr(keypath)
+                type_key = 'vanishing' if norm < 1e-6 else 'exploding' if norm > 1e3 else None
+                if type_key is not None:
+                    if tree_key not in bad_grads[type_key]:
+                        bad_grads[type_key][tree_key] = 1
+                    else:
+                        bad_grads[type_key][tree_key] += 1
 
-            except Exception as e:
-                consecutive_exceptions += 1
-                if self.cfg['log']:
-                    error_dir = self.log_dir / "exceptions" / f"epoch{self.epoch}_batch{batch_count}"
-                    self.save_state(error_dir)
+            # except Exception as e:
+            #     consecutive_exceptions += 1
+            #     if self.cfg['log']:
+            #         error_dir = self.log_dir / "exceptions" / f"epoch{self.epoch}_batch{batch_count}"
+            #         self.save_state(error_dir)
 
-                    with open(error_dir / "data.pkl", "wb") as f:
-                        pickle.dump(data_tuple, f)
-                    with open(error_dir / "exception.txt", "w") as f:
-                        f.write(f"{str(e)}\n{traceback.format_exc()}")
-                    error_str = f"{type(e).__name__} exception caught. See {error_dir} for data, model state, and trace."
-                    logging.error(error_str)
+            #         with open(error_dir / "data.pkl", "wb") as f:
+            #             pickle.dump(data_tuple, f)
+            #         with open(error_dir / "exception.txt", "w") as f:
+            #             f.write(f"{str(e)}\n{traceback.format_exc()}")
+            #         error_str = f"{type(e).__name__} exception caught. See {error_dir} for data, model state, and trace."
+            #         logging.error(error_str)
                     
-                else:
-                    error_str = f"{str(e)}\n{traceback.format_exc()}"
-                print(error_str)
+            #     else:
+            #         error_str = f"{str(e)}\n{traceback.format_exc()}"
+            #     print(error_str)
 
             if consecutive_exceptions >= 3:
                 raise RuntimeError(f"Too many consecutive exceptions ({consecutive_exceptions})")
@@ -287,7 +286,8 @@ def load_state(state_dir, cfg=None):
     lr_schedule = optax.exponential_decay(
         cfg['initial_lr'],
         cfg['num_epochs'],
-        cfg['decay_rate'])
+        cfg['decay_rate'],
+        cfg.get('transition_begin',0))
     
     with open(state_dir / "model.eqx", "rb") as f:
         model_args = json.loads(f.readline().decode())
