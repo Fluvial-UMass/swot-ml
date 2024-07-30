@@ -251,17 +251,19 @@ class TEALSTMCell(eqx.Module):
 
 
 class TEALSTM(BaseLSTM):
+    return_all: bool
     """
     Time- and Entity-Aware LSTM (TEALSTM) model for processing time series data with
     dynamic and static features.
     """
-    def __init__(self, dynamic_in_size, static_in_size, hidden_size,  dense_size, dropout, *, key):
+    def __init__(self, dynamic_in_size, static_in_size, hidden_size,  dense_size, dropout, return_all=False, *, key):
         super().__init__(dynamic_in_size, hidden_size, dense_size, dropout, key=key)
         self.cell = TEALSTMCell(dynamic_in_size, static_in_size, hidden_size, key=key)
+        self.return_all = return_all
 
     def __call__(self, x_d, x_s, key):
         """
-        Forward pass of the TEALSTM module.
+        Forward pass of the TEALSTM.
 
         Args:
             data (dict): Contains at least these two keys:
@@ -269,7 +271,7 @@ class TEALSTM(BaseLSTM):
                 x_s (jax.Array): Static input features.
 
         Returns:
-            Output of the TEALSTM module and final skip count.
+            Output of the TEALSTM and final skip count.
         """
         # Input gate is based on static watershed features
         i = jax.nn.sigmoid(self.cell.input_linear(x_s))
@@ -277,11 +279,12 @@ class TEALSTM(BaseLSTM):
         def scan_fn(state, x):
             skip_count = state[2]
             new_state, skip_count = self.cell(state[:2], x, i, skip_count)
-            return (*new_state, skip_count), None
+            return (*new_state, skip_count), new_state[0]
 
         init_state = (jnp.zeros(self.hidden_size), jnp.zeros(self.hidden_size), int(0))
-        (out, _, skip_count), _ = jax.lax.scan(scan_fn, init_state, x_d)
+        (final_state, _, skip_count), all_states = jax.lax.scan(scan_fn, init_state, x_d)
 
+        out = all_states if self.return_all else final_state
         out = self.dropout(out, key=key)
 
         if self.dense is not None:

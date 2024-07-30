@@ -39,7 +39,7 @@ class Trainer:
         opt_state: Optimizer state.
         filter_spec: Specification for freezing components.
     """
-    def __init__(self, cfg, dataloader, *, log_parent:Path=None, continue_from:Path=None):
+    def __init__(self, cfg, dataloader, *, log_parent=None, log_dir=None, continue_from=None):
         """        
         Initializes optimizers, logging, and sets up the training environment.
 
@@ -53,7 +53,7 @@ class Trainer:
         self.dataloader = dataloader
         
         if cfg['log']: 
-            self.setup_logging(log_parent, continue_from)
+            self.setup_logging(log_parent, log_dir, continue_from)
 
         self.num_epochs = cfg['num_epochs']
         self.log_interval = cfg.get('log_interval', 5)
@@ -66,7 +66,7 @@ class Trainer:
 
         self.train_key = jax.random.PRNGKey(cfg['model_args']['seed']+1)
 
-        if continue_from:
+        if continue_from is not None:
             self.load_last_state(continue_from)
         else:
             self.model = models.make(cfg)
@@ -79,10 +79,12 @@ class Trainer:
         # Set filterspec to train all components.
         self.freeze_components(None, False)
             
-    def setup_logging(self, log_parent:Path, continue_from:Path):
+    def setup_logging(self, log_parent=None, log_dir=None, continue_from=None):
         current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if log_parent:
+        if log_parent is not None:
             self.log_dir = log_parent / f"{self.cfg.get('cfg_path').stem}_{current_date}"
+        elif log_dir is not None:
+            self.log_dir = log_dir
         elif continue_from:
             self.log_dir = continue_from
         else:     
@@ -96,7 +98,7 @@ class Trainer:
             pickle.dump(self.cfg, file)
 
         log_file = self.log_dir / "training.log"
-        logging.basicConfig(filename=log_file, filemode='w', level=logging.INFO,
+        logging.basicConfig(filename=log_file, filemode='a', level=logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 
     def start_training(self, stop_at=np.inf):
@@ -136,10 +138,11 @@ class Trainer:
                     self.save_state()
                     
                 self.loss_list.append(float(loss))
-        except KeyboardInterrupt:
-            pass
+        except:
+            self.epoch -= 1
+            return
 
-        print("Training finished or interrupted. Model state saved.")
+        print("Training finished. Model state saved.")
         if self.cfg['log']:
             if self.epoch % self.log_interval != 0:
                 self.save_state()
@@ -170,53 +173,55 @@ class Trainer:
             keys = jax.random.split(self.train_key, self.cfg['batch_size']+1)
             self.train_key = keys[0]
             batch_keys = keys[1:] 
-            # try: 
-            loss, grads, self.model, self.opt_state = make_step(
-                self.model, 
-                batch,
-                batch_keys,
-                self.opt_state, 
-                self.optim, 
-                self.filter_spec, 
-                **self.cfg['step_kwargs']
-            )
+            try: 
+                loss, grads, self.model, self.opt_state = make_step(
+                    self.model, 
+                    batch,
+                    batch_keys,
+                    self.opt_state, 
+                    self.optim, 
+                    self.filter_spec, 
+                    self.dataloader.dataset.denormalize_target,
+                    **self.cfg['step_kwargs']
+                )
 
-            if jnp.isnan(loss):
-                raise RuntimeError(f"NaN loss encountered")
+                if jnp.isnan(loss):
+                    raise RuntimeError(f"NaN loss encountered")
 
-            pbar.set_postfix_str(f"Loss:{loss:0.04f}")
-            losses.append(loss)
-            consecutive_exceptions = 0
-            
-            # Monitor gradients
-            grad_norms = jtu.tree_map(jnp.linalg.norm, grads)
-            grad_norms = jtu.tree_leaves_with_path(grad_norms)
-            # Check each gradient norm
-            for keypath, norm in grad_norms:
-                tree_key = jtu.keystr(keypath)
-                type_key = 'vanishing' if norm < 1e-6 else 'exploding' if norm > 1e3 else None
-                if type_key is not None:
-                    if tree_key not in bad_grads[type_key]:
-                        bad_grads[type_key][tree_key] = 1
-                    else:
-                        bad_grads[type_key][tree_key] += 1
+                pbar.set_postfix_str(f"Loss:{loss:0.04f}")
+                losses.append(loss)
+                consecutive_exceptions = 0
+                
+                # Monitor gradients
+                grad_norms = jtu.tree_map(jnp.linalg.norm, grads)
+                grad_norms = jtu.tree_leaves_with_path(grad_norms)
+                # Check each gradient norm
+                for keypath, norm in grad_norms:
+                    tree_key = jtu.keystr(keypath)
+                    type_key = 'vanishing' if norm < 1e-6 else 'exploding' if norm > 1e3 else None
+                    if type_key is not None:
+                        if tree_key not in bad_grads[type_key]:
+                            bad_grads[type_key][tree_key] = 1
+                        else:
+                            bad_grads[type_key][tree_key] += 1
 
-            # except Exception as e:
-            #     consecutive_exceptions += 1
-            #     if self.cfg['log']:
-            #         error_dir = self.log_dir / "exceptions" / f"epoch{self.epoch}_batch{batch_count}"
-            #         self.save_state(error_dir)
+            except Exception as e:
+                consecutive_exceptions += 1
 
-            #         with open(error_dir / "data.pkl", "wb") as f:
-            #             pickle.dump(data_tuple, f)
-            #         with open(error_dir / "exception.txt", "w") as f:
-            #             f.write(f"{str(e)}\n{traceback.format_exc()}")
-            #         error_str = f"{type(e).__name__} exception caught. See {error_dir} for data, model state, and trace."
-            #         logging.error(error_str)
+                if self.cfg['log']:
+                    error_dir = self.log_dir / "exceptions" / f"epoch{self.epoch}_batch{batch_count}"
+                    self.save_state(error_dir)
+
+                    with open(error_dir / "data.pkl", "wb") as f:
+                        pickle.dump(data_tuple, f)
+                    with open(error_dir / "exception.txt", "w") as f:
+                        f.write(f"{str(e)}\n{traceback.format_exc()}")
+                    error_str = f"{type(e).__name__} exception caught. See {error_dir} for data, model state, and trace."
+                    logging.error(error_str)
                     
-            #     else:
-            #         error_str = f"{str(e)}\n{traceback.format_exc()}"
-            #     print(error_str)
+                else:
+                    error_str = f"{str(e)}\n{traceback.format_exc()}"
+                print(error_str)
 
             if consecutive_exceptions >= 3:
                 raise RuntimeError(f"Too many consecutive exceptions ({consecutive_exceptions})")
@@ -274,9 +279,8 @@ class Trainer:
             # return True (differentiable) for any remaining components.
             else:
                 return True
-        self.filter_spec = jtu.tree_map_with_path(diff_filter, self.model)
-       
-    
+        self.filter_spec = jtu.tree_map_with_path(diff_filter, self.model) 
+
 def load_state(state_dir, cfg=None):
     print(f"Loading model state from {state_dir}")
     if cfg is None:

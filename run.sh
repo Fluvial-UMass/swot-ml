@@ -2,7 +2,6 @@
 # Wrapper script to submit SLURM job with dynamic output path based on named argument
 
 # Initialize variables
-finetune_config=""
 partition_name="cpu"  # Default to CPU
 flag=""
 config_path=""
@@ -51,30 +50,37 @@ elif [[ "$flag" == "--continue" || "$flag" == "--test" ]]; then
 fi
 
 # Set the partition and runtime args based on partition_name
-n_workers=2
+n_workers=1
 SBATCH_DIRECTIVES=""
+ENVIRONMENT_LINES=""
 case $partition_name in
     cpu)
-        SBATCH_DIRECTIVES+="#SBATCH -c $((n_workers+2)) # Number of Cores per Task \n"
+        SBATCH_DIRECTIVES+="#SBATCH -c $((n_workers+1))\n"
         SBATCH_DIRECTIVES+="#SBATCH -t 1-00:00:00\n"
         SBATCH_DIRECTIVES+="#SBATCH -p cpu\n"
+        ENVIRONMENT_LINES+="export JAX_PLATFORMS=cpu\n"
         ;;
     ceewater)
-        SBATCH_DIRECTIVES+="#SBATCH -c $((n_workers+2)) # Number of Cores per Task \n"
+        SBATCH_DIRECTIVES+="#SBATCH -c $((n_workers+1))\n"
         SBATCH_DIRECTIVES+="#SBATCH -t 14-00:00:00\n"
-        SBATCH_DIRECTIVES+="#SBATCH -p ceewater\n"
+        SBATCH_DIRECTIVES+="#SBATCH -p ceewater_kandread-cpu\n"
+        ENVIRONMENT_LINES+="export JAX_PLATFORMS=cpu\n"
         ;;
     gpu)
-        SBATCH_DIRECTIVES+="#SBATCH -c $n_workers # Number of Cores per Task \n"
+        SBATCH_DIRECTIVES+="#SBATCH -c $n_workers\n"
         SBATCH_DIRECTIVES+="#SBATCH -t 1-00:00:00\n"
         SBATCH_DIRECTIVES+="#SBATCH -p gpu\n"
         SBATCH_DIRECTIVES+="#SBATCH --gpus=2080ti:1\n"
+        ENVIRONMENT_LINES+="module load cuda/12.4.0\n"
+        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_MEM_FRACTION=0.7\n"
         ;;
     gpu-long)
-        SBATCH_DIRECTIVES+="#SBATCH -c $n_workers # Number of Cores per Task \n"
+        SBATCH_DIRECTIVES+="#SBATCH -c $n_workers\n"
         SBATCH_DIRECTIVES+="#SBATCH -t 14-00:00:00\n"
         SBATCH_DIRECTIVES+="#SBATCH -p gpu-long\n"
         SBATCH_DIRECTIVES+="#SBATCH --gpus=2080ti:1\n"
+        ENVIRONMENT_LINES+="module load cuda/12.4.0\n"
+        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_MEM_FRACTION=0.7\n"
         ;;
     *)
         echo "Unknown partition type: $partition_name"
@@ -96,16 +102,16 @@ sbatch_script=$(mktemp)
 cat << EOF > "$sbatch_script"
 #!/bin/bash
 #SBATCH --job-name="${config_parent}_${config_basename}"
-#SBATCH --mem=64G  # Requested Memory
+#SBATCH --mem=32G  # Requested Memory
 #SBATCH -o ${output_dir}/${config_basename}.out
 $(echo -e "$SBATCH_DIRECTIVES")
 
-module load cuda/12.4.0
 module load miniconda/22.11.1-1
 conda activate tss-ml
+
+$(echo -e "$ENVIRONMENT_LINES")
     
-# Run Python script with provided path
-python /work/pi_kandread_umass_edu/tss-ml/src/run.py $flag $config_path ${finetune_config:+--finetune "$finetune_config"}
+python /work/pi_kandread_umass_edu/tss-ml/src/run.py $flag $config_path
 EOF
 
 # Submit the job

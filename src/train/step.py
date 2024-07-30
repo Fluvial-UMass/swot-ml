@@ -20,8 +20,19 @@ def huber_loss(y, y_pred, mask, *, huber_delta=1.0):
     linear_loss = huber_delta * (jnp.abs(residual) - 0.5 * huber_delta)
     return jnp.mean(jnp.where(condition, squared_loss, linear_loss), where=mask)
 
+def flux_agreement(y_pred, target_list):
+    if any([t not in target_list for t in ['ssc','flux','usgs_q']]):
+        raise ValueError("Must predict at least ssc, flux, and usgs_q when using flux agreement regularization.")
+    
+    ssc = y_pred[:,target_list.index('ssc')] / 1E6 # mg/l -> kg/l
+    flux = y_pred[:,target_list.index('flux')] / 1.102 / 1E3 # short ton/day -> kg/d
+    q = y_pred[:,target_list.index('usgs_q')] * 24*3600*1000 # m^3/s -> l/d
+
+    rel_error = ((ssc * q) - flux) / ((ssc * q + flux)/2)
+    return  jnp.mean(jnp.square(rel_error))
+
 @eqx.filter_value_and_grad
-def compute_loss(diff_model, static_model, data, keys, loss_name, weights=None):
+def compute_loss(diff_model, static_model, data, keys, denormalize_fn, loss_name, target_weights, agreement_weight):
     """
     Computes the loss between the model predictions and the targets using the specified loss function.
 
@@ -57,20 +68,24 @@ def compute_loss(diff_model, static_model, data, keys, loss_name, weights=None):
     # Exclude any nan target losses from average.
     valid_target_loss = ~jnp.isnan(target_losses)
     target_losses = jnp.where(valid_target_loss, target_losses, 0)
-    weights = valid_target_loss * jnp.array(weights)
+    target_weights = valid_target_loss * jnp.array(target_weights)
     
-    loss = jnp.average(target_losses, weights=weights)
+    loss = jnp.average(target_losses, weights=target_weights)
 
     # Debugging
     def print_func(operand):
-        target_losses, weights = operand
-        jax.debug.print("losses: {a}\nweights: {b}", a=target_losses, b=weights)
+        y, y_pred = operand
+        jax.debug.print("y: {a}\ny_pred: {b}", a=y, b=y_pred)
         return None
     jax.lax.cond(jnp.isnan(loss),
                  print_func,
                  lambda *args: None,
-                 operand=(target_losses, weights))
+                 operand=(y, y_pred))
     # Debugging 
+
+    if agreement_weight>0:
+        y_pred_denorm = denormalize_fn(y_pred)
+        loss += agreement_weight*flux_agreement(y_pred_denorm, model.target)
 
     return loss
     
@@ -92,7 +107,7 @@ def clip_gradients(grads, max_norm):
 
 
 @eqx.filter_jit    
-def make_step(model, data, keys, opt_state, optim, filter_spec, **kwargs):
+def make_step(model, data, keys, opt_state, optim, filter_spec, denormalize_fn, **kwargs):
     """
     Performs a single optimization step, updating the model parameters.
 
@@ -111,8 +126,11 @@ def make_step(model, data, keys, opt_state, optim, filter_spec, **kwargs):
         tuple: A tuple containing the loss, gradients, updated model, and updated optimizer state.
     """
     diff_model, static_model = eqx.partition(model, filter_spec)
-    loss, grads = compute_loss(diff_model, static_model, data, keys, 
-                               kwargs.get('loss'), kwargs.get('target_weights'))
+    loss, grads = compute_loss(diff_model, static_model, data, keys,
+                               denormalize_fn, 
+                               kwargs.get('loss'), 
+                               kwargs.get('target_weights',1),
+                               kwargs.get('agreement_weight',0))
     
     if kwargs.get('max_grad_norm'):
         grads = clip_gradients(grads, kwargs.get('max_grad_norm'))
