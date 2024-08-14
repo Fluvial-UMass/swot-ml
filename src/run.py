@@ -106,8 +106,8 @@ def make_plots(cfg, results, bulk_metrics, basin_metrics, data_subset, log_dir):
         'R2': {'range':[-1,1]},
         'nBias':{'range':[-1,1]},
         'rRMSE':{'range':[0,500]},
-        'KGE':{'range':[-2,1]},
-        'NSE':{'range':[-5,1]},
+        'KGE':{'range':[-1,1]},
+        'NSE':{'range':[-4,1]},
         'Agreement':{'range':[0,1]}
     }
     figs = basin_metric_histograms(basin_metrics, metric_args)
@@ -188,6 +188,7 @@ if __name__ == '__main__':
         main(args)
     except Exception as e:
         print(f"An error occurred: {e}")
+        sys.stdout.flush()
     finally:
         # Cleanup all processes (helps with pytorch dataloader workers)
         os.killpg(os.getpgid(0), signal.SIGKILL)
