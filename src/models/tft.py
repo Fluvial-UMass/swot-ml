@@ -136,8 +136,8 @@ class VariableSelectionNetwork(eqx.Module):
 
 
 class TemporalFusionTransformer(eqx.Module):
-    dynamic_variables: dict
-    missing_data_tokens: jnp.ndarray
+    dynamic_variables: list
+    missing_data_tokens: dict
     static_context_vsn: VariableSelectionNetwork
     dynamic_vsn_context_encoder: GatedResidualNetwork
     dynamic_vsn: VariableSelectionNetwork
@@ -151,12 +151,13 @@ class TemporalFusionTransformer(eqx.Module):
     feed_forward: GatedResidualNetwork
     decoder_skip: GatedSkipLayer
     dense: eqx.nn.Linear
+    target: list
 
     def __init__(self,
+                 target: list,
                  dynamic_sizes: dict, 
                  static_size: int,
                  hidden_size: int,
-                 out_size: int,  
                  num_heads: int, 
                  dropout: float, 
                  *, 
@@ -182,9 +183,13 @@ class TemporalFusionTransformer(eqx.Module):
         self.feed_forward = GatedResidualNetwork(hidden_size, dropout=dropout, key=keys.pop()) #Shared across time
         self.decoder_skip = GatedSkipLayer(hidden_size, key=keys.pop())
         
-        self.dense = eqx.nn.Linear(hidden_size, out_size, key=keys.pop())
+        self.dense = eqx.nn.Linear(hidden_size, len(target), key=keys.pop())
+        self.target = target
 
-    def __call__(self, data: Dict[str, jnp.ndarray], key) -> jnp.ndarray:
+    def __call__(self, 
+                 data: Dict[str, jnp.ndarray], 
+                 key, 
+                 inspect=False) -> jnp.ndarray:
         keys = list(jrandom.split(key, 12))
 
         # Replace missing data with the learned missing data token
@@ -221,22 +226,128 @@ class TemporalFusionTransformer(eqx.Module):
         decoder_skip = jax.vmap(self.decoder_skip)(lstm_skip, decoder_out)
 
         out = self.dense(decoder_skip[-1,:])
-        return out
+        if inspect:
+            return (
+                static_vars, dynamic_vsn_context, dynamic_vars, lstm_context, 
+                lstm_output, lstm_skip, enrichment_context, enriched, 
+                self_attn, attn_skip, decoder_out, decoder_skip, out)
+        else:
+            return out
 
 class TFT(eqx.Module):
     tft: TemporalFusionTransformer
-
-    def __init__(self, *, dynamic_sizes, static_size, hidden_size, out_size, num_heads, dropout, seed):
+    target: list
+    
+    def __init__(self, *, target, dynamic_sizes, static_size, hidden_size, num_heads, dropout, seed):
         key = jax.random.PRNGKey(seed)
         self.tft = TemporalFusionTransformer(
+            target = target,
             dynamic_sizes=dynamic_sizes,
             static_size=static_size,
             hidden_size=hidden_size,
-            out_size=out_size,
             num_heads=num_heads,
             dropout=dropout,
             key=key
         )
+        self.target = target
 
-    def __call__(self, data, key):
-        return self.tft(data, key)
+
+    def __call__(self, data, key, inspect=False):
+        return self.tft(data, key, inspect)
+    
+
+
+
+
+
+class StaticContextEncoder(eqx.Module):
+    static_vsn: VariableSelectionNetwork
+    dynamic_vsn_encoder: GatedResidualNetwork
+    lstm_encoder: GatedResidualNetwork
+    enrichment_encoder: GatedResidualNetwork
+
+    def __init__(self, static_size, hidden_size, dropout, key):
+        keys = jrandom.split(key, 4)
+        self.static_vsn = VariableSelectionNetwork({'static': static_size}, hidden_size, dropout=dropout, key=keys[0])
+        self.dynamic_vsn_encoder = GatedResidualNetwork(hidden_size, dropout=dropout, key=keys[1])
+        self.lstm_encoder = GatedResidualNetwork(hidden_size, dropout=dropout, key=keys[2])
+        self.enrichment_encoder = GatedResidualNetwork(hidden_size, dropout=dropout, key=keys[3])
+
+    def __call__(self, static_data):
+        keys = jrandom.split(key, 4)
+        static_data = {'static': data['x_s'][jnp.newaxis,:]}
+        static_vars = self.static_vsn(static_data, key=keys[0]) #(1, hidden_size)
+        dynamic_vsn_context = self.dynamic_vsn_encoder(static_vars[0,:], None, keys[1])
+        lstm_context = self.lstm_encoder(static_vars[0,:], None, keys[2])
+        enrichment_context = self.enrichment_encoder(static_vars[0,:], None, keys[3])
+        
+
+    
+class TemporalFusionEncoder(eqx.Module):
+    dynamic_vsn: VariableSelectionNetwork
+    lstm_encoder: EALSTM
+    lstm_skip: GatedSkipLayer
+
+    def __init__(self, dynamic_sizes, hidden_size, dropout, key):
+        keys = jrandom.split(key, 3)
+        self.dynamic_vsn = VariableSelectionNetwork(dynamic_sizes, hidden_size, hidden_size, dropout=dropout, key=keys[0])
+        self.lstm_encoder = EALSTM(hidden_size, hidden_size, hidden_size, None, dropout, return_all=True, key=keys[1])
+        self.lstm_skip = GatedSkipLayer(hidden_size, key=keys[2]) #Shared across time
+
+class TemporalFusionDecoder(eqx.Module):
+    enrichment_grn: GatedResidualNetwork
+    mhattention: eqx.nn.MultiheadAttention
+    attention_skip: GatedSkipLayer
+    feed_forward: GatedResidualNetwork
+    decoder_skip: GatedSkipLayer
+
+    def __init__(self, hidden_size, num_heads, dropout, key):
+        keys = jrandom.split(key, 5)
+        self.enrichment_grn = GatedResidualNetwork(hidden_size, hidden_size, dropout=dropout, key=keys[0]) #Shared across time
+        self.mhattention = eqx.nn.MultiheadAttention(num_heads, hidden_size, dropout_p=dropout, key=keys[1])
+        self.attention_skip = GatedSkipLayer(hidden_size, key=keys[2])
+        self.feed_forward = GatedResidualNetwork(hidden_size, dropout=dropout, key=key[3]) #Shared across time
+        self.decoder_skip = GatedSkipLayer(hidden_size, key=keys[4])
+
+class TemporalFusionTransformer_take2(eqx.Module):
+    """
+    https://arxiv.org/pdf/1912.09363
+    """
+    missing_data_tokens: dict
+    static_encoder: StaticContextEncoder
+    encoder: TemporalFusionEncoder
+    decoder: TemporalFusionDecoder
+    dense: eqx.nn.Linear
+    target: list
+
+    def __init__(self,
+                 target: list,
+                 dynamic_sizes: dict, 
+                 static_size: int,
+                 hidden_size: int,
+                 num_heads: int, 
+                 dropout: float, 
+                 *, 
+                 key):
+        keys = jrandom.split(key, 4)
+        self.missing_data_tokens = {k: jnp.zeros(v) for k, v in dynamic_sizes.items()} # Learnable per-feature tokens.
+        self.static_encoder = StaticContextEncoder(static_size, hidden_size, dropout, keys[0])
+        self.encoder = TemporalFusionEncoder(dynamic_sizes,hidden_size,dropout, keys[1])
+        self.decoder = TemporalFusionDecoder(hidden_size, num_heads, dropout, keys[2])
+        self.dense = eqx.nn.Linear(hidden_size, len(target), key=keys[3])
+        self.target = target
+
+    def __call__(self, 
+                 data: Dict[str, jnp.ndarray], 
+                 key) -> jnp.ndarray:
+        keys = list(jrandom.split(key, 12))
+
+        # Replace missing data with the learned missing data token
+        dynamic_data = {} #{key0:(seq_len, dynamic_sizes[key0]) ... keyn:(seq_len, dynamic_sizes[keyn])}
+        for k in self.dynamic_variables:
+            d = data[k]
+            mask = jnp.isnan(d)
+            d = jnp.where(mask, self.missing_data_tokens[k], d)
+            dynamic_data[k] = d
+
+        

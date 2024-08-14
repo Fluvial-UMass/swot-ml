@@ -27,6 +27,7 @@ class TAPDataLoader(DataLoader):
                          num_workers=num_workers,
                          pin_memory=cfg.get('pin_memory', True),
                          drop_last=cfg.get('drop_last', False),
+                         timeout=cfg.get('timeout',900),
                          persistent_workers=persistent_workers)     
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 
@@ -83,9 +84,10 @@ class TAPDataset(Dataset):
     """
     DataLoader class for loading and preprocessing hydrological time series data.
     """
-    def __init__(self, cfg):
+    def __init__(self, cfg, *, inference_mode=False, dynamic_scale=None, static_scale=None):
         self.cfg = cfg
         self.log_pad = 0.001
+        self.inference_mode = inference_mode
 
         # Validate the feature dict
         features = cfg['features']
@@ -97,12 +99,12 @@ class TAPDataset(Dataset):
         self.target = features['target']
         self.daily_features = features['daily']
         # These are not strictly required and can pass None.
-        self.irregular_features = features.get('irregular')
+        self.irregular_features = features.get('irregular',[])
         self.static_features = features.get('static') 
 
         self._read_basin_files()
-        self.x_s, self.attributes_scale = self._load_attributes()
-        self.x_d, self.scale = self._load_or_read_basin_data()
+        self.x_s, self.attributes_scale = self._load_attributes(static_scale)
+        self.x_d, self.scale = self._load_or_read_basin_data(dynamic_scale)
         self.date_ranges = self._precompute_date_ranges()
 
         self.update_indices(data_subset=cfg.get('data_subset','train'),
@@ -143,7 +145,7 @@ class TAPDataset(Dataset):
         self.all_basins.sort()
 
 
-    def _load_or_read_basin_data(self):
+    def _load_or_read_basin_data(self, scale):
         data_hash = self.get_data_hash()
         print(f"Data Hash: {data_hash}")
 
@@ -153,16 +155,16 @@ class TAPDataset(Dataset):
             print("Using cached basin dataset file.")
             with open(data_file, 'rb') as file:
                 data_tuple = pickle.load(file)
-            # Else load the dataset and save it.
+        # Else load the dataset from basin files and save it.
         else:
-            data_tuple = self._load_basin_data()
+            data_tuple = self._load_basin_data(scale)
             # Save our new loaded data
             with open(data_file, 'wb') as file:
                 pickle.dump((data_tuple), file)
             
         return data_tuple
     
-    def _load_basin_data(self):
+    def _load_basin_data(self, scale=None):
         """
         Loads the basin data from NetCDF files and applies the time slice.
 
@@ -175,15 +177,18 @@ class TAPDataset(Dataset):
             ds = xr.open_dataset(file_path).sel(date=self.cfg['time_slice'])
             ds['date'] = ds['date'].astype('datetime64[ns]')
     
-            # Filter to keep only the necessary features and the target variable
-            ds = ds[[*self.daily_features, *self.irregular_features, *self.target]]
+            # Filter to keep only the necessary features and the target variable if not in inference mode
+            features_to_keep = [*self.daily_features, *self.irregular_features]
+            if not self.inference_mode:
+                features_to_keep.extend(self.target)
+            ds = ds[features_to_keep]
 
             # Replace negative values with NaN in specific columns without explicit loop
             for col in self.cfg['log_norm_cols']:
                 ds[col] = ds[col].where(ds[col] >= 0, np.nan)
                 
             # Repetitive if target is in log_norm_cols, but not a problem. 
-            if self.cfg['clip_target_to_zero']:
+            if self.cfg['clip_target_to_zero'] and not self.inference_mode:
                 for col in self.target:
                     ds[col] = ds[col].where(ds[col] >= 0, np.nan)
 
@@ -201,11 +206,11 @@ class TAPDataset(Dataset):
 
         ds = xr.concat(ds_list, dim="basin")
         ds = ds.drop_duplicates('basin')
-        x_d, scale = self._normalize_data(ds)
+        x_d, scale = self._normalize_data(ds, scale)
         
         return x_d, scale
 
-    def _load_attributes(self):
+    def _load_attributes(self, scale=None):
         """
         Loads the basin attributes from a CSV file.
 
@@ -219,21 +224,23 @@ class TAPDataset(Dataset):
         if self.static_features is not None:
             attributes_df = attributes_df[self.static_features]
 
-        # Remove columns with zero variance
-        zero_var_cols = list(attributes_df.columns[attributes_df.std(ddof=0) == 0])
-        if zero_var_cols:
-            print(f"Dropping static attributes with 0 variance: {zero_var_cols}")
-            attributes_df.drop(columns=zero_var_cols, inplace=True)
+        if scale is None:
+            # Remove columns with zero variance
+            zero_var_cols = list(attributes_df.columns[attributes_df.std(ddof=0) == 0])
+            if zero_var_cols:
+                print(f"Dropping static attributes with 0 variance: {zero_var_cols}")
+                attributes_df.drop(columns=zero_var_cols, inplace=True)
+            self.static_features = list(attributes_df.columns)
 
-        self.static_features = list(attributes_df.columns)
-
-        mu = attributes_df.mean()
-        std = attributes_df.std(ddof=0)
+            # Create dict of the scaling factors
+            mu = attributes_df.mean()
+            std = attributes_df.std(ddof=0)
+            scale = {var: {'offset': mu[var], 'scale': std[var]} for var in attributes_df.columns}
+        else:
+            mu = [row['offset'] for _, row in scale.items()]
+            std = [row['scale'] for _, row in scale.items()]
         scaled_attributes = (attributes_df-mu)/std
 
-        # Create dict of the scaling factors
-        scale = {var: {'offset': mu[var], 'scale': std[var]} for var in attributes_df.columns}
-                
         x_s = {}
         for basin in self.all_basins:
             if basin not in attributes_df.index:
@@ -246,7 +253,7 @@ class TAPDataset(Dataset):
         unique_dates = self.x_d['date'].values
         date_ranges = {date: pd.date_range(end=date, periods=self.cfg['sequence_length'], freq='D').values for date in unique_dates}
         return date_ranges
-
+    
     
     def __getitems__(self, ids):
         """Generate one batch of data."""
@@ -261,18 +268,22 @@ class TAPDataset(Dataset):
 
         ds = self.x_d.sel(basin=basins_da, date=sequenced_dates_da)
         x_dd = np.moveaxis(ds[self.daily_features].to_array().values,0,2)
-        x_di = np.moveaxis(ds[self.irregular_features].to_array().values,0,2)
         x_s = np.array([self.x_s[b] for b in basins])
-        y = np.moveaxis(ds[self.target].to_array().values,0,2)
 
-        batch = { 'x_dd': jnp.array(x_dd), 
-                 'x_di': jnp.array(x_di), 
-                 'x_s': jnp.array(x_s), 
-                 'y': jnp.array(y)}
+        batch = {'x_dd': jnp.array(x_dd), 
+                 'x_s': jnp.array(x_s)}
         
+        if not self.inference_mode:
+            y = np.moveaxis(ds[self.target].to_array().values,0,2)
+            batch['y'] = jnp.array(y)
+        
+        if self.irregular_features:
+            x_di = np.moveaxis(ds[self.irregular_features].to_array().values,0,2)
+            batch['x_di'] = jnp.array(x_di)
+            
         return basins, dates, batch
 
-    def _normalize_data(self, ds):
+    def _normalize_data(self, ds, scale=None):
         """
         Normalize the input data using log normalization for specified variables and standard normalization for others.
         
@@ -280,30 +291,38 @@ class TAPDataset(Dataset):
             ds: the input xarray dataset after normalization
             scale: A dictionary containing the 'offset', 'scale', and 'log_norm' for each variable.
         """
-        # Initialize
-        scale = {k: {'offset': 0, 'scale': 1, 'log_norm': False} for k in ds.data_vars}
-    
-        # Subset the dataset to the training time period
-        training_ds = ds.sel(date=slice(None, self.cfg['split_time']))
-    
-        # Iterate over each variable in the dataset
+
+        if scale is None:
+            # Initialize
+            scale = {k: {'offset': 0, 'scale': 1, 'log_norm': False} for k in ds.data_vars}
+        
+            # Subset the dataset to the training time period
+            training_ds = ds.sel(date=slice(None, self.cfg['split_time']))
+        
+            # Iterate over each variable in the dataset
+            for var in ds.data_vars:
+                if var in self.cfg.get('log_norm_cols',[]):
+                    # Perform log normalization
+                    scale[var]['log_norm'] = True
+                    x = ds[var] + self.log_pad
+                    training_x = x.sel(date=slice(None, self.cfg['split_time']))
+                    scale[var]['offset'] = np.nanmean(np.log(training_x))    
+                    # Apply normalization and offset
+                    
+                elif var in self.cfg.get('range_norm_cols',[]):
+                    # Perform min-max scaling
+                    scale[var]['scale'] = training_ds[var].max().values.item()
+                    ds[var] = ds[var] / scale[var]['scale']
+                else:
+                    # Perform standard normalization
+                    scale[var]['offset'] = training_ds[var].mean().values.item()
+                    scale[var]['scale'] = training_ds[var].std().values.item()
+                    ds[var] = (ds[var] - scale[var]['offset']) / scale[var]['scale']
+
         for var in ds.data_vars:
-            if var in self.cfg.get('log_norm_cols',[]):
-                # Perform log normalization
-                scale[var]['log_norm'] = True
-                x = ds[var] + self.log_pad
-                training_x = x.sel(date=slice(None, self.cfg['split_time']))
-                scale[var]['offset'] = np.nanmean(np.log(training_x))    
-                # Apply normalization and offset
-                ds[var] = np.log(x) - scale[var]['offset']
-            elif var in self.cfg.get('range_norm_cols',[]):
-                # Perform min-max scaling
-                scale[var]['scale'] = training_ds[var].max().values.item()
-                ds[var] = ds[var] / scale[var]['scale']
+            if scale[var]['log_norm']:
+                ds[var] = np.log(ds[var] + self.log_pad) - scale[var]['offset']
             else:
-                # Perform standard normalization
-                scale[var]['offset'] = training_ds[var].mean().values.item()
-                scale[var]['scale'] = training_ds[var].std().values.item()
                 ds[var] = (ds[var] - scale[var]['offset']) / scale[var]['scale']
                 
         return ds, scale
@@ -318,8 +337,8 @@ class TAPDataset(Dataset):
         Returns:
             np.ndarray or jnp.ndarray: Denormalized target data.
         """
-        y = np.empty_like(y_normalized)
-        
+        y = jnp.empty_like(y_normalized)
+    
         for i in range(len(self.target)):
             # Retrieve the normalization parameters for the target variable
             target = self.target[i]
@@ -327,16 +346,53 @@ class TAPDataset(Dataset):
             scale = self.scale[target]['scale']
             log_norm = self.scale[target]['log_norm']
 
-            # Reverse the normalization process
+            # Reverse the normalization process using .at and .set
             if log_norm:
-                y[:,i] = np.exp(y_normalized[:,i] + offset) - self.log_pad
+                y = y.at[:, i].set(jnp.exp(y_normalized[:, i] + offset) - self.log_pad)
             else:
-                y[:,i] = y_normalized[:,i] * scale + offset
+                y = y.at[:, i].set(y_normalized[:, i] * scale + offset)
         return y
+    
+    def date_batching(self, data_subset='predict_all', date_range=None):
+        self.data_subset = data_subset
+
+        if self.data_subset not in ['predict','predict_all']:
+            raise ValueError(f"Invalid data_subset: {self.data_subset}")
+
+        # Minimum date for sequenced training data
+        min_train_date = (np.datetime64(self.cfg['time_slice'].start) +
+                        np.timedelta64(self.cfg['sequence_length'], 'D'))  
+        valid_sequence = self.x_d['date'] >= min_train_date
+
+        all_dates = self.x_d['date'].values
+        if date_range:
+            start_date = np.datetime64(date_range[0])
+            end_date = np.datetime64(date_range[1])
+            in_date_range = (start_date <= all_dates) & (all_dates < end_date)
+            valid_dates = all_dates[in_date_range & valid_sequence]
+        elif data_subset == 'predict':
+            is_train = self.x_d['date'] < self.cfg['split_time']
+            valid_dates = all_dates[~is_train & valid_sequence]
+        else:
+            valid_dates = all_dates[valid_sequence]
+        
+        if self.data_subset == 'predict':
+            basins = self.test_basins
+        else:
+            basins = self.all_basins
+            
+        self.basin_index_pairs = []
+        for date in valid_dates:
+            self.basin_index_pairs.extend([(basin, date) for basin in basins])
+
+        n_basins = len(basins)
+        dataloader_kwargs = {'shuffle': False, 'batch_size': n_basins}
+
+        return dataloader_kwargs
     
     def update_data_masks(self):
         # Validate the data_subset choice
-        subset_choices = ['pre_train','train','test','predict']
+        subset_choices = ['pre_train','train','test','predict','predict_all']
         if self.data_subset not in subset_choices:
              raise ValueError(f"data_subset ({self.data_subset}) must be in ({subset_choices}) ")
         
@@ -351,6 +407,8 @@ class TAPDataset(Dataset):
             basins = self.train_basins
         elif self.data_subset in ['test','predict']:
             basins = self.test_basins
+        elif self.data_subset == 'predict_all':
+            basins = self.all_basins
 
         for basin in tqdm(basins, disable=self.cfg['quiet'], desc="Updating Indices"):
             ds = self.x_d.sel(basin=basin)
@@ -358,23 +416,32 @@ class TAPDataset(Dataset):
             # Component masks for creating data indices
             is_train = ds['date'] < self.cfg['split_time']
             valid_sequence = ds['date'] >= min_train_date
-            valid_irregular = (~np.isnan(ds[self.irregular_features])).to_array().all(dim='variable')
-            valid_target = (~np.isnan(ds[self.targets_to_index])).to_array().any(dim='variable')
+
+            def valid_target():
+                return (~np.isnan(ds[self.targets_to_index])).to_array().any(dim='variable')
+
+            def valid_irregular():
+                if self.irregular_features:
+                    valid_irregular = (~np.isnan(ds[self.irregular_features])).to_array().all(dim='variable')
+                else:
+                    valid_irregular = True
+                return valid_irregular
 
             # Create valid data indices for this basin
             if self.data_subset == 'pre_train':
-                mask = is_train & valid_sequence & valid_irregular & valid_target
+                mask = is_train & valid_sequence & valid_irregular() & valid_target()
             elif self.data_subset == 'train':
-                mask = is_train & valid_sequence & valid_target
+                mask = is_train & valid_sequence & valid_target()
             elif self.data_subset == 'test':
-                mask =  ~is_train & valid_sequence & valid_target
+                mask =  ~is_train & valid_sequence & valid_target()
             elif self.data_subset == 'predict':
                 mask =  ~is_train & valid_sequence
+            elif self.data_subset == 'predict_all':
+                mask = valid_sequence
             indices[basin] = ds['date'][mask].values
 
         return indices
 
-      
     def update_indices(self, data_subset:str, exclude_target:list=None, basin_subset:list = None):
         self.data_subset = data_subset
           
@@ -411,8 +478,8 @@ class TAPDataset(Dataset):
     
     def get_data_hash(self):
         cfg_keys = ['data_dir', 'features', 'exclude_target_from_index', 
-                    'time_slice', 'split_time', 'add_rolling_means', 
-                    'log_norm_cols',  'range_norm_cols', 'clip_target_to_zero']
+                    'time_slice', 'split_time', 'add_rolling_means', 'log_norm_cols',  
+                    'range_norm_cols', 'clip_target_to_zero']
         data_config = {k: self.cfg.get(k) for k in cfg_keys}
         data_config['basins'] = self.all_basins
 

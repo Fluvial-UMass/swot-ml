@@ -42,6 +42,7 @@ def get_all_metrics(df, disp=False):
             'MAPE': mask_nan(skm.mean_absolute_percentage_error)(y, y_hat),
             'nBias': calc_nbias(y, y_hat),
             'RE': calc_rel_err(y, y_hat),
+            'MAE': calc_mae(y, y_hat),
             'RMSE': calc_rmse(y, y_hat),
             'rRMSE': calc_rrmse(y, y_hat),
             'KGE': calc_kge(y, y_hat),
@@ -75,6 +76,10 @@ def mask_nan(func):
 def calc_nbias(y, y_hat):
     mean_y = np.mean(y) + log_pad
     return np.nanmean((y - y_hat) / mean_y)
+
+@mask_nan
+def calc_mae(y, y_hat):
+    return np.mean(np.abs(y - y_hat))
 
 @mask_nan
 def calc_rel_err(y, y_hat):

@@ -10,6 +10,7 @@ from models.transformer import EATransformer
 from models.hybrid import Hybrid
 from models.fusion import FusionTransformer
 from models.tft import TFT
+from models.tft_mha import TFT_MHA
 
 def make(cfg: dict):
     name = cfg['model'].lower()
@@ -24,6 +25,8 @@ def make(cfg: dict):
         model_fn = FusionTransformer
     elif name == 'tft':
         model_fn = TFT
+    elif name == 'tft_mha':
+        model_fn = TFT_MHA
     else:
         raise ValueError(f"{cfg['model']} is not a valid model name. Check /src/models/__init__.py for model config.")
 

@@ -1,6 +1,8 @@
 import yaml
 import numpy as np
+import itertools
 from pathlib import Path
+
 
 def read_yml(yml_path):
     if not isinstance(yml_path, Path):
@@ -33,31 +35,78 @@ def format_config(cfg):
     return cfg
 
 
+def get_grid_update_tuples(cfg):
+    param_dict = cfg['param_search_dict']
+    key_list = []
+    value_list = []
+    for k1, v1 in param_dict.items():
+        if isinstance(v1, dict):
+            for k2, v2 in v1.items():
+                key_list.append((k1, k2))
+                value_list.append(v2)
+        elif isinstance(v1, list):
+            key_list.append(k1)
+            value_list.append(v1)
+        else:
+            raise ValueError('param_search_dict must be a dict that contains only lists and dicts of lists') 
+
+    # Shuffle the hyperparam grid and select one based on idx.
+    # This allows for both random search or grid search based on range of ids passed.  
+    param_grid_list = list(itertools.product(*value_list))
+    rng = np.random.default_rng(42) #Do not change!
+    rng.shuffle(param_grid_list)
+
+    return key_list, param_grid_list
+
+def update_cfg_from_grid(cfg:dict, idx:int):
+    key_list, param_grid_list = get_grid_update_tuples(cfg)
+    updates = param_grid_list[idx]
+    
+    # Insert the updates into the config
+    for k, v in zip(key_list, updates):
+        if isinstance(k, tuple):
+            if len(k) != 2:
+                raise RuntimeError("tuple keys in 'param_search_dict' must have length 2")
+            cfg[k[0]][k[1]] = v
+        else:
+            cfg[k] = v
+
+    return cfg
+
+
 def set_model_data_args(cfg, dataset):
-    cfg['model_args']['out_size'] = len(dataset.target)
+    target = dataset.target
+    target = target if isinstance(target, list) else list(target)
+    cfg['model_args']['target'] = target
     
     model_name = cfg['model'].lower()
-    if model_name in ["eatransformer", "hybrid", "fusion"]:
+    if model_name in ["eatransformer", "fusion"]:
         cfg['model_args']['daily_in_size'] = len(dataset.daily_features)
         cfg['model_args']['irregular_in_size'] = len(dataset.irregular_features)
         cfg['model_args']['static_in_size'] = len(dataset.static_features)
         cfg['model_args']['seq_length'] = cfg['sequence_length']
-    elif model_name == 'tft':
-        dynamic_sizes = {'x_dd': len(dataset.daily_features), 
-                         'x_di': len(dataset.irregular_features)}
         
+    elif model_name in ['tft', 'tft_mha']:
+        dynamic_sizes = {'x_dd': len(dataset.daily_features)}
+        if dataset.irregular_features:
+            dynamic_sizes['x_di'] = len(dataset.irregular_features)
+            
         cfg['model_args']['dynamic_sizes'] = dynamic_sizes
         cfg['model_args']['static_size'] = len(dataset.static_features)
-    elif model_name == 'taplstm':
+
+    elif model_name in ['taplstm','hybrid']:
         cfg['model_args']['daily_in_size'] = len(dataset.daily_features)
         cfg['model_args']['irregular_in_size'] = len(dataset.irregular_features)
         cfg['model_args']['static_in_size'] = len(dataset.static_features)
+
     elif model_name == 'ealstm':
         cfg['model_args']['dynamic_in_size'] = len(dataset.daily_features)
         cfg['model_args']['static_in_size'] = len(dataset.static_features)
+
     elif model_name == 'tealstm':
         cfg['model_args']['dynamic_in_size'] = len(dataset.irregular_features)
         cfg['model_args']['static_in_size'] = len(dataset.static_features)
+
     else:
         raise ValueError(f"{model_name}: Invalid model name")
     
