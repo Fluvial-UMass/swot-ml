@@ -64,13 +64,14 @@ def finetune(finetune_yml:Path):
 
     return cfg, trainer.model, trainer.log_dir, dataset
 
-def hyperparam_grid_search(config_yml:Path, idx):
+def hyperparam_grid_search(config_yml:Path, idx, k=None):
     cfg, _ = read_config(config_yml)
     cfg = update_cfg_from_grid(cfg, idx)
 
-    for i in range(4):
-        cfg['test_basin_file'] = f"metadata/site_lists/k_folds/test_{i}.txt"
-        cfg['train_basin_file'] = f"metadata/site_lists/k_folds/train_{i}.txt"
+    k_folds = 4 if k_folds is None else k_folds
+    for i in range(k):
+        cfg['test_basin_file'] = f"metadata/site_lists/k_folds/test_{i}_{k}.txt"
+        cfg['train_basin_file'] = f"metadata/site_lists/k_folds/train_{i}_{k}.txt"
         dataset = TAPDataset(cfg) 
 
         cfg = set_model_data_args(cfg, dataset)
@@ -146,7 +147,7 @@ def main(args):
         cfg, model, run_dir, dataset = finetune(finetune_yml)
     elif args.grid_search:
         config_yml = Path(args.grid_search).resolve()
-        hyperparam_grid_search(config_yml, args.grid_index)
+        hyperparam_grid_search(config_yml, args.grid_index, args.k_folds)
         return
     elif args.test:
         run_dir = Path(args.test).resolve()
@@ -182,6 +183,12 @@ if __name__ == '__main__':
                         help='Index in the hyperparameter grid to evaluate (required if --grid_search is used)',
                         required='--grid_search' in sys.argv)
     
+    # Add optional argument for number of k-fold validation folds
+    parser.add_argument('--k_folds', 
+                        type=int, 
+                        default=None,
+                        help='Number of folds for k-fold cross-validation (optional, can be used with --train or --continue)')
+    
     args = parser.parse_args()
 
     try:
@@ -190,6 +197,6 @@ if __name__ == '__main__':
         print(f"An error occurred: {e}")
         sys.stdout.flush()
     finally:
-        # Cleanup all processes (helps with pytorch dataloader workers)
+        # Cleanup all processes (prevents zombie dataloader workers)
         os.killpg(os.getpgid(0), signal.SIGKILL)
     
