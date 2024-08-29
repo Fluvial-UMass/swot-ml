@@ -21,9 +21,6 @@ def huber_loss(y, y_pred, mask, *, huber_delta=1.0):
     return jnp.mean(jnp.where(condition, squared_loss, linear_loss), where=mask)
 
 def flux_agreement(y_pred, target_list):
-    if any([t not in target_list for t in ['ssc','flux','usgs_q']]):
-        raise ValueError("Must predict at least ssc, flux, and usgs_q when using flux agreement regularization.")
-    
     ssc = y_pred[:,target_list.index('ssc')] / 1E6 # mg/l -> kg/l
     flux = y_pred[:,target_list.index('flux')] / 1.102 / 1E3 # short ton/day -> kg/d
     q = y_pred[:,target_list.index('usgs_q')] * 24*3600*1000 # m^3/s -> l/d

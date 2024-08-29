@@ -8,7 +8,7 @@ def get_basin_metrics(df, disp=False):
     per_basin_metrics = df.groupby(level='basin').apply(get_all_metrics)
 
     # Initialize an empty DataFrame to store results with multi-level columns
-    feature_names = df.columns.get_level_values('Feature').unique()
+    feature_names = df['obs'].columns
     metric_names = per_basin_metrics.iloc[0][feature_names[0]].keys()
     multi_index_columns = pd.MultiIndex.from_product([feature_names, metric_names],names=['Feature','Metric'])
     results_df = pd.DataFrame(columns=multi_index_columns)
@@ -32,8 +32,7 @@ def get_basin_metrics(df, disp=False):
 
 def get_all_metrics(df, disp=False):
     metrics = {}
-    unique_features = df.columns.get_level_values('Feature').unique()
-    for feature in unique_features:
+    for feature in df['obs'].columns:
         y = df[('obs', feature)]
         y_hat = df[('pred', feature)]
         metrics[feature] = {

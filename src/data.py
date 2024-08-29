@@ -5,6 +5,8 @@ import pickle
 from collections import defaultdict
 from pathlib import Path
 from tqdm.auto import tqdm
+import itertools
+import warnings
 import pandas as pd
 import xarray as xr
 import numpy as np
@@ -80,6 +82,7 @@ class TAPDataLoader(DataLoader):
         return batch
 
 
+
 class TAPDataset(Dataset):
     """
     DataLoader class for loading and preprocessing hydrological time series data.
@@ -89,18 +92,12 @@ class TAPDataset(Dataset):
         self.log_pad = 0.001
         self.inference_mode = inference_mode
 
-        # Validate the feature dict
         features = cfg['features']
-        for key, value in features.items():
-            if not isinstance(value, list) and value is not None:
-                raise ValueError(f"All feature dicts must contain a list. {key} is not a list.")
-        
-        # These are required for all models.
-        self.target = features['target']
-        self.daily_features = features['daily']
-        # These are not strictly required and can pass None.
-        self.irregular_features = features.get('irregular',[])
+        _validate_feature_dict(features)
+            
+        self.dynamic_features = features['dynamic']
         self.static_features = features.get('static') 
+        self.target = features['target']
 
         self._read_basin_files()
         self.x_s, self.attributes_scale = self._load_attributes(static_scale)
@@ -140,7 +137,7 @@ class TAPDataset(Dataset):
             self.test_basins = read_file(data_dir / test_basin_file)
             self.all_basins = list(set(self.train_basins + self.test_basins))
         else:
-            raise ValueError('Must set "basin_file" or "train_basin_file" AND "test_basin_file"')
+            raise ValueError('Must set either "basin_file" or "train_basin_file" AND "test_basin_file"')
         # make sure order of basins doesn't affect hasing. 
         self.all_basins.sort()
 
@@ -178,23 +175,30 @@ class TAPDataset(Dataset):
             ds['date'] = ds['date'].astype('datetime64[ns]')
     
             # Filter to keep only the necessary features and the target variable if not in inference mode
-            features_to_keep = [*self.daily_features, *self.irregular_features]
+            features_to_keep = list(itertools.chain(*self.dynamic_features.values()))
             if not self.inference_mode:
                 features_to_keep.extend(self.target)
+            
+            missing_columns = set(features_to_keep) - set(ds.data_vars)
+            if missing_columns:
+                raise ValueError(
+                    f"The following columns are missing from the dataset: {missing_columns}"
+                    f"The following variables are available in the dataset: {ds.data_vars}"
+                )
             ds = ds[features_to_keep]
+
+            # Clip selected columns to the specified range. This range is preprocessed in config.py.
+            if self.cfg['clip_feature_range'] and not self.inference_mode:
+                for col, [lower, upper] in self.cfg['clip_feature_range'].items():
+                    if col not in ds:
+                        warnings.warn(f"Column '{col}' not found in dataset. Skipping clipping for this column.", UserWarning)
+                        continue
+                    inside_range = (ds[col] >= lower) & (ds[col] <= upper)
+                    ds[col] = ds[col].where(inside_range, np.nan)
 
             # Replace negative values with NaN in specific columns without explicit loop
             for col in self.cfg['log_norm_cols']:
                 ds[col] = ds[col].where(ds[col] >= 0, np.nan)
-                
-            # Repetitive if target is in log_norm_cols, but not a problem. 
-            if self.cfg['clip_target_to_zero'] and not self.inference_mode:
-                for col in self.target:
-                    ds[col] = ds[col].where(ds[col] >= 0, np.nan)
-
-            # Testing if this nans are causing an issue
-            for col in self.daily_features:
-                ds[col] = ds[col].where(~np.isnan(ds[col]), 0)
                 
             # Apply rolling means at 1 or more intervals.    
             window_sizes = self.cfg.get('add_rolling_means')
@@ -217,35 +221,62 @@ class TAPDataset(Dataset):
         Returns:
             dict: A basin-keyed dictionary of static attributes.
         """
+        feat = self.static_features
+        if isinstance(feat, list) and len(feat)==0:
+            return None, None
+
         file_path = f"{self.cfg['data_dir']}/attributes/attributes.csv"
         attributes_df = pd.read_csv(file_path, index_col="index")
         attributes_df.index = attributes_df.index.astype(str)
 
-        if self.static_features is not None:
-            attributes_df = attributes_df[self.static_features]
+        if feat is not None:
+            attributes_df = attributes_df[feat]
+
+        categorical_cols = self.cfg.get('categorical_cols',[])
+        static_categorical_cols = [col for col in categorical_cols if col in attributes_df.columns]
+        numerical_cols = [col for col in attributes_df.columns if col not in static_categorical_cols]
+
+        # Apply one-hot encoding to categorical columns using pandas get_dummies
+        if static_categorical_cols:
+            encoded_categorical = pd.get_dummies(attributes_df[static_categorical_cols].astype(str), 
+                                                 prefix=static_categorical_cols)
+        else:
+            warnings.warn("No static categorical columns found. Treating all static data as continuous.", UserWarning)
+            encoded_categorical = pd.DataFrame(index=attributes_df.index)
+
+        # Process numerical variables
+        numerical_df = attributes_df[numerical_cols]
 
         if scale is None:
-            # Remove columns with zero variance
-            zero_var_cols = list(attributes_df.columns[attributes_df.std(ddof=0) == 0])
-            if zero_var_cols:
-                print(f"Dropping static attributes with 0 variance: {zero_var_cols}")
-                attributes_df.drop(columns=zero_var_cols, inplace=True)
-            self.static_features = list(attributes_df.columns)
-
-            # Create dict of the scaling factors
-            mu = attributes_df.mean()
-            std = attributes_df.std(ddof=0)
-            scale = {var: {'offset': mu[var], 'scale': std[var]} for var in attributes_df.columns}
+            # Remove columns with zero variance or NaN values
+            zero_var_cols = list(numerical_df.columns[numerical_df.std(ddof=0) == 0])
+            nan_cols = list(numerical_df.columns[numerical_df.isna().any()])
+            cols_to_drop = list(set(zero_var_cols + nan_cols)) 
+            if cols_to_drop:
+                warnings.warn(f"Dropping numerical attributes with 0 variance or NaN values: {cols_to_drop}", UserWarning)
+                numerical_df.drop(columns=cols_to_drop, inplace=True)
+                
+            # Create dict of the scaling factors for numerical columns
+            mu = numerical_df.mean()
+            std = numerical_df.std(ddof=0)
+            scale = {var: {'offset': mu[var], 'scale': std[var]} for var in numerical_df.columns}
         else:
-            mu = [row['offset'] for _, row in scale.items()]
-            std = [row['scale'] for _, row in scale.items()]
-        scaled_attributes = (attributes_df-mu)/std
+            mu = pd.Series({col: row['offset'] for col, row in scale.items() if col in numerical_df.columns})
+            std = pd.Series({col: row['scale'] for col, row in scale.items() if col in numerical_df.columns})
+        # Apply scaling to numerical columns
+        scaled_numerical = (numerical_df - mu) / std
+
+        # Combine scaled numerical and encoded categorical data
+        combined_df = pd.concat([scaled_numerical, encoded_categorical.astype(float)], axis=1)
+
+        # Update static_features to reflect all columns in the final DataFrame
+        self.static_features = list(combined_df.columns)
 
         x_s = {}
         for basin in self.all_basins:
             if basin not in attributes_df.index:
                 raise KeyError(f"Basin '{basin}' not found in attributes DataFrame.")
-            x_s[basin] = scaled_attributes.loc[basin].values
+            x_s[basin] = combined_df.loc[basin].values
             
         return x_s, scale
     
@@ -267,21 +298,19 @@ class TAPDataset(Dataset):
         sequenced_dates_da = xr.DataArray(sequenced_dates, dims=["sample", "time"])
 
         ds = self.x_d.sel(basin=basins_da, date=sequenced_dates_da)
-        x_dd = np.moveaxis(ds[self.daily_features].to_array().values,0,2)
-        x_s = np.array([self.x_s[b] for b in basins])
 
-        batch = {'x_dd': jnp.array(x_dd), 
-                 'x_s': jnp.array(x_s)}
+        batch = {'dynamic':{}}
+        for source, col_names in self.dynamic_features.items():
+            batch['dynamic'][source] = jnp.array(np.moveaxis(ds[col_names].to_array().values,0,2))
+
+        if self.x_s:
+            batch['static'] = jnp.array([self.x_s[b] for b in basins])
         
         if not self.inference_mode:
-            y = np.moveaxis(ds[self.target].to_array().values,0,2)
-            batch['y'] = jnp.array(y)
+            batch['y'] = jnp.array(np.moveaxis(ds[self.target].to_array().values,0,2))
         
-        if self.irregular_features:
-            x_di = np.moveaxis(ds[self.irregular_features].to_array().values,0,2)
-            batch['x_di'] = jnp.array(x_di)
-            
         return basins, dates, batch
+    
 
     def _normalize_data(self, ds, scale=None):
         """
@@ -294,37 +323,40 @@ class TAPDataset(Dataset):
 
         if scale is None:
             # Initialize
-            scale = {k: {'offset': 0, 'scale': 1, 'log_norm': False} for k in ds.data_vars}
+            scale = {k: {'log_norm': False} for k in ds.data_vars}
         
             # Subset the dataset to the training time period
             training_ds = ds.sel(date=slice(None, self.cfg['split_time']))
         
-            # Iterate over each variable in the dataset
+            # Iterate over each variable in the dataset and calculate scaler
             for var in ds.data_vars:
                 if var in self.cfg.get('log_norm_cols',[]):
-                    # Perform log normalization
+                    # Log normalization
                     scale[var]['log_norm'] = True
-                    x = ds[var] + self.log_pad
-                    training_x = x.sel(date=slice(None, self.cfg['split_time']))
-                    scale[var]['offset'] = np.nanmean(np.log(training_x))    
-                    # Apply normalization and offset
+                    x = training_ds[var] + self.log_pad
+                    scale[var]['offset'] = np.nanmean(np.log(x))    
+                    scale[var]['scale'] = 1
                     
                 elif var in self.cfg.get('range_norm_cols',[]):
-                    # Perform min-max scaling
-                    scale[var]['scale'] = training_ds[var].max().values.item()
-                    ds[var] = ds[var] / scale[var]['scale']
+                    # Min-max scaling
+                    min_val = training_ds[var].min().values.item()
+                    max_val = training_ds[var].max().values.item()
+                    scale[var]['offset'] = min_val
+                    scale[var]['scale'] = max_val - min_val
+                    
                 else:
-                    # Perform standard normalization
+                    # Standard normalization
                     scale[var]['offset'] = training_ds[var].mean().values.item()
                     scale[var]['scale'] = training_ds[var].std().values.item()
-                    ds[var] = (ds[var] - scale[var]['offset']) / scale[var]['scale']
 
         for var in ds.data_vars:
-            if scale[var]['log_norm']:
-                ds[var] = np.log(ds[var] + self.log_pad) - scale[var]['offset']
+            scl = scale[var]
+            if scl['log_norm']:
+                ds[var] = np.log(ds[var] + self.log_pad) - scl['offset']
             else:
-                ds[var] = (ds[var] - scale[var]['offset']) / scale[var]['scale']
-                
+                #minmax works just the same after calculating scale and offset.
+                ds[var] = (ds[var] - scl['offset']) / scl['scale']
+
         return ds, scale
  
     def denormalize_target(self, y_normalized):
@@ -478,8 +510,9 @@ class TAPDataset(Dataset):
     
     def get_data_hash(self):
         cfg_keys = ['data_dir', 'features', 'exclude_target_from_index', 
-                    'time_slice', 'split_time', 'add_rolling_means', 'log_norm_cols',  
-                    'range_norm_cols', 'clip_target_to_zero']
+                    'time_slice', 'split_time', 'add_rolling_means', 
+                    'log_norm_cols', 'categorical_cols', 'range_norm_cols',
+                    'clip_feature_range']
         data_config = {k: self.cfg.get(k) for k in cfg_keys}
         data_config['basins'] = self.all_basins
 
@@ -503,4 +536,22 @@ def _get_available_devices():
             pass   
     return devices
 
+def _validate_feature_dict(d):
+    if not isinstance(d, dict):
+        raise ValueError("features in config must be a dict. See examples.")
+    
+    invalid_entries = []
+    for key, value in d.items():
+        if key == 'dynamic':
+            if not isinstance(value, dict):
+                raise ValueError(f"The features dict key 'daily' must be a dict.")
+            else:
+                for sub_key, sub_value in value.items():
+                    if not isinstance(sub_value, list):
+                        invalid_entries.append(str(sub_key))
+        elif not isinstance(value, list) and value is not None:
+            invalid_entries.append(str(key))
+    
+    if len(invalid_entries)>0:
+        raise ValueError(f"The features dict in config file must contains lists. {invalid_entries} is not a list.")
 

@@ -17,13 +17,13 @@ class Hybrid(eqx.Module):
     head: eqx.nn.Linear
     target: list
 
-    def __init__(self, *, target, daily_in_size, irregular_in_size, static_in_size, hidden_size, num_layers, num_heads, seed, dropout):
+    def __init__(self, *, target, dynamic_sizes, static_size, hidden_size, num_layers, num_heads, seed, dropout):
         key = jax.random.PRNGKey(seed)
         keys = jrandom.split(key, 5)
 
-        self.static_embedder = StaticEmbedder(static_in_size, hidden_size, dropout, keys[0])
-        self.ealstm_d = EALSTM(daily_in_size, hidden_size, hidden_size, None, dropout, return_all=True, key=keys[1])
-        self.tealstm_i = TEALSTM(irregular_in_size, hidden_size, hidden_size, None, dropout, return_all=True, key=keys[2])
+        self.static_embedder = StaticEmbedder(static_size, hidden_size, dropout, keys[0])
+        self.ealstm_d = EALSTM(dynamic_sizes['era5'], hidden_size, hidden_size, None, dropout, return_all=True, key=keys[1])
+        self.tealstm_i = TEALSTM(dynamic_sizes['landsat'], hidden_size, hidden_size, None, dropout, return_all=True, key=keys[2])
 
         self.decoder = CrossAttnDecoder(hidden_size, hidden_size, num_layers, num_heads, dropout, keys[3])
         self.head = eqx.nn.Linear(in_features=hidden_size, out_features=len(target), key=keys[4])

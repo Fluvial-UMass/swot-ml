@@ -27,18 +27,22 @@ def _calc_dt_array(batch):
     return batch_dt_arr
 
 # Only calculates dt for the final element in sequence (prediciton)
-def _calc_last_dt(batch):
-    # Simplifying to the first feature, since all features align
-    valid_mask = ~np.isnan(batch['x_di'][:, :, 0])  
-    # Find the last valid index for each sequence in the batch
-    batch_dt_last = np.argmax(valid_mask[:, ::-1], axis=1)
+def _calc_last_dts(batch):
+    last_dt_list = []
+    for x in batch['dynamic'].values():
+        # Simplifying to the first feature, since all features align
+        valid_mask = ~np.isnan(x[:, :, 0]) # [batch, seq_len, n_features] 
+        # Find the last valid index for each sequence in the batch
+        last_dt = np.argmax(valid_mask[:, ::-1], axis=1)
 
-    # Logic fails if there are no obs, so we handle those cases here.
-    seq_length = valid_mask.shape[1]
-    all_nan_mask = ~np.any(valid_mask, axis=1)
-    batch_dt_last[all_nan_mask] = seq_length+1
+        # Logic fails if there are no obs, so we handle those cases here.
+        seq_length = valid_mask.shape[1]
+        all_nan_mask = ~np.any(valid_mask, axis=1)
+        last_dt[all_nan_mask] = seq_length+1
 
-    return batch_dt_last
+        last_dt_list.append(last_dt)
+
+    return np.stack(last_dt_list, axis=1)
 
 def model_iterate(model, dataloader, return_dt=False, quiet=False, denormalize=True):
     # Set model to inference mode (no dropout)
@@ -62,8 +66,7 @@ def model_iterate(model, dataloader, return_dt=False, quiet=False, denormalize=T
         if not inference_mode:
             out_tuple += (y,)
         if return_dt:
-            dt = _calc_last_dt(batch)
-            out_tuple += (dt,)
+            out_tuple += (_calc_last_dts(batch),)
         yield out_tuple
 
 def predict(model, dataloader, *, return_dt=False, quiet=False, denormalize=True):
@@ -100,7 +103,8 @@ def predict(model, dataloader, *, return_dt=False, quiet=False, denormalize=True
 
     if return_dt:
         dt_arr = np.concatenate(dt_list)
-        dt_index = pd.MultiIndex.from_product([['metadata'], ['dt']], names=['Type', 'Feature'])
+        dt_index = pd.MultiIndex.from_product([['dt'],dataloader.dataset.dynamic_features.keys()], 
+                                              names=['Type', 'Feature'])
         results[dt_index] = dt_arr
 
     return results

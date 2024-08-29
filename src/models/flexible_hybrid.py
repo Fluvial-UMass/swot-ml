@@ -48,35 +48,36 @@ class FlexibleHybrid(eqx.Module):
     def __call__(self, data, key):
         keys = jax.random.split(key, 3)
 
-        # Encoder
+        # Static embedding
+        if self.static_embedder:
+            static_bias = self.static_embedder(data['static'], keys[1])
+        else:
+            static_bias = 0
+
+        # Encoders
         encoder_keys = jax.random.split(keys[0],len(self.encoders))
         encoded_data = {}
         masks = {}
-        for e_key, (var_name, encoder) in zip(self.encoders.items(), encoder_keys):
-            encoded_data[var_name] = encoder(data[var_name], data['static'], e_key)
-            masks[var_name] = ~jnp.any(jnp.isnan(data[var_name]),axis=1)
+        for (var_name, encoder), e_key in zip(self.encoders.items(), encoder_keys):
+            encoded_data[var_name], _ = encoder(data['dynamic'][var_name], static_bias, e_key)
+            masks[var_name] = ~jnp.any(jnp.isnan(data['dynamic'][var_name]),axis=1)
 
-        if self.static_embedder:
-            head_bias = self.static_embedder(data['static'], keys[1])
-        else:
-            head_bias = 0
-
-        # Decoder
+        # Decoders
         source_var = list(encoded_data.keys())[0]
         cross_vars = list(encoded_data.keys())[1:]
-        query = encoded_data[source_var]   
-
-        # Use cross-attention with multiple sources
+        query = encoded_data[source_var] 
+        
         if len(cross_vars)>0:
+            # Use cross-attention with multiple sources
             decoder_keys = jax.random.split(keys[2],len(cross_vars))
             decoded_list = []
             for k, d_key in zip(cross_vars, decoder_keys):
-                decoded_list.append(self.decoders[k](query, encoded_data[k], head_bias, masks[k], d_key))
+                decoded_list.append(self.decoders[k](query, encoded_data[k], static_bias, masks[k], d_key))
             pooled_output = jnp.concatenate(decoded_list, axis=0)
 
-        # If only one data source, use self-attention
         else:
-            pooled_output = self.decoders['self'](query, query, head_bias, masks[source_var], keys[-1])
+            # Use self-attention for a single source
+            pooled_output = self.decoders['self'](query, query, static_bias, masks[source_var], keys[-1])
 
         return self.head(pooled_output)
 

@@ -8,7 +8,7 @@ reload(models.tft)
 from models.lstm import TAPLSTM
 from models.transformer import EATransformer
 from models.hybrid import Hybrid
-from models.fusion import FusionTransformer
+from models.flexible_hybrid import FlexibleHybrid
 from models.tft import TFT
 from models.tft_mha import TFT_MHA
 
@@ -21,8 +21,8 @@ def make(cfg: dict):
         model_fn = EATransformer
     elif name == "hybrid":
         model_fn = Hybrid
-    elif name == 'fusion':
-        model_fn = FusionTransformer
+    elif name == "flexible_hybrid":
+        model_fn = FlexibleHybrid
     elif name == 'tft':
         model_fn = TFT
     elif name == 'tft_mha':

@@ -10,7 +10,7 @@ import json
 import os
 import re
 import traceback
-from tqdm.auto import tqdm
+from tqdm import tqdm
 from pathlib import Path
 from datetime import datetime
 
@@ -111,36 +111,32 @@ class Trainer:
         Returns:
             The trained model after completing the training or upon an interruption.
         """
-        try:
-            while (self.epoch < self.num_epochs) and (self.epoch < stop_at):
-                self.epoch += 1
-                loss, bad_grads = self._train_epoch()
+        while (self.epoch < self.num_epochs) and (self.epoch < stop_at):
+            self.epoch += 1
+            loss, bad_grads = self._train_epoch()
 
-                info_str = f"Epoch: {self.epoch}, Loss: {loss:.4f}"
-                if self.cfg['log']:
-                    logging.info(info_str)
-                if self.cfg['quiet']:
-                    print(info_str)
+            info_str = f"Epoch: {self.epoch}, Loss: {loss:.4f}"
+            if self.cfg['log']:
+                logging.info(info_str)
+            if self.cfg['quiet']:
+                print(info_str)
 
-                # Log the counts of any bad gradients.
-                for type_key, tree_counts in bad_grads.items():
-                    if tree_counts:
-                        warning_str = f"{type_key} gradients detected:"
-                        for tree_key, count in tree_counts.items():
-                            warning_str += f"\n\t{tree_key}: {count}"
+            # Log the counts of any bad gradients.
+            for type_key, tree_counts in bad_grads.items():
+                if tree_counts:
+                    warning_str = f"{type_key} gradients detected:"
+                    for tree_key, count in tree_counts.items():
+                        warning_str += f"\n\t{tree_key}: {count}"
 
-                        if self.cfg['log']:
-                            logging.warning(warning_str)
-                        else:
-                            print(warning_str)
+                    if self.cfg['log']:
+                        logging.warning(warning_str)
+                    else:
+                        print(warning_str)
 
-                if self.cfg['log'] & (self.epoch % self.log_interval == 0):
-                    self.save_state()
-                    
-                self.loss_list.append(float(loss))
-        except:
-            self.epoch -= 1
-            return
+            if self.cfg['log'] & (self.epoch % self.log_interval == 0):
+                self.save_state()
+                
+            self.loss_list.append(float(loss))
 
         print("Training finished. Model state saved.")
         if self.cfg['log']:
