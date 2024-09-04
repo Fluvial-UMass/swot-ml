@@ -69,6 +69,7 @@ def model_iterate(model, dataloader, return_dt=False, quiet=False, denormalize=T
             out_tuple += (_calc_last_dts(batch),)
         yield out_tuple
 
+
 def predict(model, dataloader, *, return_dt=False, quiet=False, denormalize=True):
     inference_mode = dataloader.dataset.inference_mode
     
@@ -78,6 +79,7 @@ def predict(model, dataloader, *, return_dt=False, quiet=False, denormalize=True
     if not inference_mode: y_list = []
     if return_dt: dt_list = []
 
+    # Iterate through the dataset,make predictions and collect data in lists.
     for iter_out in model_iterate(model, dataloader, return_dt, quiet, denormalize):
         basins.extend(iter_out[0])
         dates.extend(iter_out[1])
@@ -85,6 +87,7 @@ def predict(model, dataloader, *, return_dt=False, quiet=False, denormalize=True
         if not inference_mode: y_list.append(iter_out[3])
         if return_dt: dt_list.append(iter_out[4])
     
+    # Concate all the data lists into arrays. 
     y_hat_arr = np.concatenate(y_hat_list)
     if not inference_mode:
         y_arr = np.concatenate(y_list)
@@ -94,16 +97,15 @@ def predict(model, dataloader, *, return_dt=False, quiet=False, denormalize=True
         data = y_hat_arr
         cols = ['pred']
 
-     # Place the data into a dataframe with multilevel indices.
+    # Place the data arrays into a dataframe with multilevel indices.
     datetime_index = pd.MultiIndex.from_arrays([basins,dates],names=['basin','date'])
     column_index = pd.MultiIndex.from_product([cols, dataloader.dataset.target],
                                               names=['Type', 'Feature'])
-
     results = pd.DataFrame(data, index=datetime_index, columns=column_index)
 
     if return_dt:
         dt_arr = np.concatenate(dt_list)
-        dt_index = pd.MultiIndex.from_product([['dt'],dataloader.dataset.dynamic_features.keys()], 
+        dt_index = pd.MultiIndex.from_product([['dt'],dataloader.dataset.features['dynamic'].keys()], 
                                               names=['Type', 'Feature'])
         results[dt_index] = dt_arr
 

@@ -30,11 +30,14 @@ def get_basin_metrics(df, disp=False):
    
     return results_df
 
-def get_all_metrics(df, disp=False):
+def get_all_metrics(df:pd.DataFrame, disp=False):
     metrics = {}
+    dt_mask = (df['dt']==0).all(axis=1)
+    
     for feature in df['obs'].columns:
-        y = df[('obs', feature)]
-        y_hat = df[('pred', feature)]
+        y = df.loc[dt_mask, ('obs', feature)]
+        y_hat = df.loc[dt_mask, ('pred', feature)]
+
         metrics[feature] = {
             'num_obs': np.sum(~np.isnan(y)),
             'R2': mask_nan(skm.r2_score)(y,y_hat),

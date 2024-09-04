@@ -12,7 +12,7 @@ def mosaic_scatter(cfg, results, metrics, title_str):
         x = x[positive_mask]
         y = y[positive_mask]
         
-        min_val = 5E-3
+        min_val = 5E-1
         max_val = 5E6
         log_min = np.log10(min_val)
         log_max = np.log10(max_val)
@@ -99,7 +99,7 @@ def basin_metric_histograms(basin_metrics, metric_args, cdf=True):
 
 
 def map_animation(cfg, model, dataset, target, cmap_label, period, lim, dt_alpha=1, log=True, denorm=True):
-    from data import TAPDataLoader
+    from data import HydroDataLoader
     from evaluate import model_iterate
     import matplotlib.animation as animation
 
@@ -107,9 +107,10 @@ def map_animation(cfg, model, dataset, target, cmap_label, period, lim, dt_alpha
     wqp_locs = wqp_locs.set_index('LocationID')
     wqp_locs = wqp_locs.to_crs("EPSG:5070")
 
-    dataloader_kwargs = dataset.date_batching(period) # Return batches where each batch is 1 day
+    dataset.inference_mode = True
+    dataloader_kwargs = dataset.date_batching(date_range=period) # Return batches where each batch is 1 day
     cfg.update(dataloader_kwargs)
-    dataloader = TAPDataLoader(cfg, dataset)
+    dataloader = HydroDataLoader(cfg, dataset)
 
     test_basins = wqp_locs.loc[dataset.all_basins]
     test_basins['y_hat'] = 0.0 
@@ -150,9 +151,11 @@ def map_animation(cfg, model, dataset, target, cmap_label, period, lim, dt_alpha
     # Updates the plot based on the data passed by frames()
     def update(frame):
         # Function signature is fixed so we have to unpack.
-        basin, date, y, y_hat, dt = frame
-        alpha = np.where(dt==0, 1, dt_alpha)
+        basin, date, y_hat, dt = frame
+        alpha = np.where(dt[:,1]==0, 1, dt_alpha)
         ax.clear()
+
+        # Insert the data into our gdf and then plot.
         test_basins.loc[basin, 'y_hat'] = y_hat[:, target_idx]
         test_basins.plot(column='y_hat', cmap='inferno', linewidth=0, alpha=alpha, norm=norm, ax=ax)
 

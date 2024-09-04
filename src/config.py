@@ -14,6 +14,8 @@ def read_yml(yml_path):
 def read_config(yml_path):
     raw_cfg = read_yml(yml_path)
     cfg = format_config(raw_cfg)
+    validate_feature_dict(cfg)
+
     cfg['cfg_path'] = yml_path
     cfg_str = yaml.dump(raw_cfg, default_flow_style=False)
     
@@ -56,6 +58,25 @@ def process_clip_range(range_list):
     upper = np.inf if range_list[1] is None else range_list[1]
     
     return [lower, upper]
+
+def validate_feature_dict(cfg):
+    if not isinstance(cfg['features'], dict):
+        raise ValueError("features in config must be a dict. See examples.")
+    
+    invalid_entries = []
+    for key, value in cfg['features'].items():
+        if key == 'dynamic':
+            if not isinstance(value, dict):
+                raise ValueError(f"The features dict key 'daily' must be a dict.")
+            else:
+                for sub_key, sub_value in value.items():
+                    if not isinstance(sub_value, list):
+                        invalid_entries.append(str(sub_key))
+        elif not isinstance(value, list) and value is not None:
+            invalid_entries.append(str(key))
+    
+    if len(invalid_entries)>0:
+        raise ValueError(f"The features dict in config file must contains lists. {invalid_entries} is not a list.")
 
 def get_grid_update_tuples(cfg):
     param_dict = cfg['param_search_dict']
@@ -103,8 +124,8 @@ def set_model_data_args(cfg, dataset):
     
     model_name = cfg['model'].lower()
     if model_name in ['flexible_hybrid', 'hybrid']:
-        cfg['model_args']['dynamic_sizes'] = {k: len(v) for k, v in dataset.dynamic_features.items()}
-        cfg['model_args']['static_size'] = len(dataset.static_features)
+        cfg['model_args']['dynamic_sizes'] = {k: len(v) for k, v in dataset.features['dynamic'].items()}
+        cfg['model_args']['static_size'] = len(dataset.features['static'])
 
     # if model_name in ["eatransformer", "fusion"]:
     #     cfg['model_args']['daily_in_size'] = len(dataset.daily_features)

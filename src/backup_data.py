@@ -2,6 +2,7 @@ import os
 import hashlib
 import yaml
 import pickle
+import copy
 from collections import defaultdict
 from pathlib import Path
 from tqdm.auto import tqdm
@@ -17,7 +18,7 @@ import jax.sharding as jshard
 from torch.utils.data import Dataset, DataLoader
 
 
-class TAPDataLoader(DataLoader):
+class HydroDataLoader(DataLoader):
     def __init__(self, cfg, dataset):    
         num_workers = cfg.get('num_workers', 1)
         persistent_workers = False if num_workers==0 else cfg.get('persistent_workers',True)
@@ -82,26 +83,28 @@ class TAPDataLoader(DataLoader):
         return batch
 
 
-
-class TAPDataset(Dataset):
+class HydroDataset(Dataset):
     """
     DataLoader class for loading and preprocessing hydrological time series data.
     """
-    def __init__(self, cfg, *, inference_mode=False, dynamic_scale=None, static_scale=None):
-        self.cfg = cfg
+    def __init__(self, cfg, *, 
+                 inference_mode=False, 
+                 dynamic_encoding=None, 
+                 dynamic_scale=None,
+                 static_encoding=None, 
+                 static_scale=None):
+        
+        self.cfg = copy.deepcopy(cfg)
         self.log_pad = 0.001
         self.inference_mode = inference_mode
 
-        features = cfg['features']
-        _validate_feature_dict(features)
-            
-        self.dynamic_features = features['dynamic']
-        self.static_features = features.get('static') 
-        self.target = features['target']
+        self.features = cfg['features']
+        _validate_feature_dict(self.features)  
+        self.target = self.features['target']
 
         self._read_basin_files()
-        self.x_s, self.attributes_scale = self._load_attributes(static_scale)
-        self.x_d, self.scale = self._load_or_read_basin_data(dynamic_scale)
+        self.x_s, self.s_encoding, self.s_scale = self._load_attributes(static_encoding, static_scale)
+        self.x_d, self.d_encoding, self.d_scale = self._load_or_read_basin_data(dynamic_encoding, dynamic_scale)
         self.date_ranges = self._precompute_date_ranges()
 
         self.update_indices(data_subset=cfg.get('data_subset','train'),
@@ -142,26 +145,26 @@ class TAPDataset(Dataset):
         self.all_basins.sort()
 
 
-    def _load_or_read_basin_data(self, scale):
+    def _load_or_read_basin_data(self, encoding, scale):
         data_hash = self.get_data_hash()
         print(f"Data Hash: {data_hash}")
 
-        data_file = self.cfg.get('data_dir') / "runtime_cache" / f"{data_hash}.pkl"
+        data_file = self.cfg.get('data_dir') / "cache" / f"{data_hash}.pkl"
         # If data from this cfg hash exists, read it in.
         if data_file.is_file():
             print("Using cached basin dataset file.")
             with open(data_file, 'rb') as file:
-                data_tuple = pickle.load(file)
+                x_d, scale, encoding, self.features['dynamic'] = pickle.load(file)
         # Else load the dataset from basin files and save it.
         else:
-            data_tuple = self._load_basin_data(scale)
+            x_d, encoding, scale = self._load_basin_data(encoding, scale)
             # Save our new loaded data
             with open(data_file, 'wb') as file:
-                pickle.dump((data_tuple), file)
+                pickle.dump((x_d, scale, encoding, self.features['dynamic']), file)
             
-        return data_tuple
+        return x_d, encoding, scale
     
-    def _load_basin_data(self, scale=None):
+    def _load_basin_data(self, encoding=None, scale=None):
         """
         Loads the basin data from NetCDF files and applies the time slice.
 
@@ -175,7 +178,7 @@ class TAPDataset(Dataset):
             ds['date'] = ds['date'].astype('datetime64[ns]')
     
             # Filter to keep only the necessary features and the target variable if not in inference mode
-            features_to_keep = list(itertools.chain(*self.dynamic_features.values()))
+            features_to_keep = list(itertools.chain(*self.features['dynamic'].values()))
             if not self.inference_mode:
                 features_to_keep.extend(self.target)
             
@@ -210,81 +213,55 @@ class TAPDataset(Dataset):
 
         ds = xr.concat(ds_list, dim="basin")
         ds = ds.drop_duplicates('basin')
-        x_d, scale = self._normalize_data(ds, scale)
-        
-        return x_d, scale
 
-    def _load_attributes(self, scale=None):
+        ds, encoding = self._encode_data(ds, 'dynamic', encoding)
+        x_d, scale = self._normalize_data(ds, 'dynamic', encoding, scale)
+        
+        return x_d, encoding, scale
+
+    def _load_attributes(self, encoding=None, scale=None):
         """
         Loads the basin attributes from a CSV file.
 
         Returns:
-            dict: A basin-keyed dictionary of static attributes.
+            xr.Dataset: An xarray dataset of attribute data with basin coordinates.
         """
-        feat = self.static_features
+        feat = self.features['static']
         if isinstance(feat, list) and len(feat)==0:
             return None, None
 
         file_path = f"{self.cfg['data_dir']}/attributes/attributes.csv"
-        attributes_df = pd.read_csv(file_path, index_col="index")
-        attributes_df.index = attributes_df.index.astype(str)
+        df = pd.read_csv(file_path, index_col="index")
+        df.index = df.index.astype(str)
 
+        # Trim the dataset to the config'd list.
         if feat is not None:
-            attributes_df = attributes_df[feat]
+            df = df[feat]
 
-        categorical_cols = self.cfg.get('categorical_cols',[])
-        static_categorical_cols = [col for col in categorical_cols if col in attributes_df.columns]
-        numerical_cols = [col for col in attributes_df.columns if col not in static_categorical_cols]
+        #Remove columns with zero variance or NaN values
+        zero_var_cols = list(df.columns[df.std(ddof=0) == 0])
+        nan_cols = list(df.columns[df.isna().any()])
+        cols_to_drop = list(set(zero_var_cols + nan_cols)) 
+        if cols_to_drop:
+            warnings.warn(f"Dropping numerical attributes with 0 variance or NaN values: {cols_to_drop}", UserWarning)
+            df.drop(columns=cols_to_drop, inplace=True)
 
-        # Apply one-hot encoding to categorical columns using pandas get_dummies
-        if static_categorical_cols:
-            encoded_categorical = pd.get_dummies(attributes_df[static_categorical_cols].astype(str), 
-                                                 prefix=static_categorical_cols)
-        else:
-            warnings.warn("No static categorical columns found. Treating all static data as continuous.", UserWarning)
-            encoded_categorical = pd.DataFrame(index=attributes_df.index)
+        # Update or set the static feature list.
+        if feat is None:
+            self.features['static'] = list(df.columns)
 
-        # Process numerical variables
-        numerical_df = attributes_df[numerical_cols]
+        # Convert the DataFrame to an xarray Dataset
+        ds = df.to_xarray().rename({'index': 'basin'})
+        ds, encoding = self._encode_data(ds, 'static', encoding)
+        x_s, scale = self._normalize_data(ds, 'static', encoding, scale)
 
-        if scale is None:
-            # Remove columns with zero variance or NaN values
-            zero_var_cols = list(numerical_df.columns[numerical_df.std(ddof=0) == 0])
-            nan_cols = list(numerical_df.columns[numerical_df.isna().any()])
-            cols_to_drop = list(set(zero_var_cols + nan_cols)) 
-            if cols_to_drop:
-                warnings.warn(f"Dropping numerical attributes with 0 variance or NaN values: {cols_to_drop}", UserWarning)
-                numerical_df.drop(columns=cols_to_drop, inplace=True)
-                
-            # Create dict of the scaling factors for numerical columns
-            mu = numerical_df.mean()
-            std = numerical_df.std(ddof=0)
-            scale = {var: {'offset': mu[var], 'scale': std[var]} for var in numerical_df.columns}
-        else:
-            mu = pd.Series({col: row['offset'] for col, row in scale.items() if col in numerical_df.columns})
-            std = pd.Series({col: row['scale'] for col, row in scale.items() if col in numerical_df.columns})
-        # Apply scaling to numerical columns
-        scaled_numerical = (numerical_df - mu) / std
+        return x_s, encoding, scale
 
-        # Combine scaled numerical and encoded categorical data
-        combined_df = pd.concat([scaled_numerical, encoded_categorical.astype(float)], axis=1)
 
-        # Update static_features to reflect all columns in the final DataFrame
-        self.static_features = list(combined_df.columns)
-
-        x_s = {}
-        for basin in self.all_basins:
-            if basin not in attributes_df.index:
-                raise KeyError(f"Basin '{basin}' not found in attributes DataFrame.")
-            x_s[basin] = combined_df.loc[basin].values
-            
-        return x_s, scale
-    
     def _precompute_date_ranges(self):
         unique_dates = self.x_d['date'].values
         date_ranges = {date: pd.date_range(end=date, periods=self.cfg['sequence_length'], freq='D').values for date in unique_dates}
         return date_ranges
-    
     
     def __getitems__(self, ids):
         """Generate one batch of data."""
@@ -300,19 +277,126 @@ class TAPDataset(Dataset):
         ds = self.x_d.sel(basin=basins_da, date=sequenced_dates_da)
 
         batch = {'dynamic':{}}
-        for source, col_names in self.dynamic_features.items():
+        for source, col_names in self.features['dynamic'].items():
             batch['dynamic'][source] = jnp.array(np.moveaxis(ds[col_names].to_array().values,0,2))
 
-        if self.x_s:
-            batch['static'] = jnp.array([self.x_s[b] for b in basins])
+        # Handle static data as an xarray Dataset
+        if self.x_s is not None:
+            static_ds = self.x_s.sel(basin=basins_da)
+            batch['static'] = jnp.array(np.moveaxis(static_ds.to_array().values, 0, 1)) 
         
         if not self.inference_mode:
             batch['y'] = jnp.array(np.moveaxis(ds[self.target].to_array().values,0,2))
         
         return basins, dates, batch
     
+    def _encode_data(self, ds, feat_group, encoding:dict | None):
+        columns_in = ds.data_vars
+        one_hot_enc = encoding.get('one_hot') if encoding else None
+        bitmask_enc = encoding.get('bitmask') if encoding else None
 
-    def _normalize_data(self, ds, scale=None):
+        ds, one_hot = self._one_hot_encoding(ds, feat_group, one_hot_enc)
+        ds, bitmask = self._bitmask_expansion(ds, feat_group, bitmask_enc)
+
+        new_columns = set(ds.data_vars) - set(columns_in)
+
+        encoding = {'one_hot': one_hot,
+                    'bitmask': bitmask,
+                    'encoded_columns': list(new_columns)}
+        
+        return ds, encoding
+
+    def _one_hot_encoding(self, ds, feat_group, onehot_enc:dict | None):
+        # Apply one-hot encoding to categorical columns
+        if not onehot_enc:
+            categorical_cols = self.cfg.get('categorical_cols',{}).get(feat_group, [])
+            if not categorical_cols:
+                return ds, None
+            onehot_enc = {col: None for col in categorical_cols}
+        
+        for col, prescribed_cols in onehot_enc.items():
+            if col not in ds.data_vars:
+                continue
+
+            df = ds[col].to_dataframe()
+            encoded = pd.get_dummies(df.astype(str), prefix=col)
+
+            if prescribed_cols:
+                # Add missing categories as columns filled with zeros
+                for c in prescribed_cols:
+                    if c not in encoded.columns:
+                        encoded[c] = 0
+                # Filter out columns not in the prescribed encoding
+                encoded = encoded[prescribed_cols]
+            else:
+                onehot_enc[col] = encoded.columns
+            
+            # Add encoded data and remove the original categorical column
+            ds = xr.merge([ds, encoded.to_xarray()])
+            ds = ds.drop_vars(col)
+
+            # Locate the col inside the features dict, remove and replace.
+            # This is kind of ugly but deals with the 2 level feature dict.
+            if feat_group == 'dynamic':
+                for source, source_features in self.features[feat_group].items():
+                    if col in source_features:
+                        self.features[feat_group][source].remove(col)
+                        self.features[feat_group][source].extend(encoded.columns)
+            else:
+                self.features[feat_group].remove(col)
+                self.features[feat_group].extend(encoded.columns)
+
+
+        return ds, onehot_enc
+
+    def _bitmask_expansion(self, ds, feat_group, bitmask_enc:dict | None):
+        if not bitmask_enc:
+            bitmask_cols = self.cfg.get('bitmask_cols',{}).get(feat_group,[])
+            if not bitmask_cols:
+                return ds, None
+            bitmask_enc = {k: None for k in bitmask_cols}
+        
+        for col, num_bits in bitmask_enc.items():
+            if col not in ds.data_vars:
+                continue
+            # Get the bitmask integers
+            x = ds[col].values
+            x[np.isnan(x)] = 0
+            x = x.astype(int)
+
+            if not num_bits:
+                num_bits = int(np.ceil(np.log2(x.max())))
+                bitmask_enc[col] = num_bits
+
+            # Expand into bits
+            new_vars = {}
+            for n in range(num_bits):
+                bit_arr = (x // 2**n) % 2
+
+                new_vars[f"{col}_bit_{n}"] = xr.DataArray(
+                    data=bit_arr,
+                    dims=['basin', 'date'],
+                    coords={'basin': ds.basin, 'date': ds.date}
+                )
+
+            ds = xr.merge([ds, xr.Dataset(new_vars)])
+            # Remove the original categorical column
+            ds = ds.drop_vars(col)
+
+            # Locate the col inside the dynamic features dict, remove and replace.
+            # This is kind of ugly but deals with the 2 level feature dict.
+            if feat_group == 'dynamic':
+                for source, source_features in self.features['dynamic'].items():
+                    if col in source_features:
+                        self.features['dynamic'][source].remove(col)
+                        self.features['dynamic'][source].extend(new_vars.keys())
+            else:
+                self.features[feat_group].remove(col)
+                self.features[feat_group].extend(new_vars.keys())
+        
+        return ds, bitmask_enc
+
+    def _normalize_data(self, ds, feat_group, encoding, scale=None):
         """
         Normalize the input data using log normalization for specified variables and standard normalization for others.
         
@@ -320,22 +404,30 @@ class TAPDataset(Dataset):
             ds: the input xarray dataset after normalization
             scale: A dictionary containing the 'offset', 'scale', and 'log_norm' for each variable.
         """
-
         if scale is None:
-            # Initialize
-            scale = {k: {'log_norm': False} for k in ds.data_vars}
-        
             # Subset the dataset to the training time period
-            training_ds = ds.sel(date=slice(None, self.cfg['split_time']))
+            if feat_group == 'dynamic':
+                training_ds = ds.sel(date=slice(None, self.cfg['split_time']))
+            else:
+                training_ds = ds
+
+            # Initialize
+            scale = {k: {'encoded': False,
+                         'log_norm': False,
+                         'offset': 0,
+                         'scale': 1} for k in ds.data_vars}
         
             # Iterate over each variable in the dataset and calculate scaler
             for var in ds.data_vars:
-                if var in self.cfg.get('log_norm_cols',[]):
+                if var in encoding['encoded_columns']:
+                    # One-hot encoded columns don't need normalization
+                    scale[var]['encoded'] = True
+                
+                elif var in self.cfg.get('log_norm_cols',[]):
                     # Log normalization
                     scale[var]['log_norm'] = True
                     x = training_ds[var] + self.log_pad
-                    scale[var]['offset'] = np.nanmean(np.log(x))    
-                    scale[var]['scale'] = 1
+                    scale[var]['offset'] = np.nanmean(np.log(x))
                     
                 elif var in self.cfg.get('range_norm_cols',[]):
                     # Min-max scaling
@@ -351,10 +443,11 @@ class TAPDataset(Dataset):
 
         for var in ds.data_vars:
             scl = scale[var]
-            if scl['log_norm']:
+            if scl['encoded']:
+                continue
+            elif scl['log_norm']:
                 ds[var] = np.log(ds[var] + self.log_pad) - scl['offset']
             else:
-                #minmax works just the same after calculating scale and offset.
                 ds[var] = (ds[var] - scl['offset']) / scl['scale']
 
         return ds, scale
@@ -374,9 +467,9 @@ class TAPDataset(Dataset):
         for i in range(len(self.target)):
             # Retrieve the normalization parameters for the target variable
             target = self.target[i]
-            offset = self.scale[target]['offset']
-            scale = self.scale[target]['scale']
-            log_norm = self.scale[target]['log_norm']
+            offset = self.d_scale[target]['offset']
+            scale = self.d_scale[target]['scale']
+            log_norm = self.d_scale[target]['log_norm']
 
             # Reverse the normalization process using .at and .set
             if log_norm:
@@ -511,7 +604,7 @@ class TAPDataset(Dataset):
     def get_data_hash(self):
         cfg_keys = ['data_dir', 'features', 'exclude_target_from_index', 
                     'time_slice', 'split_time', 'add_rolling_means', 
-                    'log_norm_cols', 'categorical_cols', 'range_norm_cols',
+                    'log_norm_cols', 'categorical_cols', 'bitmask_cols', 'range_norm_cols',
                     'clip_feature_range']
         data_config = {k: self.cfg.get(k) for k in cfg_keys}
         data_config['basins'] = self.all_basins

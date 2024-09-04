@@ -14,7 +14,7 @@ from pathlib import Path
 import pickle
 
 from config import *
-from data import TAPDataset, TAPDataLoader
+from data import HydroDataset, HydroDataLoader
 from train import Trainer, load_last_state
 from evaluate import *
 
@@ -27,9 +27,9 @@ def load_model(run_dir):
 
 def start_training(config_yml):
     cfg, _ = read_config(config_yml)
-    dataset = TAPDataset(cfg) 
+    dataset = HydroDataset(cfg) 
     cfg = set_model_data_args(cfg, dataset)
-    dataloader = TAPDataLoader(cfg, dataset)
+    dataloader = HydroDataLoader(cfg, dataset)
     trainer = Trainer(cfg, dataloader, log_parent=config_yml.parent)
     trainer.start_training()
 
@@ -37,8 +37,8 @@ def start_training(config_yml):
 
 def continue_training(run_dir):
     cfg, _, _ = load_model(run_dir)
-    dataset = TAPDataset(cfg) 
-    dataloader = TAPDataLoader(cfg, dataset)
+    dataset = HydroDataset(cfg) 
+    dataloader = HydroDataLoader(cfg, dataset)
     trainer = Trainer(cfg, dataloader, continue_from=run_dir)
     trainer.start_training()
 
@@ -57,8 +57,8 @@ def finetune(finetune_yml:Path):
     # Insert these params directly.
     cfg.update(finetune.get('config_update',{}))
 
-    dataset = TAPDataset(cfg) 
-    dataloader = TAPDataLoader(cfg, dataset)
+    dataset = HydroDataset(cfg) 
+    dataloader = HydroDataLoader(cfg, dataset)
     trainer = Trainer(cfg, dataloader, log_parent=finetune_yml.parent, continue_from=run_dir)
     trainer.start_training()
 
@@ -72,10 +72,10 @@ def hyperparam_grid_search(config_yml:Path, idx, k=None):
     for i in range(k):
         cfg['test_basin_file'] = f"metadata/site_lists/k_folds/test_{i}_{k}.txt"
         cfg['train_basin_file'] = f"metadata/site_lists/k_folds/train_{i}_{k}.txt"
-        dataset = TAPDataset(cfg) 
+        dataset = HydroDataset(cfg) 
 
         cfg = set_model_data_args(cfg, dataset)
-        dataloader = TAPDataLoader(cfg, dataset)
+        dataloader = HydroDataLoader(cfg, dataset)
         
         log_dir = config_yml.parent / f"index_{idx}" / f"fold_{i}"
         if log_dir.is_dir():
@@ -119,9 +119,9 @@ def make_plots(cfg, results, bulk_metrics, basin_metrics, data_subset, log_dir):
 def eval_model(cfg, model, dataset, log_dir, plots=True):
     def eval_subset(data_subset):
         dataset.update_indices(data_subset)
-        dataloader = TAPDataLoader(cfg, dataset)
+        dataloader = HydroDataLoader(cfg, dataset)
 
-        results = predict(model, dataloader, quiet=cfg.get('quiet',True), denormalize=True)
+        results = predict(model, dataloader, return_dt=True, quiet=cfg.get('quiet',True), denormalize=True)
         bulk_metrics = get_all_metrics(results)
         basin_metrics = get_basin_metrics(results)
     
@@ -152,7 +152,7 @@ def main(args):
     elif args.test:
         run_dir = Path(args.test).resolve()
         cfg, model, _ = load_model(run_dir)
-        dataset = TAPDataset(cfg) 
+        dataset = HydroDataset(cfg) 
     eval_model(cfg, model, dataset, run_dir)
 
 if __name__ == '__main__':
