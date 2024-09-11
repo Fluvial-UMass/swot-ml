@@ -2,7 +2,6 @@ data/
 logs/
 runs/
 
-!runs/example_config.yml
 
 # OSX / *nix default autosave extension
 *.m~

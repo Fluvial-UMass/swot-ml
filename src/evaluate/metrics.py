@@ -32,11 +32,10 @@ def get_basin_metrics(df, disp=False):
 
 def get_all_metrics(df:pd.DataFrame, disp=False):
     metrics = {}
-    dt_mask = (df['dt']==0).all(axis=1)
     
     for feature in df['obs'].columns:
-        y = df.loc[dt_mask, ('obs', feature)]
-        y_hat = df.loc[dt_mask, ('pred', feature)]
+        y = df[('obs', feature)]
+        y_hat = df[('pred', feature)]
 
         metrics[feature] = {
             'num_obs': np.sum(~np.isnan(y)),
@@ -76,7 +75,7 @@ def mask_nan(func):
 
 @mask_nan
 def calc_nbias(y, y_hat):
-    mean_y = np.mean(y) + log_pad
+    mean_y = np.mean(y)
     return np.nanmean((y - y_hat) / mean_y)
 
 @mask_nan
@@ -85,7 +84,7 @@ def calc_mae(y, y_hat):
 
 @mask_nan
 def calc_rel_err(y, y_hat):
-    exponent = np.median(np.abs(np.log10(y_hat / (y+log_pad))))
+    exponent = np.median(np.abs(np.log10(y_hat / y)))
     return (10 ** exponent) - 1
 
 @mask_nan

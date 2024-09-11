@@ -64,11 +64,11 @@ def finetune(finetune_yml:Path):
 
     return cfg, trainer.model, trainer.log_dir, dataset
 
-def hyperparam_grid_search(config_yml:Path, idx, k=None):
+def hyperparam_grid_search(config_yml:Path, idx, k_folds=None):
     cfg, _ = read_config(config_yml)
     cfg = update_cfg_from_grid(cfg, idx)
 
-    k_folds = 4 if k_folds is None else k_folds
+    k = 4 if k_folds is None else k_folds
     for i in range(k):
         cfg['test_basin_file'] = f"metadata/site_lists/k_folds/test_{i}_{k}.txt"
         cfg['train_basin_file'] = f"metadata/site_lists/k_folds/train_{i}_{k}.txt"
@@ -113,7 +113,7 @@ def make_plots(cfg, results, bulk_metrics, basin_metrics, data_subset, log_dir):
     }
     figs = basin_metric_histograms(basin_metrics, metric_args)
     for target, fig in figs.items():
-        fig.savefig(fig_dir / f"{target}_metrics_hist_.png",  dpi=300)
+        fig.savefig(fig_dir / f"{target}_metrics_hist.png",  dpi=300)
 
 
 def eval_model(cfg, model, dataset, log_dir, plots=True):
@@ -122,14 +122,16 @@ def eval_model(cfg, model, dataset, log_dir, plots=True):
         dataloader = HydroDataLoader(cfg, dataset)
 
         results = predict(model, dataloader, return_dt=True, quiet=cfg.get('quiet',True), denormalize=True)
-        bulk_metrics = get_all_metrics(results)
-        basin_metrics = get_basin_metrics(results)
+        dt_mask = (results['dt']<=16).all(axis=1)
+
+        bulk_metrics = get_all_metrics(results[dt_mask])
+        basin_metrics = get_basin_metrics(results[dt_mask])
     
         with open(log_dir / f"{data_subset}_data.pkl", 'wb') as f:
             pickle.dump((results, bulk_metrics, basin_metrics), f)
 
         if plots:
-            make_plots(cfg, results, bulk_metrics, basin_metrics, data_subset, log_dir) 
+            make_plots(cfg, results[dt_mask], bulk_metrics, basin_metrics, data_subset, log_dir) 
 
     eval_subset('test')
     # eval_subset('train')
