@@ -8,9 +8,9 @@ config_path=""
 # Parse named arguments
 while [[ "$#" -gt 0 ]]; do
   case $1 in
-    --train|--continue|--finetune|--test)
+    --train|--continue|--finetune|--test|--plot)
       if [[ -n "$flag" ]]; then
-          echo "Error: Cannot specify multiple modes (--train, --continue, --finetune, --test)."
+          echo "Error: Cannot specify multiple modes (--train, --continue, --finetune, --test, --plot)."
           exit 1
       fi
       flag="$1"
@@ -55,7 +55,7 @@ process_and_submit() {
 if [ -d "$config_path" ]; then
   # Next we need to scan and submit directories and yml files differently.
   case $flag in
-    --continue|--test)
+    --continue|--test|--plot)
       subdirs=($(find "$config_path" -mindepth 1 -maxdepth 1 -type d -not -name '_*'))
       process_and_submit "${subdirs[@]}"
       ;;

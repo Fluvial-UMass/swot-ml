@@ -13,21 +13,42 @@ class FlexibleHybrid(eqx.Module):
     head: eqx.nn.Linear
     target: list
 
-    def __init__(self, *, target, dynamic_sizes, static_size, hidden_size, num_layers, num_heads, seed, dropout):
+    def __init__(self, *, 
+                 target: list, 
+                 dynamic_sizes: dict, 
+                 static_size: int, 
+                 hidden_size: int, 
+                 num_layers: int, 
+                 num_heads: int, 
+                 seed: int, 
+                 dropout: float,
+                 time_aware: dict = {}):
         key = jax.random.PRNGKey(seed)
         keys = jax.random.split(key, 5) 
+
+        # Encoder for static data if used.
+        entity_aware = static_size>0
+        if entity_aware:
+            self.static_embedder = StaticEmbedder(static_size, hidden_size, dropout, keys[1])
+            static_size = hidden_size
+        else:
+            self.static_embedder = None
+            static_size = 0
 
         # Encoders for each dynamic data source.
         encoder_keys = jax.random.split(keys[0], len(dynamic_sizes))
         self.encoders = {}
         for (var_name, var_size), var_key in zip(dynamic_sizes.items(), encoder_keys):
-            self.encoders[var_name] = TEALSTM(var_size, hidden_size, hidden_size, None, dropout, return_all=True, key=var_key)
-
-        # Encoder for static data if used.
-        if static_size>0:
-            self.static_embedder = StaticEmbedder(static_size, hidden_size, dropout, keys[1])
-        else:
-            self.static_embedder = None
+            self.encoders[var_name] = TEALSTM(
+                dynamic_in_size = var_size, 
+                static_in_size = static_size, 
+                hidden_size = hidden_size, 
+                dense_size = None, 
+                dropout = dropout, 
+                time_aware = time_aware[var_name],
+                return_all=True, 
+                key=var_key
+            )
         
         # Cross-attn or Self-attn decoders. 
         self.decoders = {}
@@ -36,9 +57,9 @@ class FlexibleHybrid(eqx.Module):
         # Set up each cross-attention decoder
         if len(cross_vars) > 0:
             for var_name, var_key in zip(cross_vars, decoder_keys):
-                self.decoders[var_name] = CrossAttnDecoder(hidden_size, hidden_size, num_layers, num_heads, dropout, var_key)
+                self.decoders[var_name] = CrossAttnDecoder(hidden_size, hidden_size, num_layers, num_heads, dropout, entity_aware, var_key)
         else:
-            self.decoders['self'] = CrossAttnDecoder(hidden_size, hidden_size, num_layers, num_heads, dropout, var_key)
+            self.decoders['self'] = CrossAttnDecoder(hidden_size, hidden_size, num_layers, num_heads, dropout, entity_aware, var_key)
 
         self.head = eqx.nn.Linear(in_features = hidden_size*len(self.decoders), 
                                   out_features = len(target), 
@@ -52,10 +73,10 @@ class FlexibleHybrid(eqx.Module):
         if self.static_embedder:
             static_bias = self.static_embedder(data['static'], keys[1])
         else:
-            static_bias = 0
+            static_bias = None
 
         # Encoders
-        encoder_keys = jax.random.split(keys[0],len(self.encoders))
+        encoder_keys = jax.random.split(keys[0], len(self.encoders))
         encoded_data = {}
         masks = {}
         for (var_name, encoder), e_key in zip(self.encoders.items(), encoder_keys):

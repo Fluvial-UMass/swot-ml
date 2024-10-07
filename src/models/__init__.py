@@ -1,32 +1,28 @@
 import jax
 import equinox as eqx
 
-from importlib import reload
-import models.tft
-reload(models.tft)
-
-from models.lstm import TAPLSTM
-from models.transformer import EATransformer
-from models.hybrid import Hybrid
+# from models.lstm import TAPLSTM
+# from models.transformer import EATransformer
+# from models.hybrid import Hybrid
 from models.flexible_hybrid import FlexibleHybrid
-from models.tft import TFT
-from models.tft_mha import TFT_MHA
+# from models.tft import TFT
+# from models.tft_mha import TFT_MHA
 
 def make(cfg: dict):
     name = cfg['model'].lower()
     
-    if name == "taplstm":
-        model_fn = TAPLSTM
-    if name == "eatransformer":
-        model_fn = EATransformer
-    elif name == "hybrid":
-        model_fn = Hybrid
-    elif name == "flexible_hybrid":
+    # if name == "taplstm":
+    #     model_fn = TAPLSTM
+    # if name == "eatransformer":
+    #     model_fn = EATransformer
+    # elif name == "hybrid":
+    #     model_fn = Hybrid
+    if name == "flexible_hybrid":
         model_fn = FlexibleHybrid
-    elif name == 'tft':
-        model_fn = TFT
-    elif name == 'tft_mha':
-        model_fn = TFT_MHA
+    # elif name == 'tft':
+    #     model_fn = TFT
+    # elif name == 'tft_mha':
+    #     model_fn = TFT_MHA
     else:
         raise ValueError(f"{cfg['model']} is not a valid model name. Check /src/models/__init__.py for model config.")
 

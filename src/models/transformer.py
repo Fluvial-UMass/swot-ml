@@ -241,10 +241,15 @@ class CrossAttnDecoder(eqx.Module):
                  num_layers: int, 
                  num_heads: int, 
                  dropout: float,
+                 entity_aware: bool,
                  key: jrandom.PRNGKey):
         keys = jrandom.split(key, 3)
 
-        self.head_proj = StaticContextHeadBias(hidden_size, num_heads, dropout, keys[0])
+        if entity_aware:
+            self.head_proj = StaticContextHeadBias(hidden_size, num_heads, dropout, keys[0])
+        else:
+            self.head_proj = None
+
         layer_keys = jrandom.split(keys[1], num=num_layers)
         layer_args = (hidden_size, intermediate_size, num_heads, dropout)
         self.layers = [TransformerLayer(*layer_args, k) for k in layer_keys]
@@ -266,7 +271,10 @@ class CrossAttnDecoder(eqx.Module):
         q = daily_encoded
         k = v = irregular_encoded
 
-        head_bias = self.head_proj(static_encoded, keys[0])
+        if self.head_proj:
+            head_bias = self.head_proj(static_encoded, keys[0])
+        else:
+            head_bias = 0
         
         layer_keys = jrandom.split(keys[1], num=len(self.layers))
         x = (q, k, v)

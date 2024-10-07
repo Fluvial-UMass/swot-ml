@@ -40,9 +40,10 @@ def get_all_metrics(df:pd.DataFrame, disp=False):
         metrics[feature] = {
             'num_obs': np.sum(~np.isnan(y)),
             'R2': mask_nan(skm.r2_score)(y,y_hat),
-            'MAPE': mask_nan(skm.mean_absolute_percentage_error)(y, y_hat),
+            'MAPE': calc_mape(y, y_hat),
             'nBias': calc_nbias(y, y_hat),
             'RE': calc_rel_err(y, y_hat),
+            'RB': calc_rel_bias(y, y_hat),
             'MAE': calc_mae(y, y_hat),
             'RMSE': calc_rmse(y, y_hat),
             'rRMSE': calc_rrmse(y, y_hat),
@@ -74,9 +75,15 @@ def mask_nan(func):
     return wrapper
 
 @mask_nan
+def calc_mape(y, y_hat):
+    skm_mape = skm.mean_absolute_percentage_error(y, y_hat)
+    return skm_mape * 100
+
+@mask_nan
 def calc_nbias(y, y_hat):
+    mean_err = np.mean(y - y_hat)
     mean_y = np.mean(y)
-    return np.nanmean((y - y_hat) / mean_y)
+    return (mean_err / mean_y) * 100
 
 @mask_nan
 def calc_mae(y, y_hat):
@@ -84,8 +91,15 @@ def calc_mae(y, y_hat):
 
 @mask_nan
 def calc_rel_err(y, y_hat):
-    exponent = np.median(np.abs(np.log10(y_hat / y)))
-    return (10 ** exponent) - 1
+    MdALQ = np.median(np.abs(np.log(y_hat / y)))
+    return 100 * (np.exp(MdALQ) - 1)
+
+@mask_nan
+def calc_rel_bias(y, y_hat):
+    MdLQ = np.median(np.log(y_hat / y))
+    sign = np.sign(MdLQ)
+    mag = np.exp(np.abs(MdLQ)) - 1
+    return 100 * sign * mag
 
 @mask_nan
 def calc_rmse(y, y_hat):

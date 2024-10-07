@@ -27,7 +27,7 @@ def format_config(cfg):
     cfg['data_dir'] = data_dir
 
     cfg['time_slice'] = slice(*cfg['time_slice'])
-    cfg['split_time'] = np.datetime64(cfg['split_time'])
+    cfg['split_time'] = np.datetime64(cfg['split_time']) if cfg.get('split_time') else None
 
     cfg['log_norm_cols'] = cfg.get('log_norm_cols',[])
     cfg['clip_feature_range'] = {
@@ -126,6 +126,8 @@ def set_model_data_args(cfg, dataset):
     if model_name in ['flexible_hybrid', 'hybrid']:
         cfg['model_args']['dynamic_sizes'] = {k: len(v) for k, v in dataset.features['dynamic'].items()}
         cfg['model_args']['static_size'] = len(dataset.features['static'])
+        cfg['model_args']['time_aware'] = dataset.time_gaps
+        
 
     # if model_name in ["eatransformer", "fusion"]:
     #     cfg['model_args']['daily_in_size'] = len(dataset.daily_features)

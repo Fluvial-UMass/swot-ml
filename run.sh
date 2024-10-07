@@ -9,9 +9,9 @@ config_path=""
 # Parse named arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        --train|--continue|--finetune|--test)
+        --train|--continue|--finetune|--test|--plot)
             if [[ -n "$flag" ]]; then
-                echo "Error: Cannot specify multiple modes (--train, --continue, --finetune, --test)."
+                echo "Error: Cannot specify multiple modes (--train, --continue, --finetune, --test, --plot)."
                 exit 1
             fi
             flag="$1"
@@ -102,7 +102,7 @@ sbatch_script=$(mktemp)
 cat << EOF > "$sbatch_script"
 #!/bin/bash
 #SBATCH --job-name="${config_parent}_${config_basename}"
-#SBATCH --mem=32G  # Requested Memory
+#SBATCH --mem=16G  # Requested Memory
 #SBATCH -o ${output_dir}/${config_basename}.out
 $(echo -e "$SBATCH_DIRECTIVES")
 
