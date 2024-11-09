@@ -50,7 +50,7 @@ elif [[ "$flag" == "--continue" || "$flag" == "--test" ]]; then
 fi
 
 # Set the partition and runtime args based on partition_name
-n_workers=1
+n_workers=2
 SBATCH_DIRECTIVES=""
 ENVIRONMENT_LINES=""
 case $partition_name in
@@ -62,7 +62,7 @@ case $partition_name in
         ;;
     ceewater)
         SBATCH_DIRECTIVES+="#SBATCH -c $((n_workers+1))\n"
-        SBATCH_DIRECTIVES+="#SBATCH -t 14-00:00:00\n"
+        SBATCH_DIRECTIVES+="#SBATCH -t 7-00:00:00\n"
         SBATCH_DIRECTIVES+="#SBATCH -p ceewater_kandread-cpu\n"
         ENVIRONMENT_LINES+="export JAX_PLATFORMS=cpu\n"
         ;;
@@ -70,17 +70,20 @@ case $partition_name in
         SBATCH_DIRECTIVES+="#SBATCH -c $n_workers\n"
         SBATCH_DIRECTIVES+="#SBATCH -t 1-00:00:00\n"
         SBATCH_DIRECTIVES+="#SBATCH -p gpu\n"
-        SBATCH_DIRECTIVES+="#SBATCH --gpus=2080ti:1\n"
-        ENVIRONMENT_LINES+="module load cuda/12.4.0\n"
-        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_MEM_FRACTION=0.7\n"
+        SBATCH_DIRECTIVES+="#SBATCH --gpus=1\n"
+        SBATCH_DIRECTIVES+="#SBATCH --constraint=sm_61&vram11\n"
+        ENVIRONMENT_LINES+="module load cuda/12.6\n"
+        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_MEM_FRACTION=0.8\n"
         ;;
     gpu-long)
         SBATCH_DIRECTIVES+="#SBATCH -c $n_workers\n"
         SBATCH_DIRECTIVES+="#SBATCH -t 14-00:00:00\n"
-        SBATCH_DIRECTIVES+="#SBATCH -p gpu-long\n"
-        SBATCH_DIRECTIVES+="#SBATCH --gpus=2080ti:1\n"
-        ENVIRONMENT_LINES+="module load cuda/12.4.0\n"
-        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_MEM_FRACTION=0.7\n"
+        SBATCH_DIRECTIVES+="#SBATCH -p gpu\n"
+        SBATCH_DIRECTIVES+="#SBATCH -q long\n"
+        SBATCH_DIRECTIVES+="#SBATCH --gpus=1\n"
+        SBATCH_DIRECTIVES+="#SBATCH --constraint=sm_61&vram11\n"
+        ENVIRONMENT_LINES+="module load cuda/12.6\n"
+        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_MEM_FRACTION=0.8\n"
         ;;
     *)
         echo "Unknown partition type: $partition_name"
@@ -102,11 +105,11 @@ sbatch_script=$(mktemp)
 cat << EOF > "$sbatch_script"
 #!/bin/bash
 #SBATCH --job-name="${config_parent}_${config_basename}"
-#SBATCH --mem=16G  # Requested Memory
+#SBATCH --mem=32G  # Requested Memory
 #SBATCH -o ${output_dir}/${config_basename}.out
 $(echo -e "$SBATCH_DIRECTIVES")
 
-module load miniconda/22.11.1-1
+module load conda/latest
 conda activate tss-ml
 
 $(echo -e "$ENVIRONMENT_LINES")

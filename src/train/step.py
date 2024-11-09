@@ -60,25 +60,25 @@ def compute_loss(diff_model, static_model, data, keys, denormalize_fn, loss_name
         raise ValueError("Invalid loss function name.")  
   
     vectorized_loss_fn = jax.vmap(loss_fn, in_axes=(1, 1, 1))
-    target_losses = vectorized_loss_fn(masked_y, masked_y_pred, valid_mask)
+    raw_losses = vectorized_loss_fn(masked_y, masked_y_pred, valid_mask)
 
     # Exclude any nan target losses from average.
-    valid_target_loss = ~jnp.isnan(target_losses)
-    target_losses = jnp.where(valid_target_loss, target_losses, 0)
-    target_weights = valid_target_loss * jnp.array(target_weights)
+    valid_loss = ~jnp.isnan(raw_losses)
+    target_losses = jnp.where(valid_loss, raw_losses, 0)
+    target_weights = valid_loss * jnp.array(target_weights)
     
     loss = jnp.average(target_losses, weights=target_weights)
 
     # Debugging
     def print_func(operand):
         y, y_pred = operand
-        jax.debug.print("y: {a}\ny_pred: {b}", a=y, b=y_pred)
+        jax.debug.print("y: {a}\ny_pred: {b}\nraw losses: {c}\nweights: {d}\nweighted losses: {e}", a=y, b=y_pred, c=raw_losses, d=target_weights, e=loss)
         return None
     jax.lax.cond(jnp.isnan(loss),
                  print_func,
                  lambda *args: None,
                  operand=(y, y_pred))
-    # Debugging 
+    # Debugging
 
     if agreement_weight>0:
         y_pred_denorm = denormalize_fn(y_pred)

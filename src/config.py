@@ -37,7 +37,7 @@ def format_config(cfg):
 
     # Create the target_weights list from the dict
     cfg['step_kwargs']['target_weights'] = [
-        cfg['step_kwargs']['target_weights'].get(target, 1) 
+        cfg['step_kwargs'].get('target_weights',{}).get(target, 1) 
         for target in cfg['features']['target']
     ]
 
@@ -123,7 +123,8 @@ def set_model_data_args(cfg, dataset):
     cfg['model_args']['target'] = target
     
     model_name = cfg['model'].lower()
-    if model_name in ['flexible_hybrid', 'hybrid']:
+    if model_name in ['flexible_hybrid', 'hybrid', 'lstm_mlp_attn']:
+        cfg['model_args']['seq_length'] = cfg['sequence_length']
         cfg['model_args']['dynamic_sizes'] = {k: len(v) for k, v in dataset.features['dynamic'].items()}
         cfg['model_args']['static_size'] = len(dataset.features['static'])
         cfg['model_args']['time_aware'] = dataset.time_gaps

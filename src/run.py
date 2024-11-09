@@ -106,7 +106,7 @@ def make_all_plots(cfg, results, bulk_metrics, basin_metrics, data_subset, log_d
 
     metric_args = {
         'R2': {'range':[-1,1]},
-        'nBias':{'range':[-1,1]},
+        'nBias':{'range':[-100,100]},
         'rRMSE':{'range':[0,500]},
         'KGE':{'range':[-1,1]},
         'NSE':{'range':[-4,1]},
@@ -118,18 +118,17 @@ def make_all_plots(cfg, results, bulk_metrics, basin_metrics, data_subset, log_d
 
 
 def eval_model(cfg, model, dataset, log_dir, dt_max=16, run_test=True, run_predict=True, make_plots=True):
-
     def eval_data_subset(data_subset, run_eval, make_plots):
         results_file = log_dir / f"{data_subset}_data.pkl"
         if run_eval:
+            dataset.cfg['exclude_target_from_index'] = None
             dataset.update_indices(data_subset)
             dataloader = HydroDataLoader(cfg, dataset)
 
             results = predict(model, dataloader, return_dt=True, quiet=cfg.get('quiet',True), denormalize=True)
-            dt_mask = (results['dt']<=dt_max).all(axis=1)
 
-            bulk_metrics = get_all_metrics(results[dt_mask])
-            basin_metrics = get_basin_metrics(results[dt_mask])
+            bulk_metrics = get_all_metrics(results)
+            basin_metrics = get_basin_metrics(results)
         
             with open(results_file, 'wb') as f:
                 pickle.dump((results, bulk_metrics, basin_metrics), f)
@@ -142,11 +141,11 @@ def eval_model(cfg, model, dataset, log_dir, dt_max=16, run_test=True, run_predi
             raise ValueError("Plot only option '--plot' requires prediction data already saved. Try '--test' which will run the model and then plot.")
         
         if make_plots:
-            dt_mask = (results['dt']<=dt_max).all(axis=1)
-            make_all_plots(cfg, results[dt_mask], bulk_metrics, basin_metrics, data_subset, log_dir) 
+            make_all_plots(cfg, results, bulk_metrics, basin_metrics, data_subset, log_dir) 
 
     eval_data_subset('test', run_test, make_plots)
     eval_data_subset('predict', run_predict, False)
+    eval_data_subset('train', run_predict, make_plots)    
      
 
 def main(args):

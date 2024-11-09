@@ -44,6 +44,8 @@ def get_all_metrics(df:pd.DataFrame, disp=False):
             'nBias': calc_nbias(y, y_hat),
             'RE': calc_rel_err(y, y_hat),
             'RB': calc_rel_bias(y, y_hat),
+            'qRE': calc_q_rel_err(y, y_hat),
+            'qnBias': calc_q_nbias(y, y_hat),
             'MAE': calc_mae(y, y_hat),
             'RMSE': calc_rmse(y, y_hat),
             'rRMSE': calc_rrmse(y, y_hat),
@@ -65,7 +67,8 @@ def get_all_metrics(df:pd.DataFrame, disp=False):
 
 def mask_nan(func):
     def wrapper(y, y_hat, *args, **kwargs):
-        mask = (~np.isnan(y)) & (~np.isnan(y_hat))
+        mask = (y>log_pad) & (y_hat>log_pad)
+        # mask = (~np.isnan(y)) & (~np.isnan(y_hat))
         if np.sum(mask)>1:
             y_masked = y[mask]
             y_hat_masked = y_hat[mask]
@@ -81,9 +84,8 @@ def calc_mape(y, y_hat):
 
 @mask_nan
 def calc_nbias(y, y_hat):
-    mean_err = np.mean(y - y_hat)
-    mean_y = np.mean(y)
-    return (mean_err / mean_y) * 100
+    nBias = np.median((y_hat - y) / y)
+    return nBias * 100
 
 @mask_nan
 def calc_mae(y, y_hat):
@@ -100,6 +102,17 @@ def calc_rel_bias(y, y_hat):
     sign = np.sign(MdLQ)
     mag = np.exp(np.abs(MdLQ)) - 1
     return 100 * sign * mag
+
+@mask_nan
+def calc_q_rel_err(y, y_hat):
+    qALQ = np.quantile(np.abs(np.log(y_hat / y)),[0.25,0.5,0.75])
+    return 100 * (np.exp(qALQ) - 1)
+
+@mask_nan
+def calc_q_nbias(y, y_hat):
+    nBias = (y_hat - y) / y
+    q_nBias = np.quantile(nBias,[0.25,0.5,0.75])
+    return q_nBias * 100
 
 @mask_nan
 def calc_rmse(y, y_hat):

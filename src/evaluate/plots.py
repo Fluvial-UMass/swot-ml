@@ -17,7 +17,8 @@ def mosaic_scatter(cfg, results, metrics, title_str):
         log_min = np.log10(min_val)
         log_max = np.log10(max_val)
 
-        hb = ax.hexbin(x, y, gridsize=(30,20), bins='log', mincnt=5, 
+        hb = ax.hexbin(x, y, gridsize=(30,20), bins='log', mincnt=5,
+                    linewidth=0.2,
                     extent=(log_min, log_max, log_min, log_max),
                     xscale='log', yscale='log')
         plt.colorbar(hb, shrink=0.3, aspect=10, anchor=(-1,-0.55))
@@ -35,7 +36,7 @@ def mosaic_scatter(cfg, results, metrics, title_str):
         ax.axis('square')
         ax.set_xlim(min_val, max_val)
         ax.set_ylim(min_val, max_val)
-        ax.set_title(f"{target} (n {len(x)})")
+        ax.set_title(f"{target} (n {len(x):,})")
         ax.set_xlabel(f'Observed')
         ax.set_ylabel(f'Predicted')
 

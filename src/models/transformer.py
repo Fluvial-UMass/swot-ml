@@ -86,6 +86,15 @@ class DynamicEmbedder(eqx.Module):
         pos_encoding = pos_encoding.at[:, 0::2].set(jnp.sin(angle_rads))
         pos_encoding = pos_encoding.at[:, 1::2].set(jnp.cos(angle_rads))
         return pos_encoding
+    
+def _create_time_encoding(hidden_size: int, seq_len: int) -> jnp.ndarray:
+        """Generates time encodings based on position."""
+        position = jnp.arange(seq_len)[:, None]
+        div_term = jnp.exp(jnp.arange(0, hidden_size, 2) * -(jnp.log(10000.0) / hidden_size))
+        time_encoding = jnp.zeros((seq_len, hidden_size))
+        time_encoding = time_encoding.at[:, 0::2].set(jnp.sin(position * div_term))
+        time_encoding = time_encoding.at[:, 1::2].set(jnp.cos(position * div_term))
+        return time_encoding
 
 class AttentionBlock(eqx.Module):
     """
@@ -117,6 +126,7 @@ class AttentionBlock(eqx.Module):
             q, k, v = inputs
         else:
             q = k = v = inputs
+
 
         def process_heads(q_h, k_h, v_h):
             q_h += static_bias
@@ -193,7 +203,7 @@ class SelfAttnEncoder(eqx.Module):
     layers: List[TransformerLayer]
 
     def __init__(self,
-                 seq_length: int,
+                 seq_len: int,
                  dynamic_size: int,
                  hidden_size: int, 
                  intermediate_size: int, 
@@ -204,7 +214,7 @@ class SelfAttnEncoder(eqx.Module):
         keys = jrandom.split(key, num=3)
 
         self.head_proj = StaticContextHeadBias(hidden_size, num_heads, dropout, keys[0])
-        self.embedder = DynamicEmbedder(seq_length, dynamic_size, hidden_size, dropout, keys[0])
+        self.embedder = DynamicEmbedder(seq_len, dynamic_size, hidden_size, dropout, keys[0])
         
         layer_keys = jrandom.split(keys[1], num=num_layers)
         layer_args = (hidden_size, intermediate_size, num_heads, dropout)
@@ -233,9 +243,11 @@ class SelfAttnEncoder(eqx.Module):
 class CrossAttnDecoder(eqx.Module):
     head_proj: StaticContextHeadBias
     layers: List[TransformerLayer]
+    time_encoding: jnp.ndarray
     pooler: eqx.nn.Linear
 
     def __init__(self,
+                 seq_len: int,
                  hidden_size: int, 
                  intermediate_size: int, 
                  num_layers: int, 
@@ -253,7 +265,7 @@ class CrossAttnDecoder(eqx.Module):
         layer_keys = jrandom.split(keys[1], num=num_layers)
         layer_args = (hidden_size, intermediate_size, num_heads, dropout)
         self.layers = [TransformerLayer(*layer_args, k) for k in layer_keys]
-        
+        self.time_encoding = _create_time_encoding(hidden_size, seq_len)
         self.pooler = eqx.nn.Linear(in_features=hidden_size, out_features=hidden_size, key=keys[2])
 
     def __call__(self, 
@@ -268,8 +280,9 @@ class CrossAttnDecoder(eqx.Module):
             # For cross attn, mask keys/values where they are invalid.
             mask = jnp.tile(mask, (irregular_encoded.shape[0], 1))
 
-        q = daily_encoded
-        k = v = irregular_encoded
+        q = daily_encoded + self.time_encoding
+        k = irregular_encoded + self.time_encoding
+        v = irregular_encoded
 
         if self.head_proj:
             head_bias = self.head_proj(static_encoded, keys[0])
@@ -316,7 +329,7 @@ class EATransformer(eqx.Module):
         static_args = (hidden_size, intermediate_size, num_layers, num_heads, dropout) 
         self.d_encoder = SelfAttnEncoder(seq_length, daily_in_size, *static_args, keys[1])
         self.i_encoder = SelfAttnEncoder(seq_length, irregular_in_size, *static_args, keys[2])
-        self.decoder = CrossAttnDecoder(*static_args, keys[3])
+        self.decoder = CrossAttnDecoder(seq_length, *static_args, keys[3])
         self.head = eqx.nn.Linear(in_features=hidden_size, out_features=len(target), key=keys[4])
         self.target = target
 

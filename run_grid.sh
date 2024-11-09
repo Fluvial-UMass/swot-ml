@@ -9,7 +9,7 @@
 #SBATCH --constraint=sm_61&vram11
 #SBATCH --mem=16G
 
-module load miniconda/22.11.1-1
+module load conda/latest
 conda activate tss-ml
 
 module load cuda/12.4.0

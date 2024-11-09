@@ -1,6 +1,6 @@
 jax
 equinox
-torch
+pytorch::pytorch
 scikit-learn
 notebook
 optax
@@ -13,3 +13,6 @@ xarray
 netcdf4
 ipympl
 tqdm
+matplotlib
+numpy
+exactextract

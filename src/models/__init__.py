@@ -7,6 +7,7 @@ import equinox as eqx
 from models.flexible_hybrid import FlexibleHybrid
 # from models.tft import TFT
 # from models.tft_mha import TFT_MHA
+from models.lstm_mlp_attn import LSTM_MLP_ATTN
 
 def make(cfg: dict):
     name = cfg['model'].lower()
@@ -23,6 +24,8 @@ def make(cfg: dict):
     #     model_fn = TFT
     # elif name == 'tft_mha':
     #     model_fn = TFT_MHA
+    elif name == "lstm_mlp_attn":
+        model_fn = LSTM_MLP_ATTN
     else:
         raise ValueError(f"{cfg['model']} is not a valid model name. Check /src/models/__init__.py for model config.")
 
