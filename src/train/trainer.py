@@ -234,7 +234,11 @@ class Trainer:
         os.makedirs(save_dir, exist_ok=True)
             
         with open(save_dir / "model.eqx", "wb") as f:
-            model_args_str = json.dumps(self.cfg['model_args'])
+            model_args = self.cfg['model_args']
+            if isinstance(model_args.get('graph_matrix'), np.ndarray):
+                model_args['graph_matrix'] = model_args['graph_matrix'].tolist()
+
+            model_args_str = json.dumps(model_args)
             f.write((model_args_str + "\n").encode())
             eqx.tree_serialise_leaves(f, self.model)
 
@@ -291,7 +295,17 @@ def load_state(state_dir, cfg=None):
     
     with open(state_dir / "model.eqx", "rb") as f:
         model_args = json.loads(f.readline().decode())
+        if 'graph_matrix' in model_args.keys():
+            model_args['graph_matrix'] = np.array(model_args['graph_matrix'])
+        cfg['model_args'] = model_args
+
         serialized_model = models.make(cfg)
+        # Ensure all leaves are jnp float 32s.
+        # Bandaid for some poorly specified graph adjacency matrices
+        serialized_model = jax.tree_util.tree_map(
+            lambda x: jnp.array(x) if isinstance(x, np.ndarray) else x,
+            serialized_model
+        )
         model = eqx.tree_deserialise_leaves(f, serialized_model)
     
     with open(state_dir / "state.eqx", "rb") as f:

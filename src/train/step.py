@@ -45,7 +45,7 @@ def compute_loss(diff_model, static_model, data, keys, denormalize_fn, loss_name
     model = eqx.combine(diff_model, static_model)
     y_pred = jax.vmap(model)(data, keys)
 
-    y = data['y'][:,-1,:]
+    y = data['y'][:,-1,...] # End of time dimension
     valid_mask = ~jnp.isnan(y)
     masked_y = jnp.where(valid_mask, y, 0)
     masked_y_pred = jnp.where(valid_mask, y_pred, 0)
@@ -59,7 +59,7 @@ def compute_loss(diff_model, static_model, data, keys, denormalize_fn, loss_name
     else:
         raise ValueError("Invalid loss function name.")  
   
-    vectorized_loss_fn = jax.vmap(loss_fn, in_axes=(1, 1, 1))
+    vectorized_loss_fn = jax.vmap(loss_fn, in_axes=(-1, -1, -1))
     raw_losses = vectorized_loss_fn(masked_y, masked_y_pred, valid_mask)
 
     # Exclude any nan target losses from average.

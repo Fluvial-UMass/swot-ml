@@ -128,7 +128,11 @@ def set_model_data_args(cfg, dataset):
         cfg['model_args']['dynamic_sizes'] = {k: len(v) for k, v in dataset.features['dynamic'].items()}
         cfg['model_args']['static_size'] = len(dataset.features['static'])
         cfg['model_args']['time_aware'] = dataset.time_gaps
-        
+    
+    elif model_name == 'graph_lstm':
+        cfg['model_args']['dynamic_size'] = len(dataset.features['dynamic']['era5'])
+        cfg['model_args']['static_size'] = len(dataset.features['static'])
+        cfg['model_args']['graph_matrix'] = dataset.graph_matrix
 
     # if model_name in ["eatransformer", "fusion"]:
     #     cfg['model_args']['daily_in_size'] = len(dataset.daily_features)
