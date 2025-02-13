@@ -1,0 +1,214 @@
+# ┌────────────────────────────────┐ #
+# │             GRID               │ #
+# └────────────────────────────────┘ #
+# A full list of combinations of these parameters is constructed in config.py.
+# Calling run.py with --grid_index option will invoke one of these combinations.
+# These values will overwrite anything in the 'standard' config below. 
+# See the implementation in hyperparam_grid_search method in run.py. 
+param_search_dict:
+    sequence_length: [30, 90, 365]
+    initial_lr: [0.0001, 0.001, 0.01]
+    model_args:
+        hidden_size: [64, 96, 128]
+        dropout: [0.1, 0.3, 0.5]
+        num_heads: [1, 2, 4, 6]
+        num_layers: [1, 2, 4, 6]
+    step_kwargs:
+        max_grad_norm: [2, 5, 10]
+        agreement_weight: [0.1, 0.5, 1]
+
+
+# ┌────────────────────────────────┐ #
+# │             DATA               │ #
+# └────────────────────────────────┘ #
+# data_dir needs to at least have the following structure:
+# ├── attributes/
+# │   └── attributes.csv
+# └── time_series/
+#     ├── xxxx.nc
+#     └── ... (one .nc file for each site)
+data_dir: "/work/pi_kandread_umass_edu/tss-ml/data/NA_WQP"
+time_series_dir: #default 'time_series'
+attributes_file: #default 'attributes.csv'. Has to be within <data_dir>/attributes/
+
+# Relative to data_dir. A plain text list of sites to use. One site per line.
+train_basin_file: "metadata/site_lists/LLO_sites_train_sites.txt"
+test_basin_file: "metadata/site_lists/LLO_sites_test_sites.txt"
+# basin_file: #optional if both are the same.
+
+# Dictionary of exact column names in the netcdf files
+features:
+    # Daily (or consistent timescale) features in the netcdf files.
+    dynamic:
+        era5:
+            - 'snowmelt_sum'
+            - 'surface_runoff_sum'
+            - 'surface_solar_radiation_downwards_sum'
+            - 'surface_thermal_radiation_downwards_sum'
+            - 'temperature_2m'
+            - 'total_evaporation_sum'
+            - 'total_precipitation_sum'
+        landsat: 
+            - "sat"
+            - "pixel_qa"
+            - "Blue"
+            - "Green"
+            - "Red"
+            - "Nir"
+            - "Swir1"
+            - "Swir2"
+            - "Surface_temp_kelvin"
+            - "pCount_dswe1"
+            - "hue"
+            - "dw"
+    # Static basin parameters from the csv file. If none, all are used.
+    static: 
+        - "pre_mm_syr" # annual average precipitation in sub-basin
+        - "pre_mm_uyr" # annual average precipitation in watershed
+        - "pet_mm_syr" # annual average potential evapotranspiration in sub-basin
+        - "pet_mm_uyr" # annual average potential evapotranspiration in watershed
+        - "aet_mm_syr" # annual average actual evapotranspiration in sub-basin
+        - "aet_mm_uyr" # annual average actual evapotranspiration in watershed
+        - "run_mm_syr" # annual average surface runoff in sub-basin
+        - "ari_ix_sav" # global aridity index in sub-basin
+        - "ari_ix_uav" # global aridity index in watershed
+        - "ele_mt_sav" # elevation in sub-basin
+        - "ele_mt_uav" # average elevation in watershed
+        - "ele_mt_smx" # maximum elevation in watershed
+        - "slp_dg_sav" # average slope of watershed in sub-basin
+        - "slp_dg_uav" # average slope of watershed in watershed
+        - "sgr_dk_sav" # average slope of river in sub-basin
+        - "for_pc_sse" # percent forest cover in sub-basin
+        - "for_pc_use" # percent forest cover in watershed
+        - "crp_pc_sse" # percent cropland extent in sub-basin
+        - "crp_pc_use" # percent cropland extent in watershed
+        - "pst_pc_sse" # percent pasture extent in sub-basin
+        - "pst_pc_use" # percent pasture extent in watershed
+        - "cly_pc_sav" # percent clay soil in sub-basin
+        - "cly_pc_uav" # percent clay soil in watershed
+        - "slt_pc_sav" # percent silt soil in sub-basin
+        - "slt_pc_uav" # percent silt soil in watershed
+        - "snd_pc_sav" # percent sand soil in sub-basin
+        - "snd_pc_uav" # percent sand soil in watershed
+        - "rev_mc_usu" # total reservoir volume in watershed
+        - "dor_pc_pva" # degree of regulation for flow in sub-basin
+        - "lit_cl_smj" # majority lithologic class in watershed
+        - "ero_kh_sav" # annual average soil erosion in sub-basin
+        - "ero_kh_uav" # annual average soil erosion in watershed
+        - "urb_pc_use" # average urban area extent in watershed
+        - "area" # total upstream area
+        - "aspect" # total upstream area divided by smallest bounding circle area
+    target: 
+        - "ssc"
+        - "flux"
+        - "usgs_q"
+    
+# Start and end of join train and test periods
+time_slice: ["1980-01-01", "2022-12-31"]
+
+# When to split train / test. Train is always the first period.
+split_time: "2014-01-01" #Default is no time split. Valid ex. "2014-01-01"
+
+# List of averaging windows which are added to the dynamic feature set.
+add_rolling_means: #Default is none. Valid ex. [7, 30]
+
+log_norm_cols:
+    - "ssc"
+    - "flux"
+    - "usgs_q"
+
+range_norm_cols:
+
+categorical_cols:
+    dynamic:
+        - 'sat'
+    static:
+        - 'lit_cl_smj' # Lithological classes (16 classes)
+
+bitmask_cols:
+    dynamic:
+        - 'pixel_qa'
+    static:
+
+
+clip_feature_range: 
+    ssc: [1, null]
+    flux: [1, null]
+    usgs_q: [1, null]
+
+# ┌────────────────────────────────┐ #
+# │           DataLoader           │ #
+# └────────────────────────────────┘ #
+shuffle: true
+batch_size: 32
+
+# train, or test
+data_subset: "train"
+
+# number of parallel cpus used for data loading
+# 0 is faster than 1 when there are a small number of batches per epoch
+num_workers: 1
+
+# XLA backend: cpu, gpu, or tpu. defaults to gpu if available, then cpu.
+backend:
+
+# Number of backed devices to use. defaults to use all available.
+num_devices: 
+
+# Static memory allocation for batches on device
+pin_memory: false
+
+# Ignores the final batch if it doesn't fit into batch_size
+drop_last: true
+
+# ┌────────────────────────────────┐ #
+# │             Model              │ #
+# └────────────────────────────────┘ #
+model: "lstm_mlp_attn"
+
+sequence_length: 365
+
+# Different for each model type.
+model_args:
+    hidden_size: 96
+    num_layers: 4
+    num_heads: 2
+    dropout: 0.3
+    seed: 0
+    
+# ┌────────────────────────────────┐ #
+# │            Trainer             │ #
+# └────────────────────────────────┘ #
+num_epochs: 50
+
+# Parameters for lr scheduler (https://optax.readthedocs.io/en/latest/api/optimizer_schedules.html#optax.exponential_decay)
+# learning_rate(epoch) = initial_lr * (decay_rate ** (epoch / num_epochs))
+initial_lr: 0.001
+decay_rate: 0.001
+
+# Params passed to model steps during training.
+step_kwargs:
+    # mse, mae, or huber
+    loss: "mse" 
+    # (optional) per-target loss weights. Will be normalized later.
+    target_weights:
+        ssc: 1
+        flux: 1
+        usgs_q: 1
+    # (optional) gradient clipping to this norm
+    max_grad_norm: 5
+    # (optional) Closure regularization weight. Must be training at least ssc, flux, and q
+    agreement_weight: 0.5
+
+# ┌────────────────────────────────┐ #
+# │            Outputs             │ #
+# └────────────────────────────────┘ #
+# Use to declutter the slurm output (mostly disables tqdm output)
+quiet: true
+
+# Whether to log training progress. Really only for testing purposes. 
+log: true
+
+# How frequently (in epochs) to save training progress
+log_interval: 5
+

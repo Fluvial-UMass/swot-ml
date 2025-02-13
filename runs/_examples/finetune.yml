@@ -1,0 +1,25 @@
+# New params for finetuning. 
+
+# If True, the learning rate will start decay transition at finetune start epoch
+# If false, will follow lr schedule based on overall epoch.
+# Note that the LR will increase over the previous LR either way if adding epochs.
+# The other learning rate scheduler parameters can be changed in config_update below.
+#
+# rate_factor = ((epoch - transition_begin) / transition_steps)
+# learning_rate = initial_lr * (decay_rate ** rate_factor)
+reset_lr: True
+
+additional_epochs: 50
+
+# This dict will be directly inserted into the existing config.
+# Only include what you want to change, and not all changes make sense. 
+# Look at the finetune method in run.py for implementation details.
+config_update:
+    exclude_target_from_index: ['ssc','usgs_q']
+    step_kwargs:
+        loss: "mse" 
+        target_weights: [0, 1, 0]
+        max_grad_norm: 2
+    log_interval: 5
+    initial_lr: 0.001
+    decay_rate: 0.001
