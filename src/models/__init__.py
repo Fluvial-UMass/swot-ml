@@ -12,19 +12,8 @@ from models.rg_lstm import Graph_LSTM
 
 def make(cfg: dict):
     name = cfg['model'].lower()
-    
-    # if name == "taplstm":
-    #     model_fn = TAPLSTM
-    # if name == "eatransformer":
-    #     model_fn = EATransformer
-    # elif name == "hybrid":
-    #     model_fn = Hybrid
     if name == "flexible_hybrid":
         model_fn = FlexibleHybrid
-    # elif name == 'tft':
-    #     model_fn = TFT
-    # elif name == 'tft_mha':
-    #     model_fn = TFT_MHA
     elif name == "lstm_mlp_attn":
         model_fn = LSTM_MLP_ATTN
     elif name == 'graph_lstm':

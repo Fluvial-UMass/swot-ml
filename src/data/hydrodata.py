@@ -607,7 +607,6 @@ class HydroDataset(Dataset):
         else:
             self._basin_date_batching(valid_date_mask)
 
-       
         
     def add_smoothed_features(self, ds, window_sizes):
         new_ds = ds.copy()
@@ -627,10 +626,8 @@ class HydroDataset(Dataset):
                     'log_norm_cols', 'categorical_cols', 'bitmask_cols', 'range_norm_cols',
                     'clip_feature_range']
         data_config = {k: self.cfg.get(k) for k in cfg_keys}
-        data_config['basins'] = self.all_basins
+        data_config['basins'] = sorted(self.all_basins)
         data_config['graph_matrix'] = self.graph_matrix
-
-        # print(data_config)
 
         """Generate a SHA256 hash for the contents of the dict."""
         hasher = hashlib.sha256()

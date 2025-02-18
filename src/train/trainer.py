@@ -66,9 +66,11 @@ class Trainer:
 
         self.train_key = jax.random.PRNGKey(cfg['model_args']['seed']+1)
 
+        model_loaded = False
         if continue_from is not None:
-            self.load_last_state(continue_from)
-        else:
+            model_loaded, _ = self.load_last_state(continue_from)
+
+        if not model_loaded:
             self.model = models.make(cfg)
             self.loss_list = []
             self.epoch = 0
@@ -249,17 +251,19 @@ class Trainer:
             eqx.tree_serialise_leaves(f, self.opt_state)
    
     def load_state(self, epoch_dir:Path):
-        cfg, model, trainer_state, opt_state, data = load_state(epoch_dir, self.cfg)
-        
+        model_loaded, load_tuple = load_state(epoch_dir, self.cfg)
+        if not model_loaded:
+            return False, None
+        cfg, model, trainer_state, opt_state, data = load_tuple
         self.model = model
         self.epoch = trainer_state['epoch']
         self.loss_list = trainer_state['loss_list']
         self.opt_state = opt_state
-        return data
+        return True, data
     
     def load_last_state(self, log_dir:Path):
         epoch_dir = _last_epoch_dir(log_dir)
-        self.load_state(epoch_dir)
+        return self.load_state(epoch_dir)
 
     def freeze_components(self, component_names=None, freeze:bool=True):
         # Updates the filterspec to set which parmaters can be updated.
@@ -281,7 +285,11 @@ class Trainer:
                 return True
         self.filter_spec = jtu.tree_map_with_path(diff_filter, self.model) 
 
-def load_state(state_dir, cfg=None):
+def load_state(state_dir: Path, cfg=None):
+    if not isinstance(state_dir, Path) or not state_dir.is_dir():
+        print('Model state directory not found!')
+        return False, None
+
     print(f"Loading model state from {state_dir}")
     if cfg is None:
         cfg_file = state_dir.parent / "config.pkl"
@@ -323,7 +331,7 @@ def load_state(state_dir, cfg=None):
             out = (*out, data)
     else:
         out = (*out, None)
-    return out
+    return True, out
 
 
 def _last_epoch_dir(log_dir):
@@ -331,9 +339,11 @@ def _last_epoch_dir(log_dir):
     dirs = os.listdir(log_dir)
     matches = [epoch_regex.match(d) for d in dirs]
     epoch_strs = [m.group(1) for m in matches if isinstance(m, re.Match)]
-    last_epoch_idx = np.argmax([int(s) for s in epoch_strs])
-    
-    return log_dir / f"epoch{epoch_strs[last_epoch_idx]}"
+    if len(epoch_strs)==0:
+        return None
+    else:
+        last_epoch_idx = np.argmax([int(s) for s in epoch_strs])
+        return log_dir / f"epoch{epoch_strs[last_epoch_idx]}"
     
 def load_last_state(log_dir):
     save_dir = _last_epoch_dir(log_dir)

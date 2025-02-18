@@ -105,7 +105,7 @@ sbatch_script=$(mktemp)
 cat << EOF > "$sbatch_script"
 #!/bin/bash
 #SBATCH --job-name="${config_parent}_${config_basename}"
-#SBATCH --mem=32G  # Requested Memory
+#SBATCH --mem=16G  # Requested Memory
 #SBATCH -o ${output_dir}/${config_basename}.out
 $(echo -e "$SBATCH_DIRECTIVES")
 

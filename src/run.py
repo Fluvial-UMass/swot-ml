@@ -20,6 +20,11 @@ from data import HydroDataset, HydroDataLoader
 from train import Trainer, load_last_state
 from evaluate import *
 
+def cleanup_dl(dl: HydroDataLoader):
+    if dl is None: return
+    if dl._iterator: dl._iterator._shutdown_workers()
+    del dl
+
 def load_model(run_dir):
     state = load_last_state(run_dir)
     cfg = state[0]
@@ -34,17 +39,9 @@ def start_training(config_yml):
     dataloader = HydroDataLoader(cfg, dataset)
     trainer = Trainer(cfg, dataloader, log_parent=config_yml.parent)
     trainer.start_training()
-
+    
+    cleanup_dl(dataloader)
     return cfg, trainer.model, trainer.log_dir, dataset
-
-def continue_training(run_dir):
-    cfg, _, _ = load_model(run_dir)
-    dataset = HydroDataset(cfg) 
-    dataloader = HydroDataLoader(cfg, dataset)
-    trainer = Trainer(cfg, dataloader, continue_from=run_dir)
-    trainer.start_training()
-
-    return cfg, trainer.model, dataset
 
 def finetune(finetune_yml:Path):
     finetune = read_yml(finetune_yml)
@@ -64,6 +61,7 @@ def finetune(finetune_yml:Path):
     trainer = Trainer(cfg, dataloader, log_parent=finetune_yml.parent, continue_from=run_dir)
     trainer.start_training()
 
+    cleanup_dl(dataloader)
     return cfg, trainer.model, trainer.log_dir, dataset
 
 def hyperparam_grid_search(config_yml:Path, idx, k_folds=None):
@@ -72,14 +70,18 @@ def hyperparam_grid_search(config_yml:Path, idx, k_folds=None):
 
     k = 4 if k_folds is None else k_folds
     for i in range(k):
+        log_dir = config_yml.parent / f"index_{idx}" / f"fold_{i}"
+        out_file = log_dir / "test_data.pkl"
+        if out_file.is_file():
+            print(f"Fold {i+1} of {k} was already completed.")
+            continue
+
         cfg['test_basin_file'] = f"metadata/site_lists/k_folds/test_{i}_{k}.txt"
         cfg['train_basin_file'] = f"metadata/site_lists/k_folds/train_{i}_{k}.txt"
         dataset = HydroDataset(cfg) 
-
         cfg = set_model_data_args(cfg, dataset)
         dataloader = HydroDataLoader(cfg, dataset)
         
-        log_dir = config_yml.parent / f"index_{idx}" / f"fold_{i}"
         if log_dir.is_dir():
             trainer = Trainer(cfg, dataloader, continue_from=log_dir)
         else:
@@ -93,9 +95,11 @@ def hyperparam_grid_search(config_yml:Path, idx, k_folds=None):
                 break
 
         # Check if we actually did some training this run.
-        out_file = trainer.log_dir / "test_data.pkl"
         if (start_epoch != trainer.epoch) or (not out_file.is_file()):
             eval_model(cfg, trainer.model, dataset, trainer.log_dir, run_predict=False, run_train=False, make_plots=False)
+        print(f"Fold {i+1} of {k} done!")
+
+        if dataloader: cleanup_dl(dataloader)
 
 def load_prediction_model(run_dir, chunk_idx):
     cfg, model, _ = load_model(run_dir)
@@ -141,23 +145,6 @@ def eval_model(cfg, model, dataset, log_dir,
     """
     Evaluates a model on specified data subsets, calculates metrics, and optionally generates plots.
 
-    Parameters:
-    ----------
-    cfg : dict
-        Configuration dictionary with parameters for the model and evaluation process.
-    model : object
-        The trained model to evaluate.
-    dataset : object
-        The dataset object containing data and methods for creating data subsets.
-    log_dir : Path
-        Path to the directory where results and logs will be saved.
-    run_test, run_predict, run_train : bool | str, optional
-        If `True`, evaluates the model on the data subset. If a string, it is treated 
-        as the output file stem for test/predict/train subset results. Defaults to `True`.
-    make_plots : bool, optional
-        If `True`, generates and saves evaluation plots for the specified subsets. 
-        Defaults to `True`.
-
     Notes:
     -----
     - The `predict` subset does not generate plots, regardless of the value of `make_plots`.
@@ -189,6 +176,7 @@ def eval_model(cfg, model, dataset, log_dir,
         dataloader = HydroDataLoader(cfg, dataset)
 
         results = predict(model, dataloader, quiet=cfg.get('quiet',True), denormalize=True)
+        cleanup_dl(dataloader)
 
         if data_subset != "predict":
             bulk_metrics = get_all_metrics(results)
@@ -214,10 +202,6 @@ def main(args):
     if args.train:
         config_yml = Path(args.train).resolve()
         cfg, model, eval_dir, dataset = start_training(config_yml)
-    elif args.continue_training:
-        run_dir = Path(args.continue_training).resolve()
-        cfg, model, dataset = continue_training(run_dir)
-        eval_dir = run_dir
     elif args.finetune:
         finetune_yml = Path(args.finetune).resolve()
         cfg, model, eval_dir, dataset = finetune(finetune_yml)
@@ -246,10 +230,6 @@ if __name__ == '__main__':
     group.add_argument('--train', 
                     type=str, 
                     help='Path to the training configuration file.')
-    group.add_argument('--continue', 
-                    dest='continue_training', 
-                    type=str, 
-                    help='Directory path to continue training.')
     group.add_argument('--finetune',
                         type=str,
                         help='Path to the finetune configuration yml file.')
@@ -289,7 +269,6 @@ if __name__ == '__main__':
         print(f"An error occurred: {e}")
         traceback.print_exc()
         sys.stdout.flush()
-    finally:
-        # Cleanup all processes (prevents zombie dataloader workers)
-        os.killpg(os.getpgid(0), signal.SIGKILL)
+        sys.exit(1)
+    sys.exit(0) 
     
