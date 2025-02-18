@@ -5,32 +5,35 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 
 
-
 def mosaic_scatter(cfg, results, metrics, title_str):
+
     def hexbin_1to1(ax, x, y, target, metrics):
         positive_mask = (x > 0) & (y > 0)
         x = x[positive_mask]
         y = y[positive_mask]
-        
+
         min_val = 5E-1
         max_val = 5E6
         log_min = np.log10(min_val)
         log_max = np.log10(max_val)
 
-        hb = ax.hexbin(x, y, gridsize=(30,20), bins='log', mincnt=5,
-                    linewidth=0.2,
-                    extent=(log_min, log_max, log_min, log_max),
-                    xscale='log', yscale='log')
-        plt.colorbar(hb, shrink=0.3, aspect=10, anchor=(-1,-0.55))
-        
+        hb = ax.hexbin(x,
+                       y,
+                       gridsize=(30, 20),
+                       bins='log',
+                       mincnt=5,
+                       linewidth=0.2,
+                       extent=(log_min, log_max, log_min, log_max),
+                       xscale='log',
+                       yscale='log')
+        plt.colorbar(hb, shrink=0.3, aspect=10, anchor=(-1, -0.55))
+
         # Add a 1:1 line over the min and max of x and y
         ax.plot([min_val, max_val], [min_val, max_val], 'r--')
-        
-        textstr = '\n'.join([f"{key}: {metrics[target][key]:0.2f}" 
-                             for key in ['R2', 'RE', 'MAPE', 'nBias']])
+
+        textstr = '\n'.join([f"{key}: {metrics[target][key]:0.2f}" for key in ['R2', 'RE', 'MAPE', 'nBias']])
         props = dict(boxstyle='round', facecolor='white', alpha=0.5)
-        ax.text(0, -0.4, textstr, transform=ax.transAxes, fontsize=10,
-                verticalalignment='top', bbox=props)
+        ax.text(0, -0.4, textstr, transform=ax.transAxes, fontsize=10, verticalalignment='top', bbox=props)
 
         # Setting axes to be square and equal range
         ax.axis('square')
@@ -41,14 +44,14 @@ def mosaic_scatter(cfg, results, metrics, title_str):
         ax.set_ylabel(f'Predicted')
 
     targets = cfg['features']['target']
-    fig, axes = plt.subplots(1,len(targets), figsize=(len(targets)*3, 4))
+    fig, axes = plt.subplots(1, len(targets), figsize=(len(targets) * 3, 4))
 
-    axes = [axes] if len(targets)==1 else axes        
+    axes = [axes] if len(targets) == 1 else axes
     for target, ax in zip(targets, axes):
         x = results['obs'][target]
         y = results['pred'][target]
         hexbin_1to1(ax, x, y, target, metrics)
-        
+
     fig.subplots_adjust(top=0.9, bottom=0.3)
     fig.suptitle(title_str)
 
@@ -56,25 +59,21 @@ def mosaic_scatter(cfg, results, metrics, title_str):
 
 
 def basin_metric_histograms(basin_metrics, metric_args, cdf=True):
-    cols  = 3
-    rows = int(np.ceil(len(metric_args)/cols))
+    cols = 3
+    rows = int(np.ceil(len(metric_args) / cols))
 
     if cdf:
-        common_args = {
-            'bins': 500,
-            'cumulative': True, 
-            'density': True,
-            'histtype': 'step'}
+        common_args = {'bins': 500, 'cumulative': True, 'density': True, 'histtype': 'step'}
     else:
-        common_args = {'bins':20}
+        common_args = {'bins': 20}
 
     fig_dict = {}
     targets = basin_metrics.columns.get_level_values('Feature').unique()
     for target in targets:
-        fig, axes = plt.subplots(rows, cols, figsize=(3*cols,2*rows))
+        fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 2 * rows))
         axes = axes.flatten()
 
-        count_mask = basin_metrics[target]['num_obs']>1
+        count_mask = basin_metrics[target]['num_obs'] > 1
         for ax, (metric, metric_kwargs) in zip(axes, metric_args.items()):
             tmp = basin_metrics[target][metric].astype(float)
             valid_mask = (~np.isnan(tmp)) & (~np.isinf(tmp)) & count_mask
@@ -86,7 +85,7 @@ def basin_metric_histograms(basin_metrics, metric_args, cdf=True):
             lims = metric_kwargs.get('range')
             if lims:
                 ax.set_xlim(lims[0], lims[1])
-            ax.set_ylim([0,1])
+            ax.set_ylim([0, 1])
 
         # Hide any unused axes.
         for ax in axes[len(metric_args):]:
@@ -95,7 +94,7 @@ def basin_metric_histograms(basin_metrics, metric_args, cdf=True):
         fig.suptitle(target.upper())
         fig.tight_layout()
         fig_dict[target] = fig
-        
+
     return fig_dict
 
 
@@ -109,19 +108,19 @@ def map_animation(cfg, model, dataset, target, cmap_label, period, lim, dt_alpha
     wqp_locs = wqp_locs.to_crs("EPSG:5070")
 
     dataset.inference_mode = True
-    dataloader_kwargs = dataset.date_batching(date_range=period) # Return batches where each batch is 1 day
+    dataloader_kwargs = dataset.date_batching(date_range=period)  # Return batches where each batch is 1 day
     cfg.update(dataloader_kwargs)
     dataloader = HydroDataLoader(cfg, dataset)
 
     test_basins = wqp_locs.loc[dataset.all_basins]
-    test_basins['y_hat'] = 0.0 
+    test_basins['y_hat'] = 0.0
     target_idx = np.where([t == target for t in dataset.target])[0]
 
     def draw_year_progress(ax, date):
         year_start = pd.Timestamp(date.year, 1, 1)
         year_end = pd.Timestamp(date.year, 12, 31)
         progress = (date - year_start).days / (year_end - year_start).days
-        
+
         ax.add_patch(plt.Rectangle((0.1, 0.05), 0.8, 0.04, fill=False, transform=ax.transAxes))
         ax.add_patch(plt.Rectangle((0.1, 0.05), 0.8 * progress, 0.04, facecolor='black', transform=ax.transAxes))
         text_str = date.strftime('%Y-%m-%d')
@@ -140,7 +139,7 @@ def map_animation(cfg, model, dataset, target, cmap_label, period, lim, dt_alpha
     sm = plt.cm.ScalarMappable(cmap='inferno', norm=norm)
     sm._A = []  # Empty array for the scalar mappable
     cbar = plt.colorbar(sm, ax=ax, shrink=0.65, aspect=15, label=cmap_label)
-    
+
     # Initialize animation frame
     plot = test_basins.plot(column='y_hat', cmap='inferno', norm=norm, ax=ax)
 
@@ -153,7 +152,7 @@ def map_animation(cfg, model, dataset, target, cmap_label, period, lim, dt_alpha
     def update(frame):
         # Function signature is fixed so we have to unpack.
         basin, date, y_hat, dt = frame
-        alpha = np.where(dt[:,1]==0, 1, dt_alpha)
+        alpha = np.where(dt[:, 1] == 0, 1, dt_alpha)
         ax.clear()
 
         # Insert the data into our gdf and then plot.
@@ -165,10 +164,8 @@ def map_animation(cfg, model, dataset, target, cmap_label, period, lim, dt_alpha
         return plot
 
     # Create the animation
-    ani = animation.FuncAnimation(fig, update, frames=frames, 
-                                interval=1000/10, repeat=True, cache_frame_data=False)
-    
+    ani = animation.FuncAnimation(fig, update, frames=frames, interval=1000 / 10, repeat=True, cache_frame_data=False)
+
     return ani
 
     # ani.save('ssc_animation.mp4', writer='ffmpeg', dpi=300)
-    

@@ -16,7 +16,7 @@ class GatedLinearUnit(eqx.Module):
     def __call__(self, gamma):
         gates = jax.nn.sigmoid(self.gates(gamma))
         return gates * self.linear(gamma)
-    
+
 
 class GatedSkipLayer(eqx.Module):
     glu: GatedLinearUnit
@@ -44,7 +44,7 @@ class GatedResidualNetwork(eqx.Module):
         elif isinstance(grn_size, int):
             input_size = hidden_size = output_size = grn_size
         else:
-            raise ValueError("grn_size must either be a tuple or int for input, hidden, and output sizes")    
+            raise ValueError("grn_size must either be a tuple or int for input, hidden, and output sizes")
         keys = jax.random.split(key, 4)
 
         self.eta2_dynamic = eqx.nn.Linear(input_size, hidden_size, use_bias=True, key=keys[0])
@@ -57,7 +57,7 @@ class GatedResidualNetwork(eqx.Module):
         self.dropout = eqx.nn.Dropout(dropout)
         self.skip = GatedSkipLayer(hidden_size, key=keys[3])
 
-    def __call__(self, input:jnp.ndarray, context:jnp.ndarray, key) -> jnp.ndarray:
+    def __call__(self, input: jnp.ndarray, context: jnp.ndarray, key) -> jnp.ndarray:
         if self.eta2_static and context is not None:
             context_term = self.eta2_static(context)
         elif self.eta2_static or context is not None:

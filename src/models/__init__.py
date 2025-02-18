@@ -1,14 +1,10 @@
 import jax
 import equinox as eqx
 
-# from models.lstm import TAPLSTM
-# from models.transformer import EATransformer
-# from models.hybrid import Hybrid
 from models.flexible_hybrid import FlexibleHybrid
-# from models.tft import TFT
-# from models.tft_mha import TFT_MHA
 from models.lstm_mlp_attn import LSTM_MLP_ATTN
 from models.rg_lstm import Graph_LSTM
+
 
 def make(cfg: dict):
     name = cfg['model'].lower()
@@ -27,6 +23,7 @@ def make(cfg: dict):
     print(f"Model contains {num_params:,} parameters, using {size:.2f}{unit} memory.")
     return model
 
+
 def count_parameters(model):
     # Use tree_flatten to get a list of arrays and ensure is_leaf treats arrays as leaves
     params, _ = jax.tree_util.tree_flatten(model)
@@ -36,6 +33,7 @@ def count_parameters(model):
     memory_bytes = num_params * 4
 
     return num_params, memory_bytes
+
 
 # Convert bytes to a human-readable format
 def human_readable_size(size):

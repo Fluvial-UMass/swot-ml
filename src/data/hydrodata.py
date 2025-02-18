@@ -16,7 +16,8 @@ class HydroDataset(Dataset):
     """
     DataLoader class for loading and preprocessing hydrological time series data.
     """
-    def __init__(self, cfg, *, train_ds = None, use_cache=True):
+
+    def __init__(self, cfg, *, train_ds=None, use_cache=True):
         self.cfg = copy.deepcopy(cfg)
         self.log_pad = 0.001
         self.dataloader_kwargs = {}
@@ -26,7 +27,7 @@ class HydroDataset(Dataset):
         self.s_scale = train_ds.s_scale if self.inference_mode else None
         self.d_encoding = train_ds.d_encoding if self.inference_mode else None
         self.d_scale = train_ds.d_scale if self.inference_mode else None
-        
+
         self.features = self.cfg['features']
         self.target = self.features['target']
 
@@ -34,17 +35,16 @@ class HydroDataset(Dataset):
         self.x_s = self._load_attributes()
         self.x_d = self._load_or_read_basin_data(use_cache)
         self.date_ranges = self._precompute_date_ranges()
-        
-        self.update_indices(data_subset=self.cfg.get('data_subset','train'),
-                            basin_subset=self.cfg.get('basin_subset'))
+
+        self.update_indices(data_subset=self.cfg.get('data_subset', 'train'), basin_subset=self.cfg.get('basin_subset'))
 
     def __len__(self):
         """
         Returns the number of valid sequences in the dataset.
         """
         return len(self.sequence_indices)
-    
-    def _read_basin_files(self):   
+
+    def _read_basin_files(self):
         # for convenience and readability
         data_dir = self.cfg.get('data_dir')
         basin_file = self.cfg.get('basin_file')
@@ -56,8 +56,8 @@ class HydroDataset(Dataset):
             with open(fp, 'r') as file:
                 basin_list = file.readlines()
                 basin_list = [basin.strip() for basin in basin_list]
-                return basin_list 
-        
+                return basin_list
+
         # Same basins are used for train and test.
         if basin_file:
             self.all_basins = read_file(data_dir / basin_file)
@@ -70,24 +70,23 @@ class HydroDataset(Dataset):
         else:
             raise ValueError('Must set either "basin_file" or "train_basin_file" AND "test_basin_file"')
 
-        
         if graph_network_file:
             self.graph_mode = True
             if self.train_basins == self.test_basins:
                 self.graph_matrix = np.loadtxt(data_dir / graph_network_file)
                 if self.graph_matrix.shape[0] != len(self.train_basins):
-                    raise ValueError('Graph network matrix shape be square of number of training basins.\n' + 
+                    raise ValueError('Graph network matrix shape be square of number of training basins.\n' +
                                      f'Graph network matrix shape: {self.graph_matrix.shape}\n' +
                                      f'Number of training basins: {len(self.train_basins)}.')
                 if self.graph_matrix.shape[0] != self.graph_matrix.shape[1]:
                     raise ValueError('Graph network matrix must be square.\n' +
                                      f'Graph network matrix shape: {self.graph_matrix.shape}.')
-            else: 
-                raise ValueError('Graph network modeling does not currently support different training and testing networks.')
+            else:
+                raise ValueError(
+                    'Graph network modeling does not currently support different training and testing networks.')
         else:
             self.graph_matrix = None
             self.graph_mode = False
-
 
     def _load_or_read_basin_data(self, use_cache):
         print('Loading dynamic data')
@@ -97,8 +96,8 @@ class HydroDataset(Dataset):
 
             cache_dir = self.cfg.get('data_dir') / "cache"
             cache_dir.mkdir(exist_ok=True)
-            data_file =  cache_dir / f"{data_hash}.pkl"
-            
+            data_file = cache_dir / f"{data_hash}.pkl"
+
             # If data from this cfg hash exists, read it in.
             if data_file.is_file():
                 print("Using cached basin dataset.")
@@ -113,9 +112,9 @@ class HydroDataset(Dataset):
                     pickle.dump((x_d, self.d_scale, self.d_encoding, self.features['dynamic'], self.time_gaps), file)
         else:
             x_d = self._load_basin_data()
-            
+
         return x_d
-    
+
     def _load_basin_data(self):
         """
         Loads the basin data from NetCDF files and applies the time slice.
@@ -131,23 +130,21 @@ class HydroDataset(Dataset):
             file_path = f"{self.cfg['data_dir']}/{ts_dir}/{basin}.nc"
             ds = xr.open_dataset(file_path).sel(date=self.cfg['time_slice'])
             ds['date'] = ds['date'].astype('datetime64[ns]')
-    
+
             # Filter to keep only the necessary features and the target variable if not in inference mode
             features_to_keep = list(itertools.chain(*self.features['dynamic'].values()))
             if not self.inference_mode:
                 features_to_keep.extend(self.target)
-            
+
             missing_columns = set(features_to_keep) - set(ds.data_vars)
             if missing_columns:
-                raise ValueError(
-                    f"The following columns are missing from the dataset: {missing_columns}"
-                    f"The following variables are available in the dataset: {ds.data_vars}"
-                )
+                raise ValueError(f"The following columns are missing from the dataset: {missing_columns}"
+                                 f"The following variables are available in the dataset: {ds.data_vars}")
             ds = ds[features_to_keep]
 
             # Clip selected columns to the specified range. This range is preprocessed in config.py.
             for col in ds.data_vars:
-                if col not in self.cfg.get('clip_feature_range',{}).keys():
+                if col not in self.cfg.get('clip_feature_range', {}).keys():
                     continue
                 [lower, upper] = self.cfg['clip_feature_range'][col]
                 inside_range = (ds[col] >= lower) & (ds[col] <= upper)
@@ -155,15 +152,15 @@ class HydroDataset(Dataset):
 
             # Replace negative values with NaN in specific columns without explicit loop
             for col in ds.data_vars:
-                if col not in self.cfg.get('log_norm_cols',[]):
+                if col not in self.cfg.get('log_norm_cols', []):
                     continue
                 ds[col] = ds[col].where(ds[col] >= 0, np.nan)
-                
-            # Apply rolling means at 1 or more intervals.    
+
+            # Apply rolling means at 1 or more intervals.
             window_sizes = self.cfg.get('add_rolling_means')
             if window_sizes is not None:
                 ds = self.add_smoothed_features(ds, window_sizes)
-    
+
             ds = ds.assign_coords({'basin': basin})
             ds_list.append(ds)
 
@@ -177,7 +174,7 @@ class HydroDataset(Dataset):
 
         ds, self.d_encoding = self._encode_data(ds, 'dynamic', self.d_encoding)
         x_d, self.d_scale = self._normalize_data(ds, 'dynamic', self.d_encoding, self.d_scale)
-        
+
         return x_d
 
     def _load_attributes(self):
@@ -193,7 +190,7 @@ class HydroDataset(Dataset):
         file_path = f"{self.cfg['data_dir']}/attributes/{file_stem}"
         df = pd.read_csv(file_path, index_col="index")
         df.index = df.index.astype(str)
-        
+
         if self.inference_mode:
             unencoded_cols = [k for k, v in self.s_scale.items() if not v['encoded']]
             one_hot_cols = list((self.s_encoding['one_hot'] or {}).keys())
@@ -204,7 +201,7 @@ class HydroDataset(Dataset):
         else:
             # Trim the dataset to the config'd list.
             feat = self.features['static']
-            if isinstance(feat, list) and len(feat)==0:
+            if isinstance(feat, list) and len(feat) == 0:
                 self.s_scale = None
                 return None
             df = df[feat] if feat else df
@@ -229,20 +226,22 @@ class HydroDataset(Dataset):
 
     def _precompute_date_ranges(self):
         unique_dates = self.x_d['date'].values
-        date_ranges = {date: pd.date_range(end=date, periods=self.cfg['sequence_length'], freq='D').values for date in unique_dates}
+        date_ranges = {
+            date: pd.date_range(end=date, periods=self.cfg['sequence_length'], freq='D').values for date in unique_dates
+        }
         return date_ranges
-    
+
     def _calc_var_dt(self, x):
-        valid_mask = np.all(~np.isnan(x),axis=2)
+        valid_mask = np.all(~np.isnan(x), axis=2)
         indices = np.arange(valid_mask.shape[1])
 
         valid_indices = np.where(valid_mask, indices, -1)
-        last_valid_index = np.maximum.accumulate(valid_indices, axis=1) 
+        last_valid_index = np.maximum.accumulate(valid_indices, axis=1)
 
-        first_values = valid_mask[:,0].astype(int)[:, None]
-        dt = np.concat([first_values, np.diff(last_valid_index, axis=1)],axis=1)
+        first_values = valid_mask[:, 0].astype(int)[:, None]
+        dt = np.concat([first_values, np.diff(last_valid_index, axis=1)], axis=1)
         return dt
-    
+
     def __getitems__(self, ids):
         """Generate one batch of data."""
         # Collect all basin and date information for the indices
@@ -255,19 +254,19 @@ class HydroDataset(Dataset):
             basins_da = xr.DataArray(basins, dims="sample")
             dates = [self.sequence_indices[idx][1] for idx in ids]
         sequenced_dates = [self.date_ranges[date] for date in dates]
-        
+
         # Convert to xarray-friendly formats
         sequenced_dates_da = xr.DataArray(sequenced_dates, dims=["sample", "time"])
         ds = self.x_d.sel(basin=basins_da, date=sequenced_dates_da)
 
         if self.graph_mode:
-            batch = {'dynamic':{}}
+            batch = {'dynamic': {}}
             # Dynamic data. Shape (batch, sequence, nodes, features)
             for source, col_names in self.features['dynamic'].items():
-                batch['dynamic'][source] = np.moveaxis(ds[col_names].to_array().values,[0, 1, 3],[-1, 0, 1])
+                batch['dynamic'][source] = np.moveaxis(ds[col_names].to_array().values, [0, 1, 3], [-1, 0, 1])
                 # dt calcs not yet implemented for new dimension.
                 # batch['dynamic_dt'][source] = self._calc_var_dt(batch['dynamic'][source])
-            
+
             # Static data. Shape (batch, nodes, features)
             if self.x_s is not None:
                 static_ds = self.x_s.sel(basin=basins_da)
@@ -275,26 +274,26 @@ class HydroDataset(Dataset):
 
             # Target data. Shape (batch, sequence, features)
             if not self.inference_mode:
-                batch['y'] = np.moveaxis(ds[self.target].to_array().values,[0, 1, 3],[-1, 0, 1])
+                batch['y'] = np.moveaxis(ds[self.target].to_array().values, [0, 1, 3], [-1, 0, 1])
 
         else:
-            batch = {'dynamic':{},'dynamic_dt':{}}
+            batch = {'dynamic': {}, 'dynamic_dt': {}}
             # Dynamic data. Shape (batch, sequence, features)
             for source, col_names in self.features['dynamic'].items():
-                batch['dynamic'][source] = np.moveaxis(ds[col_names].to_array().values,0, -1)
+                batch['dynamic'][source] = np.moveaxis(ds[col_names].to_array().values, 0, -1)
                 batch['dynamic_dt'][source] = self._calc_var_dt(batch['dynamic'][source])
 
             # Static data. Shape (batch, features)
             if self.x_s is not None:
                 static_ds = self.x_s.sel(basin=basins_da)
                 batch['static'] = np.moveaxis(static_ds.to_array().values, 0, 1)
-            
+
             # Target data. Shape (batch, sequence, features)
             if not self.inference_mode:
-                batch['y'] = np.moveaxis(ds[self.target].to_array().values,0,2)
-        
+                batch['y'] = np.moveaxis(ds[self.target].to_array().values, 0, 2)
+
         return basins, dates, batch
-    
+
     def _encode_data(self, ds, feat_group, encoding):
         columns_in = ds.data_vars
         one_hot_enc = encoding.get('one_hot') if encoding else None
@@ -305,20 +304,18 @@ class HydroDataset(Dataset):
 
         new_columns = set(ds.data_vars) - set(columns_in)
 
-        encoding = {'one_hot': one_hot,
-                    'bitmask': bitmask,
-                    'encoded_columns': list(new_columns)}
-        
+        encoding = {'one_hot': one_hot, 'bitmask': bitmask, 'encoded_columns': list(new_columns)}
+
         return ds, encoding
 
-    def _one_hot_encoding(self, ds, feat_group, onehot_enc:dict | None):
+    def _one_hot_encoding(self, ds, feat_group, onehot_enc: dict | None):
         # Apply one-hot encoding to categorical columns
         if not onehot_enc:
-            categorical_cols = self.cfg.get('categorical_cols',{}).get(feat_group, [])
+            categorical_cols = self.cfg.get('categorical_cols', {}).get(feat_group, [])
             if not categorical_cols:
                 return ds, None
             onehot_enc = {col: None for col in categorical_cols}
-        
+
         for col, prescribed_cols in onehot_enc.items():
             if col in ds.data_vars:
                 df = ds[col].to_dataframe()
@@ -329,7 +326,7 @@ class HydroDataset(Dataset):
                 # Create an empty DataFrame with the same index as ds
                 encoded = pd.DataFrame(index=ds.basin)
 
-            if prescribed_cols is not None and len(prescribed_cols)>0:
+            if prescribed_cols is not None and len(prescribed_cols) > 0:
                 # Add missing categories as columns filled with zeros
                 for c in prescribed_cols:
                     if c not in encoded.columns:
@@ -338,10 +335,9 @@ class HydroDataset(Dataset):
                 encoded = encoded[prescribed_cols]
             else:
                 onehot_enc[col] = encoded.columns
-            
+
             # Add encoded data
             ds = xr.merge([ds, encoded.to_xarray()])
-            
 
             # Locate the col inside the features dict, remove and replace.
             # This is kind of ugly but deals with the 2 level feature dict.
@@ -359,13 +355,13 @@ class HydroDataset(Dataset):
 
         return ds, onehot_enc
 
-    def _bitmask_expansion(self, ds, feat_group, bitmask_enc:dict | None):
+    def _bitmask_expansion(self, ds, feat_group, bitmask_enc: dict | None):
         if not bitmask_enc:
-            bitmask_cols = self.cfg.get('bitmask_cols',{}).get(feat_group,[])
+            bitmask_cols = self.cfg.get('bitmask_cols', {}).get(feat_group, [])
             if not bitmask_cols:
                 return ds, None
             bitmask_enc = {k: None for k in bitmask_cols}
-        
+
         for col, num_bits in bitmask_enc.items():
             if col in ds.data_vars:
                 # Get the bitmask integers
@@ -382,11 +378,12 @@ class HydroDataset(Dataset):
                 for n in range(num_bits):
                     bit_arr = (x // 2**n) % 2
 
-                    new_vars[f"{col}_bit_{n}"] = xr.DataArray(
-                        data=bit_arr,
-                        dims=['basin', 'date'],
-                        coords={'basin': ds.basin, 'date': ds.date}
-                    )
+                    new_vars[f"{col}_bit_{n}"] = xr.DataArray(data=bit_arr,
+                                                              dims=['basin', 'date'],
+                                                              coords={
+                                                                  'basin': ds.basin,
+                                                                  'date': ds.date
+                                                              })
                 # Remove the original categorical column
                 ds = ds.drop_vars(col)
             else:
@@ -394,12 +391,12 @@ class HydroDataset(Dataset):
                 if num_bits is None:
                     raise ValueError(f"Number of bits for {col} is not specified in the encoding.")
                 for n in range(num_bits):
-                    new_vars[f"{col}_bit_{n}"] = xr.DataArray(
-                        data=np.zeros((len(ds.basin), len(ds.date))),
-                        dims=['basin', 'date'],
-                        coords={'basin': ds.basin, 'date': ds.date}
-                    )
-        
+                    new_vars[f"{col}_bit_{n}"] = xr.DataArray(data=np.zeros((len(ds.basin), len(ds.date))),
+                                                              dims=['basin', 'date'],
+                                                              coords={
+                                                                  'basin': ds.basin,
+                                                                  'date': ds.date
+                                                              })
 
             ds = xr.merge([ds, xr.Dataset(new_vars)])
 
@@ -416,7 +413,7 @@ class HydroDataset(Dataset):
                     self.features[feat_group].remove(col)
                 else:
                     print(f"{col} not found in {feat_group} features. Encoded as 0s.")
-        
+
         return ds, bitmask_enc
 
     def _normalize_data(self, ds, feat_group, encoding, scale=None):
@@ -435,33 +432,30 @@ class HydroDataset(Dataset):
                 training_ds = ds
 
             # Initialize
-            scale = {k: {'encoded': False,
-                         'log_norm': False,
-                         'offset': 0,
-                         'scale': 1} for k in ds.data_vars}
-        
+            scale = {k: {'encoded': False, 'log_norm': False, 'offset': 0, 'scale': 1} for k in ds.data_vars}
+
             # Iterate over each variable in the dataset and calculate scaler
             for var in ds.data_vars:
-                log_norm_cols = self.cfg.get('log_norm_cols',[])
-                range_norm_cols = self.cfg.get('range_norm_cols',[])
+                log_norm_cols = self.cfg.get('log_norm_cols', [])
+                range_norm_cols = self.cfg.get('range_norm_cols', [])
 
                 if var in encoding['encoded_columns']:
                     # One-hot encoded columns don't need normalization
                     scale[var]['encoded'] = True
-                
+
                 elif log_norm_cols is not None and var in log_norm_cols:
                     # Log normalization
                     scale[var]['log_norm'] = True
                     x = training_ds[var] + self.log_pad
                     scale[var]['offset'] = np.nanmean(np.log(x))
-                    
+
                 elif range_norm_cols is not None and var in range_norm_cols:
                     # Min-max scaling
                     min_val = training_ds[var].min().values.item()
                     max_val = training_ds[var].max().values.item()
                     scale[var]['offset'] = min_val
                     scale[var]['scale'] = max_val - min_val
-                    
+
                 else:
                     # Standard normalization
                     scale[var]['offset'] = training_ds[var].mean().values.item()
@@ -481,7 +475,7 @@ class HydroDataset(Dataset):
                     ds[var] = (ds[var] - scl['offset']) / scl['scale']
 
         return ds, scale
- 
+
     def denormalize_target(self, y_normalized):
         """
         Denormalizes the target variable(s).
@@ -489,7 +483,7 @@ class HydroDataset(Dataset):
             np.ndarray or jnp.ndarray: Denormalized target data.
         """
         y = jnp.empty_like(y_normalized)
-    
+
         for i in range(len(self.target)):
             # Retrieve the normalization parameters for the target variable
             target = self.target[i]
@@ -503,10 +497,10 @@ class HydroDataset(Dataset):
             else:
                 y = y.at[..., i].set(y_normalized[..., i] * scale + offset)
         return y
-    
+
     def _date_batching(self, valid_date_mask):
-        if self.data_subset in ['pre_train','train','test']:
-            valid_target = (~np.isnan(self.x_d[self.targets_to_index])).to_array().any(dim=['variable','basin'])
+        if self.data_subset in ['pre_train', 'train', 'test']:
+            valid_target = (~np.isnan(self.x_d[self.targets_to_index])).to_array().any(dim=['variable', 'basin'])
         else:
             valid_target = True
 
@@ -514,8 +508,9 @@ class HydroDataset(Dataset):
         valid_dates = self.x_d['date'][mask].values
 
         self.sequence_indices = valid_dates
-        
+
     def _basin_date_batching(self, valid_date_mask):
+
         def valid_target(ds):
             return (~np.isnan(ds[self.targets_to_index])).to_array().any(dim='variable')
 
@@ -540,27 +535,27 @@ class HydroDataset(Dataset):
             indices[basin] = ds_basin['date'][mask].values
 
         # These are the indices that will be used for selecting sequences of data.
-        basin_date_pairs = [(basin, date) for basin, dates in indices.items() for date in dates] 
+        basin_date_pairs = [(basin, date) for basin, dates in indices.items() for date in dates]
         self.sequence_indices = basin_date_pairs
-    
-    def _get_basin_date_split(self):        
-        # Get the list of basins we are going to use. 
+
+    def _get_basin_date_split(self):
+        # Get the list of basins we are going to use.
         # If specified, use those. Otherwise select it based on the data subset.
         if self.basin_subset is None:
-            if self.data_subset in ['pre_train','train']:
+            if self.data_subset in ['pre_train', 'train']:
                 self.basin_subset = self.train_basins
-            elif self.data_subset in ['test','predict']:
+            elif self.data_subset in ['test', 'predict']:
                 self.basin_subset = self.test_basins
             elif self.data_subset == 'predict_all':
                 self.basin_subset = self.all_basins
 
-        # Get a boolean mask of dates that match our time splitting scheme 
+        # Get a boolean mask of dates that match our time splitting scheme
         # for the current data subset.
         if self.cfg.get('split_time'):
             # Select before or after split time based on data subset.
-            if self.data_subset in ['pre_train','train']:
+            if self.data_subset in ['pre_train', 'train']:
                 date_mask = self.x_d['date'] <= self.cfg['split_time']
-            elif self.data_subset in ['test','predict']:
+            elif self.data_subset in ['test', 'predict']:
                 date_mask = self.x_d['date'] > self.cfg['split_time']
         else:
             # No time splitting between train and test.
@@ -568,26 +563,25 @@ class HydroDataset(Dataset):
 
         # Minimum date for sequenced data
         min_train_date = (np.datetime64(self.cfg['time_slice'].start) +
-                          np.timedelta64(self.cfg['sequence_length'], 'D'))  
+                          np.timedelta64(self.cfg['sequence_length'], 'D'))
         valid_sequence = self.x_d['date'] >= min_train_date
 
         # Return the combination of valid sequences and valid dates from subset.
         valid_dates = valid_sequence & date_mask
 
         return valid_dates
-    
 
-    def update_indices(self, data_subset:str, basin_subset:list = None):
-         # Validate the data_subset choice
-        data_subsets = ['pre_train','train','test','predict','predict_all']
+    def update_indices(self, data_subset: str, basin_subset: list = None):
+        # Validate the data_subset choice
+        data_subsets = ['pre_train', 'train', 'test', 'predict', 'predict_all']
         if data_subset not in data_subsets:
-             raise ValueError(f"data_subset ({data_subset}) must be in ({data_subsets}) ")
+            raise ValueError(f"data_subset ({data_subset}) must be in ({data_subsets}) ")
         self.data_subset = data_subset
 
-        # Set the basin subset. Cast as list if needed (sometimes we use a single basin). 
-        # If none, will default to the basins defined by the data subset. 
+        # Set the basin subset. Cast as list if needed (sometimes we use a single basin).
+        # If none, will default to the basins defined by the data subset.
         if basin_subset is not None:
-            if isinstance(basin_subset,list):
+            if isinstance(basin_subset, list):
                 self.basin_subset = basin_subset
             else:
                 self.basin_subset = [basin_subset]
@@ -607,7 +601,6 @@ class HydroDataset(Dataset):
         else:
             self._basin_date_batching(valid_date_mask)
 
-        
     def add_smoothed_features(self, ds, window_sizes):
         new_ds = ds.copy()
         data_vars = ds.data_vars
@@ -619,16 +612,15 @@ class HydroDataset(Dataset):
                 # Assign to new dataset with a new variable name
                 new_ds[f"{var_name}_smooth{window_size}"] = smoothed_var
         return new_ds
-    
+
     def get_data_hash(self):
-        cfg_keys = ['data_dir', "time_series_dir", 'features', 
-                    'time_slice', 'split_time', 'add_rolling_means', 
-                    'log_norm_cols', 'categorical_cols', 'bitmask_cols', 'range_norm_cols',
-                    'clip_feature_range']
+        cfg_keys = [
+            'data_dir', "time_series_dir", 'features', 'time_slice', 'split_time', 'add_rolling_means', 'log_norm_cols',
+            'categorical_cols', 'bitmask_cols', 'range_norm_cols', 'clip_feature_range'
+        ]
         data_config = {k: self.cfg.get(k) for k in cfg_keys}
         data_config['basins'] = sorted(self.all_basins)
         data_config['graph_matrix'] = self.graph_matrix
-
         """Generate a SHA256 hash for the contents of the dict."""
         hasher = hashlib.sha256()
         # Convert the dictionary to a sorted, consistent string representation

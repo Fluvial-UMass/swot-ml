@@ -1,7 +1,9 @@
-data/
-logs/
-runs/
+data/*
+runs/*
+notebooks/*
 
+!runs/_examples/
+!data/
 
 # OSX / *nix default autosave extension
 *.m~

@@ -8,8 +8,10 @@ from functools import partial
 
 from ._gates import GatedResidualNetwork
 
+
 class StaticEmbedder(eqx.Module):
     proj: eqx.nn.Linear
+
     # grn: GatedResidualNetwork
 
     def __init__(self, in_size, hidden_size, dropout, key):
@@ -22,13 +24,14 @@ class StaticEmbedder(eqx.Module):
         embed = self.proj(static)
         # encoded = self.grn(embed, None, key)
         return embed
-    
+
+
 class StaticContextHeadBias(eqx.Module):
     out_shape: tuple
     linear: eqx.nn.Linear
     dropout: eqx.nn.Dropout
-    layernorm: eqx.nn.LayerNorm 
-    
+    layernorm: eqx.nn.LayerNorm
+
     def __init__(self, hidden_size, num_heads, dropout, key):
         size_per_head = hidden_size // num_heads
         out_size = num_heads * size_per_head
@@ -55,21 +58,15 @@ class DynamicEmbedder(eqx.Module):
     layernorm: eqx.nn.LayerNorm
     dropout: eqx.nn.Dropout
 
-    def __init__(self,
-                 seq_length: int,
-                 dynamic_in_size: int,
-                 hidden_size: int,
-                 dropout_rate: float,
+    def __init__(self, seq_length: int, dynamic_in_size: int, hidden_size: int, dropout_rate: float,
                  key: jrandom.PRNGKey):
         keys = jrandom.split(key)
         self.dynamic_embedder = eqx.nn.Linear(in_features=dynamic_in_size, out_features=hidden_size, key=keys[0])
-        self.positional_encoding = self.create_positional_encoding(seq_length, hidden_size) 
+        self.positional_encoding = self.create_positional_encoding(seq_length, hidden_size)
         self.layernorm = eqx.nn.LayerNorm(shape=(hidden_size,))
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
-    def __call__(self, 
-                 data: jnp.ndarray,
-                 key: jrandom.PRNGKey) -> jnp.ndarray: 
+    def __call__(self, data: jnp.ndarray, key: jrandom.PRNGKey) -> jnp.ndarray:
         embed = jax.vmap(self.dynamic_embedder)(data)
         embed += self.positional_encoding
         embed = self.dropout(embed, key=key)
@@ -86,15 +83,17 @@ class DynamicEmbedder(eqx.Module):
         pos_encoding = pos_encoding.at[:, 0::2].set(jnp.sin(angle_rads))
         pos_encoding = pos_encoding.at[:, 1::2].set(jnp.cos(angle_rads))
         return pos_encoding
-    
+
+
 def _create_time_encoding(hidden_size: int, seq_len: int) -> jnp.ndarray:
-        """Generates time encodings based on position."""
-        position = jnp.arange(seq_len)[:, None]
-        div_term = jnp.exp(jnp.arange(0, hidden_size, 2) * -(jnp.log(10000.0) / hidden_size))
-        time_encoding = jnp.zeros((seq_len, hidden_size))
-        time_encoding = time_encoding.at[:, 0::2].set(jnp.sin(position * div_term))
-        time_encoding = time_encoding.at[:, 1::2].set(jnp.cos(position * div_term))
-        return time_encoding
+    """Generates time encodings based on position."""
+    position = jnp.arange(seq_len)[:, None]
+    div_term = jnp.exp(jnp.arange(0, hidden_size, 2) * -(jnp.log(10000.0) / hidden_size))
+    time_encoding = jnp.zeros((seq_len, hidden_size))
+    time_encoding = time_encoding.at[:, 0::2].set(jnp.sin(position * div_term))
+    time_encoding = time_encoding.at[:, 1::2].set(jnp.cos(position * div_term))
+    return time_encoding
+
 
 class AttentionBlock(eqx.Module):
     """
@@ -105,20 +104,18 @@ class AttentionBlock(eqx.Module):
     layernorm: eqx.nn.LayerNorm
     dropout: eqx.nn.Dropout
 
-    def __init__(self,
-                 hidden_size: int, 
-                 num_heads: int,
-                 dropout_rate: float,
-                 key: jrandom.PRNGKey): 
-        self.attention = eqx.nn.MultiheadAttention(num_heads, hidden_size, hidden_size, hidden_size, hidden_size, key=key)
+    def __init__(self, hidden_size: int, num_heads: int, dropout_rate: float, key: jrandom.PRNGKey):
+        self.attention = eqx.nn.MultiheadAttention(num_heads,
+                                                   hidden_size,
+                                                   hidden_size,
+                                                   hidden_size,
+                                                   hidden_size,
+                                                   key=key)
         self.layernorm = eqx.nn.LayerNorm(shape=(hidden_size,))
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
-    def __call__(self, 
-                 inputs: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]],
-                 static_bias: jnp.ndarray,
-                 mask: jnp.ndarray,
-                 key: jrandom.PRNGKey) -> jnp.ndarray:
+    def __call__(self, inputs: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]],
+                 static_bias: jnp.ndarray, mask: jnp.ndarray, key: jrandom.PRNGKey) -> jnp.ndarray:
         keys = jrandom.split(key)
         # Arg 'inputs' can be a tuple of three arrays for cross attention,
         # or a single array for self attention.
@@ -127,17 +124,17 @@ class AttentionBlock(eqx.Module):
         else:
             q = k = v = inputs
 
-
         def process_heads(q_h, k_h, v_h):
             q_h += static_bias
             k_h += static_bias
             return q_h, k_h, v_h
-        
+
         attention_output = self.attention(q, k, v, mask, process_heads=process_heads, key=keys[0])
         attention_output = self.dropout(attention_output, key=keys[1])
-        result = attention_output + q # Residual connection
+        result = attention_output + q  # Residual connection
         result = jax.vmap(self.layernorm)(result)
         return result
+
 
 class FeedForwardBlock(eqx.Module):
     """
@@ -148,97 +145,76 @@ class FeedForwardBlock(eqx.Module):
     layernorm: eqx.nn.LayerNorm
     dropout: eqx.nn.Dropout
 
-    def __init__(self, 
-                 hidden_size: int, 
-                 intermediate_size: int,
-                 dropout_rate: float,
-                 key: jrandom.PRNGKey): 
+    def __init__(self, hidden_size: int, intermediate_size: int, dropout_rate: float, key: jrandom.PRNGKey):
         keys = jrandom.split(key)
-        
+
         self.mlp = eqx.nn.Linear(in_features=hidden_size, out_features=intermediate_size, key=keys[0])
         self.output = eqx.nn.Linear(in_features=intermediate_size, out_features=hidden_size, key=keys[1])
         self.layernorm = eqx.nn.LayerNorm(shape=(hidden_size,))
         self.dropout = eqx.nn.Dropout(dropout_rate)
 
-    def __call__(self,
-                 inputs: jnp.ndarray,
-                 key: jrandom.PRNGKey) -> jnp.ndarray: 
+    def __call__(self, inputs: jnp.ndarray, key: jrandom.PRNGKey) -> jnp.ndarray:
         hidden = self.mlp(inputs)
         hidden = jax.nn.gelu(hidden)
         hidden = self.dropout(hidden, key=key)
         output = self.output(hidden)
-        output += inputs # Residual connection
-        output = self.layernorm(output) 
+        output += inputs  # Residual connection
+        output = self.layernorm(output)
         return output
+
 
 class TransformerLayer(eqx.Module):
     attention_block: AttentionBlock
     ff_block: FeedForwardBlock
 
-    def __init__(self, 
-                 hidden_size: int, 
-                 intermediate_size: int, 
-                 num_heads: int, 
-                 dropout: float,
-                 key: jrandom.PRNGKey):
+    def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int, dropout: float, key: jrandom.PRNGKey):
         keys = jrandom.split(key)
         self.attention_block = AttentionBlock(hidden_size, num_heads, dropout, keys[0])
         self.ff_block = FeedForwardBlock(hidden_size, intermediate_size, dropout, keys[1])
 
     # @partial(jax.checkpoint, static_argnums=(0,))
-    def __call__(self, 
-                 inputs: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]],
-                 logit_bias: jnp.ndarray,
-                 mask: jnp.ndarray,
-                 key: jrandom.PRNGKey) -> jnp.ndarray:
-        keys = jrandom.split(key) 
+    def __call__(self, inputs: Union[jnp.ndarray, Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]],
+                 logit_bias: jnp.ndarray, mask: jnp.ndarray, key: jrandom.PRNGKey) -> jnp.ndarray:
+        keys = jrandom.split(key)
         attention_output = self.attention_block(inputs, logit_bias, mask, keys[0])
         ff_keys = jrandom.split(keys[1], attention_output.shape[0])
         output = jax.vmap(self.ff_block)(attention_output, ff_keys)
         return output
+
 
 class SelfAttnEncoder(eqx.Module):
     head_proj: StaticContextHeadBias
     embedder: DynamicEmbedder
     layers: List[TransformerLayer]
 
-    def __init__(self,
-                 seq_len: int,
-                 dynamic_size: int,
-                 hidden_size: int, 
-                 intermediate_size: int, 
-                 num_layers: int, 
-                 num_heads: int, 
-                 dropout: float,
-                 key: jrandom.PRNGKey):
+    def __init__(self, seq_len: int, dynamic_size: int, hidden_size: int, intermediate_size: int, num_layers: int,
+                 num_heads: int, dropout: float, key: jrandom.PRNGKey):
         keys = jrandom.split(key, num=3)
 
         self.head_proj = StaticContextHeadBias(hidden_size, num_heads, dropout, keys[0])
         self.embedder = DynamicEmbedder(seq_len, dynamic_size, hidden_size, dropout, keys[0])
-        
+
         layer_keys = jrandom.split(keys[1], num=num_layers)
         layer_args = (hidden_size, intermediate_size, num_heads, dropout)
         self.layers = [TransformerLayer(*layer_args, k) for k in layer_keys]
 
-    def __call__(self, 
-                 dynamic_data: jnp.ndarray,
-                 static_encoded: jnp.ndarray,
-                 mask: Union[None, jnp.ndarray],
+    def __call__(self, dynamic_data: jnp.ndarray, static_encoded: jnp.ndarray, mask: Union[None, jnp.ndarray],
                  key: jrandom.PRNGKey) -> jnp.ndarray:
         keys = jrandom.split(key, 3)
-        
+
         head_bias = self.head_proj(static_encoded, keys[0])
         dynamic_embedded = self.embedder(dynamic_data, keys[1])
-        
+
         if mask is not None:
             # # For self attn, mask queries AND keys/values
             mask = jnp.outer(mask, mask)
-        
+
         layer_keys = jrandom.split(keys[2], num=len(self.layers))
         x = dynamic_embedded
         for layer, layer_key in zip(self.layers, layer_keys):
             x = layer(x, head_bias, mask, layer_key)
         return x
+
 
 class CrossAttnDecoder(eqx.Module):
     head_proj: StaticContextHeadBias
@@ -246,15 +222,8 @@ class CrossAttnDecoder(eqx.Module):
     time_encoding: jnp.ndarray
     pooler: eqx.nn.Linear
 
-    def __init__(self,
-                 seq_len: int,
-                 hidden_size: int, 
-                 intermediate_size: int, 
-                 num_layers: int, 
-                 num_heads: int, 
-                 dropout: float,
-                 entity_aware: bool,
-                 key: jrandom.PRNGKey):
+    def __init__(self, seq_len: int, hidden_size: int, intermediate_size: int, num_layers: int, num_heads: int,
+                 dropout: float, entity_aware: bool, key: jrandom.PRNGKey):
         keys = jrandom.split(key, 3)
 
         if entity_aware:
@@ -268,12 +237,8 @@ class CrossAttnDecoder(eqx.Module):
         self.time_encoding = _create_time_encoding(hidden_size, seq_len)
         self.pooler = eqx.nn.Linear(in_features=hidden_size, out_features=hidden_size, key=keys[2])
 
-    def __call__(self, 
-                 daily_encoded: jnp.ndarray,
-                 irregular_encoded: jnp.ndarray,
-                 static_encoded: jnp.ndarray,
-                 mask: Union[None, jnp.ndarray],
-                 key: jrandom.PRNGKey) -> jnp.ndarray:
+    def __call__(self, daily_encoded: jnp.ndarray, irregular_encoded: jnp.ndarray, static_encoded: jnp.ndarray,
+                 mask: Union[None, jnp.ndarray], key: jrandom.PRNGKey) -> jnp.ndarray:
         keys = jrandom.split(key)
 
         if mask is not None:
@@ -288,7 +253,7 @@ class CrossAttnDecoder(eqx.Module):
             head_bias = self.head_proj(static_encoded, keys[0])
         else:
             head_bias = 0
-        
+
         layer_keys = jrandom.split(keys[1], num=len(self.layers))
         x = (q, k, v)
         for layer, layer_key in zip(self.layers, layer_keys):
@@ -310,23 +275,13 @@ class EATransformer(eqx.Module):
     head: eqx.nn.Linear
     target: list
 
-    def __init__(self, 
-                 target: list,
-                 daily_in_size: int,
-                 irregular_in_size: int,
-                 static_in_size: int, 
-                 seq_length: int, 
-                 hidden_size: int, 
-                 intermediate_size: int, 
-                 num_layers: int, 
-                 num_heads: int,
-                 dropout: float, 
-                 seed: int):
+    def __init__(self, target: list, daily_in_size: int, irregular_in_size: int, static_in_size: int, seq_length: int,
+                 hidden_size: int, intermediate_size: int, num_layers: int, num_heads: int, dropout: float, seed: int):
         key = jrandom.PRNGKey(seed)
         keys = jrandom.split(key, num=5)
         self.static_embedder = StaticEmbedder(static_in_size, hidden_size, dropout, keys[0])
-        
-        static_args = (hidden_size, intermediate_size, num_layers, num_heads, dropout) 
+
+        static_args = (hidden_size, intermediate_size, num_layers, num_heads, dropout)
         self.d_encoder = SelfAttnEncoder(seq_length, daily_in_size, *static_args, keys[1])
         self.i_encoder = SelfAttnEncoder(seq_length, irregular_in_size, *static_args, keys[2])
         self.decoder = CrossAttnDecoder(seq_length, *static_args, keys[3])
@@ -336,8 +291,8 @@ class EATransformer(eqx.Module):
     def __call__(self, data: dict, key: jrandom.PRNGKey) -> jnp.ndarray:
         keys = jrandom.split(key, num=4)
 
-        # Kluge to get it running now. Will address data loader later.        
-        mask = ~jnp.any(jnp.isnan(data['x_di']),axis=1)
+        # Kluge to get it running now. Will address data loader later.
+        mask = ~jnp.any(jnp.isnan(data['x_di']), axis=1)
         data['x_di'] = jnp.where(jnp.isnan(data['x_di']), 0, data['x_di'])
         # Kluge to get it running now. Will address data loader later.
 

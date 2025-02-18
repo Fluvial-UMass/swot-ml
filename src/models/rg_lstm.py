@@ -14,7 +14,7 @@ class RG_LSTM(eqx.Module):
     cell: eqx.nn.LSTMCell
     q_proj: eqx.nn.Linear
     dense: eqx.nn.Linear
-    
+
     def __init__(self, input_size, hidden_size, output_size, graph_matrix, *, key):
         self.graph_matrix = self._calc_adjacency(graph_matrix)
         self.num_graph_nodes = graph_matrix.shape[0]
@@ -28,15 +28,16 @@ class RG_LSTM(eqx.Module):
     def _calc_adjacency(self, dist):
         dist = jnp.array(dist)
         dist = jnp.where(dist == 0, jnp.nan, dist)
-        dist_norm = (dist-jnp.nanmean(dist))/jnp.nanstd(dist)
+        dist_norm = (dist - jnp.nanmean(dist)) / jnp.nanstd(dist)
         A = 1 / (1 + jnp.exp(dist_norm))
         A = jnp.where(jnp.isnan(A), 0, A)
         return A
-        
+
     def _transfer(self, x):
         return jax.nn.tanh(self.q_proj(x))
-        
+
     def __call__(self, x_d, x_s):
+
         def scan_fn(state, x_d_t):
             #Graph convolution has to happen outside cell vmap
             q = jax.vmap(self._transfer)(state[0])
@@ -47,36 +48,25 @@ class RG_LSTM(eqx.Module):
             x = jnp.concat([x_d_t, x_s], axis=1)
             new_state = jax.vmap(self.cell)(x, (state[0], c0_t))
             return new_state, new_state
-    
-        init_state = (jnp.zeros((self.num_graph_nodes, self.hidden_size)),)*2 # Tuple of h, c
+
+        init_state = (jnp.zeros((self.num_graph_nodes, self.hidden_size)),) * 2  # Tuple of h, c
         final_state, all_states = jax.lax.scan(scan_fn, init_state, x_d)
 
         out = jax.vmap(self.dense)(final_state[0])
-        
+
         return out
 
 
 class Graph_LSTM(eqx.Module):
     rg_lstm: RG_LSTM
     target: list
-    
-    def __init__(self, *, 
-                 target: list, 
-                 dynamic_size: int, 
-                 static_size: int, 
-                 hidden_size: int,
-                 graph_matrix: np.array, 
-                 seed: int,
-                 dropout: float):
-        
+
+    def __init__(self, *, target: list, dynamic_size: int, static_size: int, hidden_size: int, graph_matrix: np.array,
+                 seed: int, dropout: float):
+
         key = jax.random.PRNGKey(seed)
-        self.rg_lstm = RG_LSTM(
-            dynamic_size + static_size, 
-            hidden_size, 
-            len(target),
-            graph_matrix,
-            key=key)
-        
+        self.rg_lstm = RG_LSTM(dynamic_size + static_size, hidden_size, len(target), graph_matrix, key=key)
+
         self.target = target
 
     def __call__(self, data, keys):

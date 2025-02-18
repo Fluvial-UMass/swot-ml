@@ -13,6 +13,5 @@ xarray
 netcdf4
 ipympl
 tqdm
-matplotlib
 numpy
-exactextract
+yapf
