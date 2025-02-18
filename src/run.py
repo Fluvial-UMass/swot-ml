@@ -8,9 +8,7 @@ mp.freeze_support()
 
 import sys
 import traceback
-import argparse
-import os
-import signal
+from argparse import ArgumentParser
 from pathlib import Path
 import pickle
 
@@ -28,49 +26,68 @@ def cleanup_dl(dl: HydroDataLoader):
     del dl
 
 
-def load_model(run_dir):
-    state = load_last_state(run_dir)
+def load_model(run_dir: Path):
+    model_loaded, state = load_last_state(run_dir)
+    if not model_loaded:
+        raise RuntimeError(f"Model could not be loaded from {run_dir}")
+
     cfg = state[0]
     model = state[1]
     trainer_state = state[2]
     return cfg, model, trainer_state
 
 
-def start_training(config_yml):
-    cfg, _ = read_config(config_yml)
+def train_from_config(cfg: dict, trainer_kwargs: dict = {}):
     dataset = HydroDataset(cfg)
     cfg = set_model_data_args(cfg, dataset)
     dataloader = HydroDataLoader(cfg, dataset)
-    trainer = Trainer(cfg, dataloader, log_parent=config_yml.parent)
-    trainer.start_training()
 
+    trainer = Trainer(cfg, dataloader, **trainer_kwargs)
+    trainer.start_training()
     cleanup_dl(dataloader)
+
+    return cfg, trainer, dataset
+
+
+def start_training(config_yml: Path):
+    cfg, _ = read_config(config_yml)
+    cfg, trainer, dataset = train_from_config(cfg)
+
+    return cfg, trainer.model, trainer.log_dir, dataset
+
+
+def train_ensemble(config_yml: Path, ensemble_seed: int):
+    cfg, _ = read_config(config_yml)
+    cfg['model_args']['seed'] += ensemble_seed
+
+    log_dir = config_yml.parent / "ensemble" / f"seed_{ensemble_seed:02d}"
+    trainer_kwargs = {'log_dir': log_dir}
+    cfg, trainer, dataset = train_from_config(cfg, trainer_kwargs)
+
     return cfg, trainer.model, trainer.log_dir, dataset
 
 
 def finetune(finetune_yml: Path):
-    finetune = read_yml(finetune_yml)
-    run_dir = Path(finetune_yml).parent
-
     # Load the config and manipulate it a bit
+    run_dir = finetune_yml.parent
     cfg, _, trainer_state = load_model(run_dir)
     stop_epoch = trainer_state['epoch']
+
+    # Read in the finetuning parameters
+    finetune = read_yml(finetune_yml)
     cfg['num_epochs'] = stop_epoch + finetune.get('additional_epochs', 0)
     cfg['transition_begin'] = stop_epoch if finetune.get('reset_lr') else 0
     cfg['cfg_path'] = finetune_yml
     # Insert these params directly.
     cfg.update(finetune.get('config_update', {}))
 
-    dataset = HydroDataset(cfg)
-    dataloader = HydroDataLoader(cfg, dataset)
-    trainer = Trainer(cfg, dataloader, log_parent=finetune_yml.parent, continue_from=run_dir)
-    trainer.start_training()
+    trainer_kwargs = {'continue_from': run_dir}
+    cfg, trainer, dataset = train_from_config(cfg, trainer_kwargs)
 
-    cleanup_dl(dataloader)
     return cfg, trainer.model, trainer.log_dir, dataset
 
 
-def hyperparam_grid_search(config_yml: Path, idx, k_folds=None):
+def hyperparam_grid_search(config_yml: Path, idx: int, k_folds=None):
     cfg, _ = read_config(config_yml)
     cfg = update_cfg_from_grid(cfg, idx)
 
@@ -138,27 +155,7 @@ def make_all_plots(cfg, results, bulk_metrics, basin_metrics, data_subset, log_d
     fig = mosaic_scatter(cfg, results, bulk_metrics, str(log_dir))
     fig.savefig(fig_dir / f"density_scatter.png", dpi=300)
 
-    metric_args = {
-        'R2': {
-            'range': [-1, 1]
-        },
-        'nBias': {
-            'range': [-100, 100]
-        },
-        'rRMSE': {
-            'range': [0, 500]
-        },
-        'KGE': {
-            'range': [-1, 1]
-        },
-        'NSE': {
-            'range': [-4, 1]
-        },
-        'Agreement': {
-            'range': [0, 1]
-        }
-    }
-    figs = basin_metric_histograms(basin_metrics, metric_args)
+    figs = basin_metric_histograms(basin_metrics)
     for target, fig in figs.items():
         fig.savefig(fig_dir / f"{target}_metrics_hist.png", dpi=300)
 
@@ -176,7 +173,7 @@ def eval_model(cfg,
 
     Notes:
     -----
-    - The `predict` subset does not generate plots, regardless of the value of `make_plots`.
+    - The `predict` subset does not generate plots, regardless of the value of `make_plots`. 
       These would be identical to test, as 'predict' covers the same basins and time period
       as 'test' but without validation data.
 
@@ -224,13 +221,16 @@ def eval_model(cfg,
     eval_data_subset('train', run_train)
 
 
-def main(args):
+def main(args: ArgumentParser):
     # Default values
     run_test = run_predict = run_train = True
 
     if args.train:
         config_yml = Path(args.train).resolve()
         cfg, model, eval_dir, dataset = start_training(config_yml)
+    elif args.train_ensemble:
+        config_yml = Path(args.train_ensemble).resolve()
+        cfg, model, eval_dir, dataset = train_ensemble(config_yml, args.ensemble_seed)
     elif args.finetune:
         finetune_yml = Path(args.finetune).resolve()
         cfg, model, eval_dir, dataset = finetune(finetune_yml)
@@ -239,7 +239,7 @@ def main(args):
         hyperparam_grid_search(config_yml, args.grid_index, args.k_folds)
         return
     elif args.test:
-        run_dir = Path(args.test).resolve()
+        run_dir = args.test.resolve()
         cfg, model, _ = load_model(run_dir)
         dataset = HydroDataset(cfg)
         eval_dir = run_dir
@@ -253,16 +253,22 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Run model based on the command line arguments.")
+    parser = ArgumentParser(description="Run model based on the command line arguments.")
 
     # Create a mutually exclusive arg group for train/continue/test.
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--train', type=str, help='Path to the training configuration file.')
-    group.add_argument('--finetune', type=str, help='Path to the finetune configuration yml file.')
-    group.add_argument('--grid_search', type=str, help='Path to the grid search configuration file.')
-    group.add_argument('--test', type=str, help='Path to directory with model to test.')
-    group.add_argument('--prediction_model', type=str, help='Path to directory with model to use for predictions.')
+    group.add_argument('--train', type=Path, help='Path to the training configuration file.')
+    group.add_argument('--train_ensemble', type=Path, help='Path to the training configuration file.')
+    group.add_argument('--finetune', type=Path, help='Path to the finetune configuration yml file.')
+    group.add_argument('--grid_search', type=Path, help='Path to the grid search configuration file.')
+    group.add_argument('--test', type=Path, help='Path to directory with model to test.')
+    group.add_argument('--prediction_model', type=Path, help='Path to directory with model to use for predictions.')
 
+    # Add a new argument for grid search index
+    parser.add_argument('--ensemble_seed',
+                        type=int,
+                        help='Integer to be added to the model seed (required if --grid_search is used)',
+                        required='--train_ensemble' in sys.argv)
     # Add a new argument for grid search index
     parser.add_argument('--grid_index',
                         type=int,

@@ -58,9 +58,31 @@ def mosaic_scatter(cfg, results, metrics, title_str):
     return fig
 
 
-def basin_metric_histograms(basin_metrics, metric_args, cdf=True):
+def basin_metric_histograms(basin_metrics, metric_args=None, cdf=True):
     cols = 3
     rows = int(np.ceil(len(metric_args) / cols))
+
+    if metric_args is None:
+        metric_args = {
+            'R2': {
+                'range': [-1, 1]
+            },
+            'nBias': {
+                'range': [-100, 100]
+            },
+            'rRMSE': {
+                'range': [0, 500]
+            },
+            'KGE': {
+                'range': [-1, 1]
+            },
+            'NSE': {
+                'range': [-1, 1]
+            },
+            'Agreement': {
+                'range': [0, 1]
+            }
+        }
 
     if cdf:
         common_args = {'bins': 500, 'cumulative': True, 'density': True, 'histtype': 'step'}
