@@ -3,25 +3,25 @@ import jax
 import jax.lax as lax
 import jax.numpy as jnp
 import jax.random as jrandom
-from typing import Optional
+from jaxtyping import Array, PRNGKeyArray
+from typing import Optional, Callable
 
 
 class BaseLSTM(eqx.Module):
     """
-    Base class for LSTM models in the Equinox framework.
+    Base class for LSTM models.
 
     Attributes:
         hidden_size (int): Size of the hidden state.
         cell (eqx.Module): LSTM cell module.
-        dense (eqx.nn.Linear or function): Linear layer for output transformation if `dense=True`,
-                                            otherwise a lambda function that returns its input.
+        dense (eqx.nn.Linear or function): Linear layer for output transformation if `dense=True`.
     """
     hidden_size: int
-    cell: eqx.Module
+    cell: eqx.nn.LSTMCell
     dropout: eqx.nn.Dropout
-    dense: eqx.nn.Linear = None
+    dense: eqx.nn.Linear | None = None
 
-    def __init__(self, in_size, hidden_size, dense_size, dropout, *, key):
+    def __init__(self, in_size: int, hidden_size: int, dense_size: int, dropout: float, *, key: PRNGKeyArray):
         """
         Initializes the BaseLSTM model.
     
@@ -51,10 +51,10 @@ class LSTM(BaseLSTM):
     Standard LSTM model built on the BaseLSTM class.
     """
 
-    def __init__(self, in_size, hidden_size, out_size, *, key, **kwargs):
+    def __init__(self, in_size: int, hidden_size: int, out_size: int, *, key: PRNGKeyArray, **kwargs):
         super().__init__(in_size, hidden_size, out_size, key=key, **kwargs)
 
-    def __call__(self, x_d, key):
+    def __call__(self, x_d: Array, key: PRNGKeyArray):
 
         def scan_fn(state, xd):
             return self.cell(xd, state), None
@@ -78,7 +78,13 @@ class EALSTMCell(eqx.Module):
     input_linear: Optional[eqx.nn.Linear]
     entity_aware: bool = eqx.field(static=True)
 
-    def __init__(self, dynamic_in_size: int, static_in_size: int, hidden_size: int, entity_aware: bool = True, *, key):
+    def __init__(self,
+                 dynamic_in_size: int,
+                 static_in_size: int,
+                 hidden_size: int,
+                 entity_aware: bool = True,
+                 *,
+                 key: PRNGKeyArray):
 
         wkey, bkey, ikey = jrandom.split(key, 3)
         self.entity_aware = entity_aware
@@ -93,15 +99,14 @@ class EALSTMCell(eqx.Module):
         self.weight_hh = jax.nn.initializers.glorot_normal()(wkey, (num_gates * hidden_size, hidden_size))
         self.bias = jax.nn.initializers.zeros(bkey, (num_gates * hidden_size,))
 
-    def __call__(self, state, x_d, i):
+    def __call__(self, state: tuple[Array, Array], x_d: Array, i: Array | None):
         """
         Forward pass of the TEALSTMCell module.
 
         Args:
             state (tuple): Tuple containing the hidden and cell states.
             x_d (jax.Array): Dynamic input features.
-            x_s (jax.Array): Static input features.
-            skip_count (int): Number of skipped updates due to missing data.
+            i (Optional; jax.Array): Input gate values (evaluated outside cell)
 
         Returns:
             Updated state and current skip count
@@ -142,7 +147,7 @@ class EALSTM(BaseLSTM):
                  dropout: float,
                  return_all: bool = False,
                  *,
-                 key):
+                 key: PRNGKeyArray):
 
         super().__init__(dynamic_in_size, hidden_size, dense_size, dropout, key=key)
         self.entity_aware = static_in_size > 0
@@ -150,14 +155,13 @@ class EALSTM(BaseLSTM):
 
         self.cell = EALSTMCell(dynamic_in_size, static_in_size, hidden_size, self.entity_aware, key=key)
 
-    def __call__(self, x_d, x_s, key):
+    def __call__(self, x_d: Array, x_s: Array, key: PRNGKeyArray):
         """
         Forward pass of the EALSTM.
 
         Args:
-            data (dict): Contains at least these two keys:
-                x_d (jax.Array): Dynamic input features.
-                x_s (jax.Array): Static input features.
+            x_d (jax.Array): Dynamic input features.
+            x_s (jax.Array): Static input features.
 
         Returns:
             Final state, all states, or densified final state depending on config. 
@@ -206,7 +210,7 @@ class TEALSTMCell(eqx.Module):
                  time_aware: bool = True,
                  entity_aware: bool = True,
                  *,
-                 key):
+                 key: PRNGKeyArray):
 
         wkey, bkey, ikey, dkey = jrandom.split(key, 4)
         self.time_aware = time_aware
@@ -229,7 +233,7 @@ class TEALSTMCell(eqx.Module):
             self.weight_decomp = None
             self.bias_decomp = None
 
-    def _decomp_and_decay(self, c_0, skip_count):
+    def _decomp_and_decay(self, c_0: Array, skip_count: int):
         if not self.time_aware:
             return c_0
         cs_0 = jnp.tanh(jnp.dot(c_0, self.weight_decomp.T) + self.bias_decomp)
@@ -273,7 +277,7 @@ class TEALSTMCell(eqx.Module):
         skip_count = 0
         return (h_1, c_1), skip_count
 
-    def __call__(self, state, x_d, x_s, skip_count):
+    def __call__(self, state: tuple[Array, Array], x_d: Array, x_s: Array, skip_count: int):
         """
         Forward pass of the TEALSTMCell module.
 
@@ -311,7 +315,7 @@ class TEALSTM(BaseLSTM):
                  time_aware: bool = True,
                  return_all: bool = False,
                  *,
-                 key):
+                 key: PRNGKeyArray):
 
         super().__init__(dynamic_in_size, hidden_size, dense_size, dropout, key=key)
         self.time_aware = time_aware
@@ -320,7 +324,7 @@ class TEALSTM(BaseLSTM):
 
         self.cell = TEALSTMCell(dynamic_in_size, static_in_size, hidden_size, time_aware, self.entity_aware, key=key)
 
-    def __call__(self, x_d, x_s, dt, key):
+    def __call__(self, x_d: Array, x_s: Array, dt: Array, key: PRNGKeyArray):
         """
         Forward pass of the TEALSTM.
 
@@ -373,7 +377,7 @@ class IEALSTMCell(eqx.Module):
                  time_aware: bool = True,
                  entity_aware: bool = True,
                  *,
-                 key):
+                 key: PRNGKeyArray):
 
         wkey, bkey = jax.random.split(key, 2)
 

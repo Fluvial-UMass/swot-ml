@@ -1,4 +1,5 @@
 import jax
+from jaxtyping import PyTree
 import equinox as eqx
 
 from models.flexible_hybrid import FlexibleHybrid
@@ -24,7 +25,7 @@ def make(cfg: dict):
     return model
 
 
-def count_parameters(model):
+def count_parameters(model: PyTree):
     # Use tree_flatten to get a list of arrays and ensure is_leaf treats arrays as leaves
     params, _ = jax.tree_util.tree_flatten(model)
     # Count the total number of parameters

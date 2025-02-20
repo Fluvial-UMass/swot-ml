@@ -17,7 +17,7 @@ class HydroDataset(Dataset):
     DataLoader class for loading and preprocessing hydrological time series data.
     """
 
-    def __init__(self, cfg, *, train_ds=None, use_cache=True):
+    def __init__(self, cfg: dict, *, train_ds=None, use_cache=True):
         self.cfg = copy.deepcopy(cfg)
         self.log_pad = 0.001
         self.dataloader_kwargs = {}

@@ -8,11 +8,11 @@ from torch.utils.data import DataLoader
 
 class HydroDataLoader(DataLoader):
 
-    def __init__(self, cfg, dataset):
+    def __init__(self, cfg: dict, dataset):
         torch.manual_seed(cfg['model_args']['seed'])
 
         num_workers = cfg.get('num_workers', 1)
-        persistent_workers = False if num_workers == 0 else cfg.get('persistent_workers', True)
+        persistent_workers = False if num_workers == 0 else cfg.get('persistent_workers', False)
 
         super().__init__(dataset,
                          collate_fn=self.collate_fn,
@@ -35,7 +35,7 @@ class HydroDataLoader(DataLoader):
         # I can't figure out how to just not collate. Can't even use lambdas because of multiprocessing.
         return sample
 
-    def set_jax_sharding(self, backend=None, num_devices=None):
+    def set_jax_sharding(self, backend: str | None = None, num_devices: int | None = None):
         """
         Updates the jax device sharding of data. 
     
@@ -72,7 +72,7 @@ class HydroDataLoader(DataLoader):
         pspec = jshard.PartitionSpec('batch',)
         self.sharding = jshard.NamedSharding(mesh, pspec)
 
-    def shard_batch(self, batch):
+    def shard_batch(self, batch: dict):
 
         def map_fn(path, leaf):
             keys = [p.key for p in path]

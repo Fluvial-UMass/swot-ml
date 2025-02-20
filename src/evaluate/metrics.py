@@ -5,7 +5,7 @@ import sklearn.metrics as skm
 log_pad = 0.001
 
 
-def get_basin_metrics(df, disp=False):
+def get_basin_metrics(df: pd.DataFrame, disp: bool = False):
     per_basin_metrics = df.groupby(level='basin').apply(get_all_metrics)
 
     # Initialize an empty DataFrame to store results with multi-level columns
@@ -32,7 +32,7 @@ def get_basin_metrics(df, disp=False):
     return results_df
 
 
-def get_all_metrics(df: pd.DataFrame, disp=False):
+def get_all_metrics(df: pd.DataFrame, disp: bool = False):
     metrics = {}
 
     for feature in df['obs'].columns:
@@ -72,7 +72,6 @@ def mask_nan(func):
 
     def wrapper(y, y_hat, *args, **kwargs):
         mask = (y > log_pad) & (y_hat > log_pad)
-        # mask = (~np.isnan(y)) & (~np.isnan(y_hat))
         if np.sum(mask) > 1:
             y_masked = y[mask]
             y_hat_masked = y_hat[mask]

@@ -2,9 +2,10 @@ import yaml
 import numpy as np
 import itertools
 from pathlib import Path
+from typing import Any
 
 
-def read_yml(yml_path):
+def read_yml(yml_path: str | Path) -> dict[str, Any]:
     if not isinstance(yml_path, Path):
         yml_path = Path(yml_path)
 
@@ -13,7 +14,7 @@ def read_yml(yml_path):
     return yml
 
 
-def read_config(yml_path):
+def read_config(yml_path: str | Path) -> tuple[dict[str, Any], str]:
     raw_cfg = read_yml(yml_path)
     cfg = format_config(raw_cfg)
     validate_feature_dict(cfg)
@@ -24,7 +25,7 @@ def read_config(yml_path):
     return cfg, cfg_str
 
 
-def format_config(cfg):
+def format_config(cfg: dict) -> dict:
     # Ensures some data types and that some keys exist
     data_dir = Path(cfg['data_dir']).resolve()
     cfg['data_dir'] = data_dir
@@ -33,6 +34,14 @@ def format_config(cfg):
     cfg['split_time'] = np.datetime64(cfg['split_time']) if cfg.get('split_time') else None
 
     cfg['log_norm_cols'] = cfg.get('log_norm_cols', [])
+
+    def process_clip_range(range_list):
+        if len(range_list) != 2:
+            raise ValueError("Each range must have exactly 2 elements")
+        lower = -np.inf if range_list[0] is None else range_list[0]
+        upper = np.inf if range_list[1] is None else range_list[1]
+        return [lower, upper]
+
     cfg['clip_feature_range'] = {key: process_clip_range(value) for key, value in cfg['clip_feature_range'].items()}
 
     # Create the target_weights list from the dict
@@ -50,17 +59,7 @@ def format_config(cfg):
     return cfg
 
 
-def process_clip_range(range_list):
-    if len(range_list) != 2:
-        raise ValueError("Each range must have exactly 2 elements")
-
-    lower = -np.inf if range_list[0] is None else range_list[0]
-    upper = np.inf if range_list[1] is None else range_list[1]
-
-    return [lower, upper]
-
-
-def validate_feature_dict(cfg):
+def validate_feature_dict(cfg: dict):
     if not isinstance(cfg['features'], dict):
         raise ValueError("features in config must be a dict. See examples.")
 
@@ -80,7 +79,7 @@ def validate_feature_dict(cfg):
         raise ValueError(f"The features dict in config file must contains lists. {invalid_entries} is not a list.")
 
 
-def get_grid_update_tuples(cfg):
+def get_grid_update_tuples(cfg: dict):
     param_dict = cfg['param_search_dict']
     key_list = []
     value_list = []
@@ -120,7 +119,7 @@ def update_cfg_from_grid(cfg: dict, idx: int):
     return cfg
 
 
-def set_model_data_args(cfg, dataset):
+def set_model_data_args(cfg: dict, dataset):
     target = dataset.target
     target = target if isinstance(target, list) else list(target)
     cfg['model_args']['target'] = target

@@ -3,6 +3,8 @@ import optax
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
+from jaxtyping import PyTree
+
 import numpy as np
 import logging
 import pickle
@@ -14,21 +16,26 @@ from tqdm import tqdm
 from pathlib import Path
 from datetime import datetime
 
-from importlib import reload
 import models
-import train.step
-
-reload(models)
-reload(train.step)
-
 from .step import make_step
 
 
 class Trainer:
+    cfg: dict
+    dataloader: "data.HydroDataLoader"
+    log_dir: Path
+    num_epochs: int
+    lr_schedule: optax.Schedule
+    model: eqx.Module
+    loss_list: list
+    epoch: int
+    optim: optax.GradientTransformation
+    opt_state: optax.OptState
+    filter_spec: PyTree
     """
     Attributes:
         cfg (dict): Configuration dictionary.
-        dataloader: DataLoader object.
+        dataloader (HydroDataLoader): DataLoader object.
         log_dir (Path): Directory for logging.
         num_epochs (int): Number of epochs for training.
         log_interval (int): Interval for logging.
@@ -81,15 +88,17 @@ class Trainer:
         self.freeze_components(None, False)
 
     def setup_logging(self, log_parent=None, log_dir=None, continue_from=None):
+        cfg_path = self.cfg.get('cfg_path')
         current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if log_parent is not None:
-            self.log_dir = log_parent / f"{self.cfg.get('cfg_path').stem}_{current_date}"
-        elif log_dir is not None:
+
+        if log_dir:
             self.log_dir = log_dir
         elif continue_from:
             self.log_dir = continue_from
         else:
-            self.log_dir = Path(f"../runs/notebook/{current_date}")
+            if log_parent is None:
+                log_parent = cfg_path.parent
+            self.log_dir = log_parent / f"{cfg_path.stem}_{current_date}"
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
         print(f"Logging at {self.log_dir}")
@@ -148,7 +157,7 @@ class Trainer:
                 self.save_state()
             logging.info("~~~ training stopped ~~~")
 
-    def _train_epoch(self):
+    def _train_epoch(self) -> tuple[float, dict[str, dict]]:
         """
         Iterates over the dataloader batches, updates the model using the optimization step, and handles 
         any exceptions that occur during the training. Logs errors and saves error data if issues are encountered.
@@ -225,7 +234,7 @@ class Trainer:
 
         return np.mean(losses), bad_grads
 
-    def save_state(self, save_dir=None):
+    def save_state(self, save_dir: Path | None = None) -> None:
         if save_dir is None:
             save_dir = self.log_dir / f"epoch{self.epoch:03d}"
         os.makedirs(save_dir, exist_ok=True)
@@ -245,7 +254,7 @@ class Trainer:
             f.write((state_str + "\n").encode())
             eqx.tree_serialise_leaves(f, self.opt_state)
 
-    def load_state(self, epoch_dir: Path):
+    def load_state(self, epoch_dir: Path) -> tuple[bool, dict | None]:
         model_loaded, load_tuple = load_state(epoch_dir, self.cfg)
         if not model_loaded:
             return False, None
@@ -260,7 +269,7 @@ class Trainer:
         epoch_dir = _last_epoch_dir(log_dir)
         return self.load_state(epoch_dir)
 
-    def freeze_components(self, component_names=None, freeze: bool = True):
+    def freeze_components(self, component_names: list[str] | str | None = None, freeze: bool = True):
         # Updates the filterspec to set which parmaters can be updated.
         # Only accepts top-level element names in the pytree model.
         if isinstance(component_names, str):
@@ -282,7 +291,8 @@ class Trainer:
         self.filter_spec = jtu.tree_map_with_path(diff_filter, self.model)
 
 
-def load_state(state_dir: Path, cfg=None):
+def load_state(state_dir: Path,
+               cfg: dict = None) -> tuple[bool, tuple[dict, eqx.Module, dict, optax.OptState, dict | None] | None]:
     if not isinstance(state_dir, Path) or not state_dir.is_dir():
         print('Model state directory not found!')
         return False, None
@@ -326,7 +336,7 @@ def load_state(state_dir: Path, cfg=None):
     return True, out
 
 
-def _last_epoch_dir(log_dir):
+def _last_epoch_dir(log_dir: Path) -> Path:
     epoch_regex = re.compile(r"epoch(\d+)")
     dirs = os.listdir(log_dir)
     matches = [epoch_regex.match(d) for d in dirs]
@@ -338,6 +348,6 @@ def _last_epoch_dir(log_dir):
         return log_dir / f"epoch{epoch_strs[last_epoch_idx]}"
 
 
-def load_last_state(log_dir):
+def load_last_state(log_dir: Path):
     save_dir = _last_epoch_dir(log_dir)
     return load_state(save_dir)

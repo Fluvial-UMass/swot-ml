@@ -1,13 +1,11 @@
 import numpy as np
 import pandas as pd
-import geopandas as gpd
 import matplotlib.pyplot as plt
-import matplotlib.colors as colors
 
 
-def mosaic_scatter(cfg, results, metrics, title_str):
+def mosaic_scatter(cfg: dict, results: pd.DataFrame, metrics: pd.DataFrame, title: str):
 
-    def hexbin_1to1(ax, x, y, target, metrics):
+    def hexbin_1to1(ax: plt.Axes, x: pd.Series, y: pd.Series, target: str):
         positive_mask = (x > 0) & (y > 0)
         x = x[positive_mask]
         y = y[positive_mask]
@@ -50,15 +48,15 @@ def mosaic_scatter(cfg, results, metrics, title_str):
     for target, ax in zip(targets, axes):
         x = results['obs'][target]
         y = results['pred'][target]
-        hexbin_1to1(ax, x, y, target, metrics)
+        hexbin_1to1(ax, x, y, target)
 
     fig.subplots_adjust(top=0.9, bottom=0.3)
-    fig.suptitle(title_str)
+    fig.suptitle(title)
 
     return fig
 
 
-def basin_metric_histograms(basin_metrics, metric_args=None, cdf=True):
+def basin_metric_histograms(basin_metrics: pd.DataFrame, metric_args: dict = None, cdf: bool = True):
     cols = 3
     rows = int(np.ceil(len(metric_args) / cols))
 
@@ -118,76 +116,3 @@ def basin_metric_histograms(basin_metrics, metric_args=None, cdf=True):
         fig_dict[target] = fig
 
     return fig_dict
-
-
-def map_animation(cfg, model, dataset, target, cmap_label, period, lim, dt_alpha=1, log=True, denorm=True):
-    from data import HydroDataLoader
-    from evaluate import model_iterate
-    import matplotlib.animation as animation
-
-    wqp_locs = gpd.read_file("/work/pi_kandread_umass_edu/tss-ml/data/NA_WQP/metadata/wqp_sites.shp")
-    wqp_locs = wqp_locs.set_index('LocationID')
-    wqp_locs = wqp_locs.to_crs("EPSG:5070")
-
-    dataset.inference_mode = True
-    dataloader_kwargs = dataset.date_batching(date_range=period)  # Return batches where each batch is 1 day
-    cfg.update(dataloader_kwargs)
-    dataloader = HydroDataLoader(cfg, dataset)
-
-    test_basins = wqp_locs.loc[dataset.all_basins]
-    test_basins['y_hat'] = 0.0
-    target_idx = np.where([t == target for t in dataset.target])[0]
-
-    def draw_year_progress(ax, date):
-        year_start = pd.Timestamp(date.year, 1, 1)
-        year_end = pd.Timestamp(date.year, 12, 31)
-        progress = (date - year_start).days / (year_end - year_start).days
-
-        ax.add_patch(plt.Rectangle((0.1, 0.05), 0.8, 0.04, fill=False, transform=ax.transAxes))
-        ax.add_patch(plt.Rectangle((0.1, 0.05), 0.8 * progress, 0.04, facecolor='black', transform=ax.transAxes))
-        text_str = date.strftime('%Y-%m-%d')
-        ax.text(0.1, 0.1, text_str, transform=ax.transAxes, fontsize=14, ha='left', va='bottom')
-
-    # Create an empty plot
-    fig, ax = plt.subplots(1, 1, figsize=(8, 4))
-    fig.set_tight_layout(True)
-
-    if log:
-        norm = colors.LogNorm(vmin=lim[0], vmax=lim[1])
-    else:
-        norm = colors.Normalize(vmin=lim[0], vmax=lim[1])
-
-    # Add color bar
-    sm = plt.cm.ScalarMappable(cmap='inferno', norm=norm)
-    sm._A = []  # Empty array for the scalar mappable
-    cbar = plt.colorbar(sm, ax=ax, shrink=0.65, aspect=15, label=cmap_label)
-
-    # Initialize animation frame
-    plot = test_basins.plot(column='y_hat', cmap='inferno', norm=norm, ax=ax)
-
-    # Data iterator wrapper for frames
-    def frames():
-        for data in model_iterate(model, dataloader, True, False, True):
-            yield data
-
-    # Updates the plot based on the data passed by frames()
-    def update(frame):
-        # Function signature is fixed so we have to unpack.
-        basin, date, y_hat, dt = frame
-        alpha = np.where(dt[:, 1] == 0, 1, dt_alpha)
-        ax.clear()
-
-        # Insert the data into our gdf and then plot.
-        test_basins.loc[basin, 'y_hat'] = y_hat[:, target_idx]
-        test_basins.plot(column='y_hat', cmap='inferno', linewidth=0, alpha=alpha, norm=norm, ax=ax)
-
-        draw_year_progress(ax, pd.Timestamp(date[0]))
-        ax.set_axis_off()
-        return plot
-
-    # Create the animation
-    ani = animation.FuncAnimation(fig, update, frames=frames, interval=1000 / 10, repeat=True, cache_frame_data=False)
-
-    return ani
-
-    # ani.save('ssc_animation.mp4', writer='ffmpeg', dpi=300)

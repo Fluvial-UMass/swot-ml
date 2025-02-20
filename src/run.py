@@ -60,7 +60,7 @@ def train_ensemble(config_yml: Path, ensemble_seed: int):
     cfg, _ = read_config(config_yml)
     cfg['model_args']['seed'] += ensemble_seed
 
-    log_dir = config_yml.parent / "ensemble" / f"seed_{ensemble_seed:02d}"
+    log_dir = config_yml.parent / "base_models" / f"seed_{ensemble_seed:02d}"
     trainer_kwargs = {'log_dir': log_dir}
     cfg, trainer, dataset = train_from_config(cfg, trainer_kwargs)
 
@@ -93,7 +93,7 @@ def hyperparam_grid_search(config_yml: Path, idx: int, k_folds=None):
 
     k = 4 if k_folds is None else k_folds
     for i in range(k):
-        log_dir = config_yml.parent / f"index_{idx}" / f"fold_{i}"
+        log_dir = config_yml.parent / "trials" / f"index_{idx}" / f"fold_{i}"
         out_file = log_dir / "test_data.pkl"
         if out_file.is_file():
             print(f"Fold {i+1} of {k} was already completed.")

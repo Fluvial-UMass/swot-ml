@@ -1,6 +1,7 @@
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, PRNGKeyArray
 
 from models.lstm import EALSTM
 from models.transformer import StaticEmbedder, CrossAttnDecoder
@@ -14,7 +15,8 @@ class StackedMLP(eqx.Module):
     append_static: bool
     mlp: eqx.nn.MLP
 
-    def __init__(self, dynamic_in_size, static_in_size, out_size, width_size, depth, *, key):
+    def __init__(self, dynamic_in_size: int, static_in_size: int, out_size: int, width_size: int, depth: int, *,
+                 key: PRNGKeyArray):
         self.append_static = static_in_size > 0
         self.mlp = eqx.nn.MLP(in_size=dynamic_in_size + static_in_size,
                               out_size=out_size,
@@ -22,7 +24,7 @@ class StackedMLP(eqx.Module):
                               depth=depth,
                               key=key)
 
-    def __call__(self, x_d, x_s, key):
+    def __call__(self, x_d: Array, x_s: Array, key: PRNGKeyArray):
         # vmap function that optionally adds static data
         def mlp_apply(x):
             input = jnp.concatenate([x, x_s], axis=-1) if self.append_static else x
@@ -100,7 +102,7 @@ class LSTM_MLP_ATTN(eqx.Module):
         self.head = eqx.nn.Linear(in_features=hidden_size * len(self.decoders), out_features=len(target), key=keys[3])
         self.target = target
 
-    def __call__(self, data, key):
+    def __call__(self, data: dict[str, Array | dict[str, Array]], key: PRNGKeyArray):
         keys = jax.random.split(key, 3)
 
         # Static embedding

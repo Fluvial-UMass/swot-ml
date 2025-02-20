@@ -3,15 +3,16 @@ import jax
 import pandas as pd
 import numpy as np
 from tqdm.auto import tqdm
-from data import HydroDataset, HydroDataLoader
+from typing import Iterator
+from jaxtyping import Array, PRNGKeyArray
 
 
 @eqx.filter_jit
-def _model_map(model, batch, keys):
+def _model_map(model, batch: dict[str:Array], keys: list[PRNGKeyArray]):
     return jax.vmap(model)(batch, keys)
 
 
-def model_iterate(model, dataloader: HydroDataLoader, quiet=False, denormalize=True):
+def model_iterate(model: eqx.Module, dataloader, quiet: bool = False, denormalize: bool = True) -> Iterator[dict]:
     # Set model to inference mode (no dropout)
     model = eqx.nn.inference_mode(model)
     # Dummy batch keys (only used for dropout, which is off).
@@ -41,7 +42,7 @@ def model_iterate(model, dataloader: HydroDataLoader, quiet=False, denormalize=T
         yield out_dict
 
 
-def predict(model, dataloader, *, quiet=False, denormalize=True):
+def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: bool = True):
     # inference_mode = dataloader.dataset.inference_mode
     basins = []
     dates = []

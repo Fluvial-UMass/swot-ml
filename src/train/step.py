@@ -2,19 +2,21 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
+from jaxtyping import Array, PRNGKeyArray, PyTree
+from typing import Callable
 
 
-def mse_loss(y, y_pred, mask):
+def mse_loss(y: Array, y_pred: Array, mask: Array):
     mse = jnp.mean(jnp.square(y - y_pred), where=mask)
     return mse
 
 
-def mae_loss(y, y_pred, mask):
+def mae_loss(y: Array, y_pred: Array, mask: Array):
     mae = jnp.mean(jnp.abs(y - y_pred), where=mask)
     return mae
 
 
-def huber_loss(y, y_pred, mask, *, huber_delta=1.0):
+def huber_loss(y: Array, y_pred: Array, mask: Array, *, huber_delta: float = 1.0):
     # Passing delta through make_step is not yet implemented.
     residual = y - y_pred
     condition = jnp.abs(residual) <= huber_delta
@@ -23,7 +25,7 @@ def huber_loss(y, y_pred, mask, *, huber_delta=1.0):
     return jnp.mean(jnp.where(condition, squared_loss, linear_loss), where=mask)
 
 
-def flux_agreement(y_pred, target_list):
+def flux_agreement(y_pred: Array, target_list: list):
     ssc = y_pred[:, target_list.index('ssc')] / 1E6  # mg/l -> kg/l
     flux = y_pred[:, target_list.index('flux')] / 1.102 / 1E3  # short ton/day -> kg/d
     q = y_pred[:, target_list.index('usgs_q')] * 24 * 3600 * 1000  # m^3/s -> l/d
@@ -33,15 +35,21 @@ def flux_agreement(y_pred, target_list):
 
 
 @eqx.filter_value_and_grad
-def compute_loss(diff_model, static_model, data, keys, denormalize_fn, loss_name, target_weights, agreement_weight):
+def compute_loss(diff_model: PyTree, static_model: PyTree, data: dict[str:Array | dict[str:Array]],
+                 keys: list[PRNGKeyArray], denormalize_fn: Callable, loss_name: str, target_weights: list[float],
+                 agreement_weight: float) -> float:
     """
     Computes the loss between the model predictions and the targets using the specified loss function.
 
     Args:
-        diff_model (equinox.Module): differentiable components of model.
-        static_model (equinox.Module): static components of model.
-        data (dict): Dictionary containing all input data.
+        diff_model (PyTree): Differentiable components of model.
+        static_model (PyTree): Static components of model.
+        data (dict): Dictionary Containing all input data.
+        keys (list[PRNGKeyArray]): List of rng keys for batch.
+        denormalize_fn (Callable): Function to denormalize data back to real units. Useful for some types of regularization.
         loss_name (str): The name of the loss function to use.
+        target_weights (list[float]): List of weights for each target.
+        agreement_weight (float): Agreement regularization weight.
 
     Returns:
         float: The computed loss.
@@ -94,16 +102,16 @@ def compute_loss(diff_model, static_model, data, keys, denormalize_fn, loss_name
     return loss
 
 
-def clip_gradients(grads, max_norm):
+def clip_gradients(grads: PyTree, max_norm: float) -> PyTree:
     """
     Clip gradients to prevent them from exceeding a maximum norm.
 
     Args:
-        grads (jax.grad): The gradients to be clipped.
+        grads (PyTree): The gradients to be clipped.
         max_norm (float): The maximum norm for clipping.
         
     Returns:
-        jax.grad: The clipped gradients.
+        PyTree: The clipped gradients.
     """
     total_norm = jtu.tree_reduce(lambda x, y: x + y, jtu.tree_map(lambda x: jnp.sum(x**2), grads))
     total_norm = jnp.sqrt(total_norm)
@@ -112,7 +120,9 @@ def clip_gradients(grads, max_norm):
 
 
 @eqx.filter_jit
-def make_step(model, data, keys, opt_state, optim, filter_spec, denormalize_fn, **kwargs):
+def make_step(model: eqx.Module, data: dict[str:Array | dict[str:Array]], keys: list[PRNGKeyArray], opt_state: PyTree,
+              optim: Callable, filter_spec: PyTree, denormalize_fn: Callable,
+              **kwargs) -> tuple[float, PyTree, eqx.Module, PyTree]:
     """
     Performs a single optimization step, updating the model parameters.
 
