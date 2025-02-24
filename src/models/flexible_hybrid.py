@@ -31,7 +31,8 @@ class FlexibleHybrid(eqx.Module):
         # Encoder for static data if used.
         entity_aware = static_size > 0
         if entity_aware:
-            self.static_embedder = StaticEmbedder(static_size, hidden_size, dropout, keys[1])
+            self.static_embedder = StaticEmbedder(static_size, hidden_size, dropout,
+                                                  keys[1])
             static_size = hidden_size
         else:
             self.static_embedder = None
@@ -57,13 +58,18 @@ class FlexibleHybrid(eqx.Module):
         # Set up each cross-attention decoder
         if len(cross_vars) > 0:
             for var_name, var_key in zip(cross_vars, decoder_keys):
-                self.decoders[var_name] = CrossAttnDecoder(seq_length, hidden_size, hidden_size, num_layers, num_heads,
-                                                           dropout, entity_aware, var_key)
+                self.decoders[var_name] = CrossAttnDecoder(seq_length, hidden_size,
+                                                           hidden_size, num_layers,
+                                                           num_heads, dropout,
+                                                           entity_aware, var_key)
         else:
-            self.decoders['self'] = CrossAttnDecoder(seq_length, hidden_size, hidden_size, num_layers, num_heads,
+            self.decoders['self'] = CrossAttnDecoder(seq_length, hidden_size,
+                                                     hidden_size, num_layers, num_heads,
                                                      dropout, entity_aware, var_key)
 
-        self.head = eqx.nn.Linear(in_features=hidden_size * len(self.decoders), out_features=len(target), key=keys[3])
+        self.head = eqx.nn.Linear(in_features=hidden_size * len(self.decoders),
+                                  out_features=len(target),
+                                  key=keys[3])
         self.target = target
 
     def __call__(self, data, key):
@@ -80,8 +86,8 @@ class FlexibleHybrid(eqx.Module):
         encoded_data = {}
         masks = {}
         for (var_name, encoder), e_key in zip(self.encoders.items(), encoder_keys):
-            encoded_data[var_name] = encoder(data['dynamic'][var_name], static_bias, data['dynamic_dt'][var_name],
-                                             e_key)
+            encoded_data[var_name] = encoder(data['dynamic'][var_name], static_bias,
+                                             data['dynamic_dt'][var_name], e_key)
             masks[var_name] = ~jnp.any(jnp.isnan(data['dynamic'][var_name]), axis=1)
 
         # Decoders
@@ -94,11 +100,13 @@ class FlexibleHybrid(eqx.Module):
             decoder_keys = jax.random.split(keys[2], len(cross_vars))
             decoded_list = []
             for k, d_key in zip(cross_vars, decoder_keys):
-                decoded_list.append(self.decoders[k](query, encoded_data[k], static_bias, masks[k], d_key))
+                decoded_list.append(self.decoders[k](query, encoded_data[k],
+                                                     static_bias, masks[k], d_key))
             pooled_output = jnp.concatenate(decoded_list, axis=0)
 
         else:
             # Use self-attention for a single source
-            pooled_output = self.decoders['self'](query, query, static_bias, masks[source_var], keys[-1])
+            pooled_output = self.decoders['self'](query, query, static_bias,
+                                                  masks[source_var], keys[-1])
 
         return self.head(pooled_output)

@@ -29,9 +29,18 @@ def mosaic_scatter(cfg: dict, results: pd.DataFrame, metrics: pd.DataFrame, titl
         # Add a 1:1 line over the min and max of x and y
         ax.plot([min_val, max_val], [min_val, max_val], 'r--')
 
-        textstr = '\n'.join([f"{key}: {metrics[target][key]:0.2f}" for key in ['R2', 'RE', 'MAPE', 'nBias']])
+        textstr = '\n'.join([
+            f"{key}: {metrics[target][key]:0.2f}"
+            for key in ['R2', 'RE', 'MAPE', 'nBias']
+        ])
         props = dict(boxstyle='round', facecolor='white', alpha=0.5)
-        ax.text(0, -0.4, textstr, transform=ax.transAxes, fontsize=10, verticalalignment='top', bbox=props)
+        ax.text(0,
+                -0.4,
+                textstr,
+                transform=ax.transAxes,
+                fontsize=10,
+                verticalalignment='top',
+                bbox=props)
 
         # Setting axes to be square and equal range
         ax.axis('square')
@@ -56,34 +65,32 @@ def mosaic_scatter(cfg: dict, results: pd.DataFrame, metrics: pd.DataFrame, titl
     return fig
 
 
-def basin_metric_histograms(basin_metrics: pd.DataFrame, metric_args: dict = None, cdf: bool = True):
-    cols = 3
-    rows = int(np.ceil(len(metric_args) / cols))
-
+def basin_metric_histograms(basin_metrics: pd.DataFrame,
+                            metric_args: dict | None = None,
+                            cdf: bool = True):
     if metric_args is None:
         metric_args = {
             'R2': {
                 'range': [-1, 1]
             },
-            'nBias': {
-                'range': [-100, 100]
-            },
-            'rRMSE': {
-                'range': [0, 500]
+            'RE': {
+                'range': [0, 100]
             },
             'KGE': {
                 'range': [-1, 1]
-            },
-            'NSE': {
-                'range': [-1, 1]
-            },
-            'Agreement': {
-                'range': [0, 1]
             }
         }
 
+    cols = 3
+    rows = int(np.ceil(len(metric_args) / cols))
+
     if cdf:
-        common_args = {'bins': 500, 'cumulative': True, 'density': True, 'histtype': 'step'}
+        common_args = {
+            'bins': 500,
+            'cumulative': True,
+            'density': True,
+            'histtype': 'step'
+        }
     else:
         common_args = {'bins': 20}
 
@@ -100,7 +107,8 @@ def basin_metric_histograms(basin_metrics: pd.DataFrame, metric_args: dict = Non
             tmp = tmp[valid_mask]
 
             ax.hist(tmp, **common_args, **metric_kwargs)
-            ax.set_title(f"{metric} (m:{np.nanmedian(tmp):0.2f}, n:{np.sum(valid_mask)})")
+            ax.set_title(
+                f"{metric} (m:{np.nanmedian(tmp):0.2f}, n:{np.sum(valid_mask)})")
 
             lims = metric_kwargs.get('range')
             if lims:

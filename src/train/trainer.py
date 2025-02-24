@@ -21,6 +21,52 @@ from .step import make_step
 
 
 class Trainer:
+    """Trainer class for training hydrological models.
+
+    Attributes
+    ----------
+    cfg : dict
+        Configuration dictionary.
+    dataloader : data.HydroDataLoader
+        DataLoader object.
+    log_dir : Path
+        Directory for logging.
+    num_epochs : int
+        Number of epochs for training.
+    lr_schedule : optax.Schedule
+        Learning rate scheduler.
+    model : eqx.Module
+        Model to be trained.
+    loss_list : list
+        List to store loss values.
+    epoch : int
+        Current epoch.
+    optim : optax.GradientTransformation
+        Optimizer.
+    opt_state : optax.OptState
+        Optimizer state.
+    filter_spec : PyTree
+        Specification for freezing components.
+
+    Methods
+    -------
+    __init__(cfg, dataloader, log_parent=None, log_dir=None, continue_from=None)
+        Initializes the trainer.
+    setup_logging(log_parent=None, log_dir=None, continue_from=None)
+        Sets up logging for training.
+    start_training(stop_at=np.inf)
+        Starts or continues training the model.
+    _train_epoch()
+        Trains the model for one epoch.
+    save_state(save_dir=None)
+        Saves the model and trainer state.
+    load_state(epoch_dir)
+        Loads the model and trainer state.
+    load_last_state(log_dir)
+        Loads the last saved model and trainer state.
+    freeze_components(component_names=None, freeze=True)
+        Freezes or unfreezes specified components of the model.
+    """
     cfg: dict
     dataloader: "data.HydroDataLoader"
     log_dir: Path
@@ -32,31 +78,31 @@ class Trainer:
     optim: optax.GradientTransformation
     opt_state: optax.OptState
     filter_spec: PyTree
-    """
-    Attributes:
-        cfg (dict): Configuration dictionary.
-        dataloader (HydroDataLoader): DataLoader object.
-        log_dir (Path): Directory for logging.
-        num_epochs (int): Number of epochs for training.
-        log_interval (int): Interval for logging.
-        lr_schedule: Learning rate scheduler.
-        model: Model to be trained.
-        loss_list (list): List to store loss values.
-        epoch (int): Current epoch.
-        optim: Optimizer.
-        opt_state: Optimizer state.
-        filter_spec: Specification for freezing components.
-    """
 
-    def __init__(self, cfg, dataloader, *, log_parent=None, log_dir=None, continue_from=None):
-        """        
-        Initializes optimizers, logging, and sets up the training environment.
+    def __init__(self,
+                 cfg,
+                 dataloader,
+                 *,
+                 log_parent=None,
+                 log_dir=None,
+                 continue_from=None):
+        """Initializes the Trainer.
 
-        Args:
-            cfg (dict): Configuration dictionary.
-            dataloader: DataLoader object.
-            log_parent (Path, optional): Parent directory for logging.
-            continue_from (Path, optional): Directory that contains epoch data
+        Sets up logging, the learning rate schedule, the model, the optimizer, and the
+        optimizer state.  Handles loading from a previous state if specified.
+
+        Parameters
+        ----------
+        cfg : dict
+            Configuration dictionary.
+        dataloader : data.HydroDataLoader
+            DataLoader object.
+        log_parent : Path, optional
+            Parent directory for logging.
+        log_dir : Path, optional
+            Specific directory for logging.
+        continue_from : Path, optional
+            Directory containing a previous training state to load.
         """
         self.cfg = cfg
         self.dataloader = dataloader
@@ -67,7 +113,8 @@ class Trainer:
         self.num_epochs = cfg['num_epochs']
         self.log_interval = cfg.get('log_interval', 5)
 
-        self.lr_schedule = optax.exponential_decay(cfg['initial_lr'], cfg['num_epochs'], cfg['decay_rate'],
+        self.lr_schedule = optax.exponential_decay(cfg['initial_lr'], cfg['num_epochs'],
+                                                   cfg['decay_rate'],
                                                    cfg.get('transition_begin', 0))
 
         self.train_key = jax.random.PRNGKey(cfg['model_args']['seed'] + 1)
@@ -88,6 +135,19 @@ class Trainer:
         self.freeze_components(None, False)
 
     def setup_logging(self, log_parent=None, log_dir=None, continue_from=None):
+        """Sets up logging for training.
+
+        Creates the log directory and configures logging to a file.
+
+        Parameters
+        ----------
+        log_parent : Path, optional
+            Parent directory for logging.
+        log_dir : Path, optional
+            Specific directory for logging.
+        continue_from : Path, optional
+            Directory containing a previous training state to load.
+        """
         cfg_path = self.cfg.get('cfg_path')
         current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -115,14 +175,20 @@ class Trainer:
                             force=True)
 
     def start_training(self, stop_at=np.inf):
-        """
-        Starts or continues training the model.
+        """Starts or continues training the model.
 
-        Manages the training loop, including updating progress bars, logging, handling keyboard 
-        interruptions, and saving the model state at specified intervals.
+        Manages the training loop, including updating progress bars, logging, handling
+        keyboard interruptions, and saving the model state at specified intervals.
 
-        Returns:
-            The trained model after completing the training or upon an interruption.
+        Parameters
+        ----------
+        stop_at : float, optional
+            Epoch to stop training.
+
+        Returns
+        -------
+        model : eqx.Module
+            The trained model.
         """
         while (self.epoch < self.num_epochs) and (self.epoch < stop_at):
             self.epoch += 1
@@ -158,12 +224,18 @@ class Trainer:
             logging.info("~~~ training stopped ~~~")
 
     def _train_epoch(self) -> tuple[float, dict[str, dict]]:
-        """
-        Iterates over the dataloader batches, updates the model using the optimization step, and handles 
-        any exceptions that occur during the training. Logs errors and saves error data if issues are encountered.
+        """Trains the model for one epoch.
 
-        Returns:
-            float: The average loss calculated over the epoch.
+        Iterates over the dataloader batches, updates the model using the optimization
+        step, and handles any exceptions that occur during the training. Logs errors and
+        saves error data if issues are encountered.
+
+        Returns
+        -------
+        loss : float
+            The average loss for the epoch.
+        bad_grads : dict[str, dict[str:int]]
+            A dictionary of vanishing and exploding gradients, organized by model layer.
         """
         lr = self.lr_schedule(self.epoch)
         self.optim = optax.adam(lr)
@@ -172,7 +244,9 @@ class Trainer:
         losses = []
         bad_grads = {'vanishing': {}, 'exploding': {}}
 
-        pbar = tqdm(self.dataloader, disable=self.cfg['quiet'], desc=f"Epoch:{self.epoch:03.0f}")
+        pbar = tqdm(self.dataloader,
+                    disable=self.cfg['quiet'],
+                    desc=f"Epoch:{self.epoch:03.0f}")
         for data_tuple in pbar:
             basins, dates, batch = data_tuple
             batch = self.dataloader.shard_batch(batch)
@@ -183,10 +257,10 @@ class Trainer:
             self.train_key = keys[0]
             batch_keys = keys[1:]
             try:
-                loss, grads, self.model, self.opt_state = make_step(self.model, batch, batch_keys, self.opt_state,
-                                                                    self.optim, self.filter_spec,
-                                                                    self.dataloader.dataset.denormalize_target,
-                                                                    **self.cfg['step_kwargs'])
+                loss, grads, self.model, self.opt_state = make_step(
+                    self.model, batch, batch_keys, self.opt_state, self.optim,
+                    self.filter_spec, self.dataloader.dataset.denormalize_target,
+                    **self.cfg['step_kwargs'])
 
                 if jnp.isnan(loss):
                     raise RuntimeError(f"NaN loss encountered")
@@ -227,7 +301,8 @@ class Trainer:
                 print(error_str)
 
             if consecutive_exceptions >= 3:
-                raise RuntimeError(f"Too many consecutive exceptions ({consecutive_exceptions})")
+                raise RuntimeError(
+                    f"Too many consecutive exceptions ({consecutive_exceptions})")
 
         pbar.set_postfix_str(f"Avg Loss:{np.mean(losses):0.04f}")
         pbar.refresh()
@@ -235,6 +310,17 @@ class Trainer:
         return np.mean(losses), bad_grads
 
     def save_state(self, save_dir: Path | None = None) -> None:
+        """Saves the model and trainer state.
+
+        Saves the model, optimizer state, epoch number, and loss list to the specified
+        directory.
+
+        Parameters
+        ----------
+        save_dir : Path, optional
+            Directory to save the state. If None, saves to a directory within the log
+            directory named for the current epoch.
+        """
         if save_dir is None:
             save_dir = self.log_dir / f"epoch{self.epoch:03d}"
         os.makedirs(save_dir, exist_ok=True)
@@ -255,6 +341,20 @@ class Trainer:
             eqx.tree_serialise_leaves(f, self.opt_state)
 
     def load_state(self, epoch_dir: Path) -> tuple[bool, dict | None]:
+        """Loads the model and trainer states from a specific epoch directory.
+
+        Parameters
+        ----------
+        epoch_dir : Path
+            Directory containing the saved state.
+
+        Returns
+        -------
+        tuple[bool, tuple[dict, eqx.Module, dict, optax.OptState, dict | None] | None]
+            A tuple containing a boolean indicating whether the load was successful, and
+            if successful, a tuple containing the config, model, trainer state,
+            optimizer state, and any loaded data.
+        """
         model_loaded, load_tuple = load_state(epoch_dir, self.cfg)
         if not model_loaded:
             return False, None
@@ -266,12 +366,28 @@ class Trainer:
         return True, data
 
     def load_last_state(self, log_dir: Path):
+        """Loads the last saved model and trainer state from the training directory.
+        """
         epoch_dir = _last_epoch_dir(log_dir)
         return self.load_state(epoch_dir)
 
-    def freeze_components(self, component_names: list[str] | str | None = None, freeze: bool = True):
-        # Updates the filterspec to set which parmaters can be updated.
-        # Only accepts top-level element names in the pytree model.
+    def freeze_components(self,
+                          component_names: list[str] | str | None = None,
+                          freeze: bool = True):
+        """Freezes or unfreezes specified components of the model.
+
+        Updates the filter specification to control which parameters are updated 
+        during training. Only accepts top-level element names in the pytree model.
+
+        Parameters
+        ----------
+        component_names : list[str] | str | None, optional
+            List of component names to freeze/unfreeze. If None, all components
+            frozen or unfrozen.
+        freeze : bool, optional
+            If True, freezes the specified components. If False, unfreezes
+            them.
+        """
         if isinstance(component_names, str):
             component_names = [component_names]
 
@@ -291,8 +407,30 @@ class Trainer:
         self.filter_spec = jtu.tree_map_with_path(diff_filter, self.model)
 
 
-def load_state(state_dir: Path,
-               cfg: dict = None) -> tuple[bool, tuple[dict, eqx.Module, dict, optax.OptState, dict | None] | None]:
+def load_state(
+    state_dir: Path,
+    cfg: dict = None
+) -> tuple[bool, tuple[dict, eqx.Module, dict, optax.OptState, dict | None] | None]:
+    """Loads a model state from a directory.
+
+    Loads the configuration, model, trainer state, and optimizer state from
+    the specified directory.
+
+    Parameters
+    ----------
+    state_dir : Path
+        Directory containing the saved state.
+    cfg : dict, optional
+        Configuration dictionary. If None, loads the configuration from
+        the state directory.
+
+    Returns
+    -------
+    tuple[bool, tuple[dict, eqx.Module, dict, optax.OptState, dict | None] | None]
+        A tuple containing a boolean indicating whether the load was
+        successful, and if successful, a tuple containing the config,
+        model, trainer state, optimizer state, and any loaded data.
+    """
     if not isinstance(state_dir, Path) or not state_dir.is_dir():
         print('Model state directory not found!')
         return False, None
@@ -302,7 +440,8 @@ def load_state(state_dir: Path,
         cfg_file = state_dir.parent / "config.pkl"
         with open(cfg_file, 'rb') as file:
             cfg = pickle.load(file)
-    lr_schedule = optax.exponential_decay(cfg['initial_lr'], cfg['num_epochs'], cfg['decay_rate'],
+    lr_schedule = optax.exponential_decay(cfg['initial_lr'], cfg['num_epochs'],
+                                          cfg['decay_rate'],
                                           cfg.get('transition_begin', 0))
 
     with open(state_dir / "model.eqx", "rb") as f:
@@ -314,8 +453,9 @@ def load_state(state_dir: Path,
         serialized_model = models.make(cfg)
         # Ensure all leaves are jnp float 32s.
         # Bandaid for some poorly specified graph adjacency matrices
-        serialized_model = jax.tree_util.tree_map(lambda x: jnp.array(x)
-                                                  if isinstance(x, np.ndarray) else x, serialized_model)
+        serialized_model = jax.tree_util.tree_map(
+            lambda x: jnp.array(x)
+            if isinstance(x, np.ndarray) else x, serialized_model)
         model = eqx.tree_deserialise_leaves(f, serialized_model)
 
     with open(state_dir / "state.eqx", "rb") as f:
@@ -337,6 +477,18 @@ def load_state(state_dir: Path,
 
 
 def _last_epoch_dir(log_dir: Path) -> Path:
+    """Finds the directory of the last saved epoch.
+
+    Parameters
+    ----------
+    log_dir : Path
+        Directory containing the saved epoch directories.
+
+    Returns
+    -------
+    Path | None
+        The path to the last epoch directory, or None if no epoch directories are found.
+    """
     epoch_regex = re.compile(r"epoch(\d+)")
     dirs = os.listdir(log_dir)
     matches = [epoch_regex.match(d) for d in dirs]
@@ -349,5 +501,10 @@ def _last_epoch_dir(log_dir: Path) -> Path:
 
 
 def load_last_state(log_dir: Path):
+    """Loads the last saved model state within the log directory.
+
+    This function is a convenience wrapper around :py:func:`load_state`. It finds the
+    most recent epoch directory and calls `load_state` with that directory.
+    """
     save_dir = _last_epoch_dir(log_dir)
     return load_state(save_dir)

@@ -9,10 +9,37 @@ from jaxtyping import Array, PRNGKeyArray
 
 @eqx.filter_jit
 def _model_map(model, batch: dict[str:Array], keys: list[PRNGKeyArray]):
+    """Applies the model to a batch of data using jax.vmap."""
     return jax.vmap(model)(batch, keys)
 
 
-def model_iterate(model: eqx.Module, dataloader, quiet: bool = False, denormalize: bool = True) -> Iterator[dict]:
+def model_iterate(model: eqx.Module,
+                  dataloader,
+                  quiet: bool = False,
+                  denormalize: bool = True) -> Iterator[dict]:
+    """Iterates through a dataloader and yields predictions from the model.
+
+    Parameters
+    ----------
+    model: eqx.Module
+        The model to be applied to the data.
+    dataloader: Dataloader
+        The dataloader providing batches of data.
+    quiet: bool, optional
+        If True, disables the progress bar. Default is False.
+    denormalize: bool, optional
+        If True, denormalizes the predictions and target values. Default is True.
+
+    Yields
+    -------
+    Iterator[dict]
+        An iterator yielding dictionaries. Each dictionary contains the following keys:
+            - 'basin': Basin IDs.
+            - 'date': Dates.
+            - 'y_pred': Model predictions.
+            - 'y': Target values (if available).
+            - 'dt': Dynamic time features (if available).
+    """
     # Set model to inference mode (no dropout)
     model = eqx.nn.inference_mode(model)
     # Dummy batch keys (only used for dropout, which is off).
@@ -42,7 +69,36 @@ def model_iterate(model: eqx.Module, dataloader, quiet: bool = False, denormaliz
         yield out_dict
 
 
-def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: bool = True):
+def predict(model: eqx.Module,
+            dataloader,
+            *,
+            quiet: bool = False,
+            denormalize: bool = True):
+    """Generates predictions from a model and dataloader.
+
+    The function iterates through the dataloader, applies the model to each batch, and
+    collects the predictions, target values, and dynamic time features (if available)
+    into lists. These lists are then concatenated into arrays and organized into a
+    pandas DataFrame with a MultiIndex.
+
+    Parameters
+    ----------
+    model: eqx.Module
+        The model to use for generating predictions.
+    dataloader: Dataloader
+        The dataloader providing data for the model.
+    quiet: bool, optional
+        If True, suppresses the progress bar. Default is False.
+    denormalize: bool, optional
+        If True, denormalizes the predictions and target values. Default is True.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A DataFrame containing the predictions, observations (if available), and dynamic
+        time features (if available). The DataFrame has a MultiIndex with levels 'basin'
+        and 'date'. The columns are also MultiIndexed with levels 'Type' and 'Feature'.
+    """
     # inference_mode = dataloader.dataset.inference_mode
     basins = []
     dates = []
@@ -81,13 +137,15 @@ def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: 
 
     # Place the data arrays into a dataframe with multilevel indices.
     datetime_index = pd.MultiIndex.from_arrays([basins, dates], names=['basin', 'date'])
-    column_index = pd.MultiIndex.from_product([cols, dataloader.dataset.target], names=['Type', 'Feature'])
+    column_index = pd.MultiIndex.from_product([cols, dataloader.dataset.target],
+                                              names=['Type', 'Feature'])
     results = pd.DataFrame(data, index=datetime_index, columns=column_index)
 
     # Might break if dt is implemented for graph mode. Not planned.
     if len(dt_list) > 0:
-        dt_index = pd.MultiIndex.from_product([['dt'], dataloader.dataset.features['dynamic'].keys()],
-                                              names=['Type', 'Feature'])
+        dt_index = pd.MultiIndex.from_product(
+            [['dt'], dataloader.dataset.features['dynamic'].keys()],
+            names=['Type', 'Feature'])
         results[dt_index] = np.concatenate(dt_list)
 
     return results

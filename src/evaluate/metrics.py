@@ -6,12 +6,33 @@ log_pad = 0.001
 
 
 def get_basin_metrics(df: pd.DataFrame, disp: bool = False):
+    """Calculates various metrics for each basin in a DataFrame.
+
+    The function applies the :py:func:`get_all_metrics` function to each basin group in the DataFrame
+    to calculate metrics such as R2, MAPE, nBias, etc. The results are organized into a new
+    DataFrame with a MultiIndex for columns, where the first level represents the feature
+    and the second level represents the metric.
+
+    Parameters
+    ----------
+    df: pandas.DataFrame
+        A DataFrame containing observations and predictions, with a MultiIndex including 'basin'.
+    disp: bool, optional
+        If True, prints a summary of the median metric values for each feature. Default is False.
+
+    Returns
+    -------
+    pandas.DataFrame
+        A DataFrame containing the calculated metrics for each basin and feature.
+        The columns are MultiIndexed with levels 'Feature' and 'Metric'.
+    """
     per_basin_metrics = df.groupby(level='basin').apply(get_all_metrics)
 
     # Initialize an empty DataFrame to store results with multi-level columns
     feature_names = df['obs'].columns
     metric_names = per_basin_metrics.iloc[0][feature_names[0]].keys()
-    multi_index_columns = pd.MultiIndex.from_product([feature_names, metric_names], names=['Feature', 'Metric'])
+    multi_index_columns = pd.MultiIndex.from_product([feature_names, metric_names],
+                                                     names=['Feature', 'Metric'])
     results_df = pd.DataFrame(columns=multi_index_columns)
 
     # Populate the DataFrame with the metrics results
@@ -33,6 +54,25 @@ def get_basin_metrics(df: pd.DataFrame, disp: bool = False):
 
 
 def get_all_metrics(df: pd.DataFrame, disp: bool = False):
+    """Calculates various metrics for each feature in a DataFrame.
+
+    The function calculates a range of metrics for each feature in the DataFrame,
+    comparing observed values ('obs') with predicted values ('pred'). The metrics
+    include R2, MAPE, nBias, etc.
+
+    Parameters
+    ----------
+    df: pandas.DataFrame
+        A DataFrame containing observations and predictions.
+    disp: bool, optional
+        If True, prints a summary of the calculated metrics for each feature.
+        Default is False.
+
+    Returns
+    -------
+    dict
+        A dictionary where keys are feature names and values are dictionaries of metrics.
+    """
     metrics = {}
 
     for feature in df['obs'].columns:
@@ -69,6 +109,11 @@ def get_all_metrics(df: pd.DataFrame, disp: bool = False):
 
 
 def mask_nan(func):
+    """Decorator to mask NaN values before applying a function.
+
+    The decorator masks NaN values in both `y` and `y_hat` and ensures there is more
+    than 1 valid measurement before applying the decorated function.
+    """
 
     def wrapper(y, y_hat, *args, **kwargs):
         mask = (y > log_pad) & (y_hat > log_pad)
@@ -153,7 +198,8 @@ def calc_kge(y, y_hat):
     if std_y == 0 or mean_y == 0:
         return np.nan
     else:
-        return 1 - np.sqrt((correlation - 1)**2 + (std_y_hat / std_y - 1)**2 + (mean_y_hat / mean_y - 1)**2)
+        return 1 - np.sqrt((correlation - 1)**2 + (std_y_hat / std_y - 1)**2 +
+                           (mean_y_hat / mean_y - 1)**2)
 
 
 @mask_nan

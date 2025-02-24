@@ -12,7 +12,8 @@ class HydroDataLoader(DataLoader):
         torch.manual_seed(cfg['model_args']['seed'])
 
         num_workers = cfg.get('num_workers', 1)
-        persistent_workers = False if num_workers == 0 else cfg.get('persistent_workers', False)
+        persistent_workers = False if num_workers == 0 else cfg.get(
+            'persistent_workers', False)
 
         super().__init__(dataset,
                          collate_fn=self.collate_fn,
@@ -35,7 +36,9 @@ class HydroDataLoader(DataLoader):
         # I can't figure out how to just not collate. Can't even use lambdas because of multiprocessing.
         return sample
 
-    def set_jax_sharding(self, backend: str | None = None, num_devices: int | None = None):
+    def set_jax_sharding(self,
+                         backend: str | None = None,
+                         num_devices: int | None = None):
         """
         Updates the jax device sharding of data. 
     
@@ -64,7 +67,8 @@ class HydroDataLoader(DataLoader):
 
         if self.batch_size % self.num_devices != 0:
             raise ValueError(
-                f"batch_size ({self.batch_size}) must be evenly divisible by the num_devices ({self.num_devices}).")
+                f"batch_size ({self.batch_size}) must be evenly divisible by the num_devices ({self.num_devices})."
+            )
 
         print(f"Batch sharding set to {self.num_devices} {backend}(s)")
         devices = jax.local_devices(backend=backend)[:self.num_devices]

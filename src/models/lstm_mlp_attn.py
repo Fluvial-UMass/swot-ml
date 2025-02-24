@@ -8,15 +8,44 @@ from models.transformer import StaticEmbedder, CrossAttnDecoder
 
 
 class StackedMLP(eqx.Module):
-    """
-    Wrapper for plain MLP that appends static data to time series data. 
-    Applies the same weights to each time step.
+    """Wrapper for a plain MLP that appends static data to time series data.
+
+    Attributes
+    ----------
+    append_static: bool
+        Whether to append static data to the time series data.
+    mlp: eqx.nn.MLP
+        The MLP to apply to the data.
+
+    Methods
+    -------
+    __init__(dynamic_in_size, static_in_size, out_size, width_size, depth, *, key)
+        Initializes the StackedMLP.
+    __call__(x_d, x_s, key)
+        Applies the MLP to the input data.
     """
     append_static: bool
     mlp: eqx.nn.MLP
 
-    def __init__(self, dynamic_in_size: int, static_in_size: int, out_size: int, width_size: int, depth: int, *,
-                 key: PRNGKeyArray):
+    def __init__(self, dynamic_in_size: int, static_in_size: int, out_size: int,
+                 width_size: int, depth: int, *, key: PRNGKeyArray):
+        """Initializes a StackedMLP.
+
+        Parameters
+        ----------
+        dynamic_in_size: int
+            The number of features in the dynamic input data.
+        static_in_size: int
+            The number of features in the static input data.
+        out_size: int
+            The number of output features.
+        width_size: int
+            The number of neurons in each hidden layer.
+        depth: int
+            The number of hidden layers.
+        key: jax.random.PRNGKeyArray
+            A PRNG key used to initialize the weights of the MLP.
+        """
         self.append_static = static_in_size > 0
         self.mlp = eqx.nn.MLP(in_size=dynamic_in_size + static_in_size,
                               out_size=out_size,
@@ -25,6 +54,23 @@ class StackedMLP(eqx.Module):
                               key=key)
 
     def __call__(self, x_d: Array, x_s: Array, key: PRNGKeyArray):
+        """Applies the MLP to the input data.
+
+        Parameters
+        ----------
+        x_d: Array
+            The dynamic input data.
+        x_s: Array
+            The static input data.
+        key: jax.random.PRNGKeyArray
+            A PRNG key used to apply the MLP.
+
+        Returns
+        -------
+        Array
+            The output of the MLP.
+        """
+
         # vmap function that optionally adds static data
         def mlp_apply(x):
             input = jnp.concatenate([x, x_s], axis=-1) if self.append_static else x
@@ -35,6 +81,22 @@ class StackedMLP(eqx.Module):
 
 
 class LSTM_MLP_ATTN(eqx.Module):
+    """Model that uses LSTMs, MLPs, and attention to mix time frequencies.
+
+    Attributes
+    ----------
+    encoders: dict
+        Encoders, one for each dynamic data source.
+    static_embedder: StaticEmbedder
+        Embedder for static data.
+    decoders: dict
+        Decoders, one for each cross-attention or self-attention.
+    head: eqx.nn.Linear
+        Linear layer that maps the output of the decoders to the target
+        variable(s).
+    target: list
+        Names of the target variables.
+    """
     encoders: dict
     static_embedder: StaticEmbedder
     decoders: dict
@@ -53,13 +115,40 @@ class LSTM_MLP_ATTN(eqx.Module):
                  seed: int,
                  dropout: float,
                  time_aware: dict = {}):
+        """Initializes an LSTM_MLP_ATTN model.
+
+        Parameters
+        ----------
+        target: list
+            The names of the target variables.
+        seq_length: int
+            The length of the input sequence.
+        dynamic_sizes: dict
+            A dictionary of the sizes of the dynamic features.
+        static_size: int
+            The number of static features.
+        hidden_size: int
+            The size of the hidden state.
+        num_layers: int
+            The number of layers in the LSTM and MLP.
+        num_heads: int
+            The number of heads in the attention.
+        seed: int
+            A seed for the random number generator.
+        dropout: float
+            The dropout rate.
+        time_aware: dict, optional
+            A dictionary of booleans indicating whether each dynamic feature is time-aware.
+            Defaults to {}.
+        """
         key = jax.random.PRNGKey(seed)
         keys = jax.random.split(key, 5)
 
         # Encoder for static data if used.
         entity_aware = static_size > 0
         if entity_aware:
-            self.static_embedder = StaticEmbedder(static_size, hidden_size, dropout, keys[1])
+            self.static_embedder = StaticEmbedder(static_size, hidden_size, dropout,
+                                                  keys[1])
             static_size = hidden_size
         else:
             self.static_embedder = None
@@ -93,16 +182,35 @@ class LSTM_MLP_ATTN(eqx.Module):
         # Set up each cross-attention decoder
         if len(cross_vars) > 0:
             for var_name, var_key in zip(cross_vars, decoder_keys):
-                self.decoders[var_name] = CrossAttnDecoder(seq_length, hidden_size, hidden_size, num_layers, num_heads,
-                                                           dropout, entity_aware, var_key)
+                self.decoders[var_name] = CrossAttnDecoder(seq_length, hidden_size,
+                                                           hidden_size, num_layers,
+                                                           num_heads, dropout,
+                                                           entity_aware, var_key)
         else:
-            self.decoders['self'] = CrossAttnDecoder(seq_length, hidden_size, hidden_size, num_layers, num_heads,
+            self.decoders['self'] = CrossAttnDecoder(seq_length, hidden_size,
+                                                     hidden_size, num_layers, num_heads,
                                                      dropout, entity_aware, var_key)
 
-        self.head = eqx.nn.Linear(in_features=hidden_size * len(self.decoders), out_features=len(target), key=keys[3])
+        self.head = eqx.nn.Linear(in_features=hidden_size * len(self.decoders),
+                                  out_features=len(target),
+                                  key=keys[3])
         self.target = target
 
     def __call__(self, data: dict[str, Array | dict[str, Array]], key: PRNGKeyArray):
+        """The forward pass of the data through the model 
+
+        Parameters
+        ----------
+        data: dict[str, Array | dict[str, Array]]
+            The input data.
+        key: PRNGKeyArray
+            A PRNG key used to apply the model.
+
+        Returns
+        -------
+        Array
+            The output of the model.
+        """
         keys = jax.random.split(key, 3)
 
         # Static embedding
@@ -117,7 +225,8 @@ class LSTM_MLP_ATTN(eqx.Module):
         masks = {}
         for (var_name, encoder), e_key in zip(self.encoders.items(), encoder_keys):
             masks[var_name] = ~jnp.any(jnp.isnan(data['dynamic'][var_name]), axis=1)
-            x_d = jnp.where(jnp.expand_dims(masks[var_name], 1), data['dynamic'][var_name], 0.0)
+            x_d = jnp.where(jnp.expand_dims(masks[var_name], 1),
+                            data['dynamic'][var_name], 0.0)
             encoded_data[var_name] = encoder(x_d, static_bias, e_key)
 
         # Decoders
@@ -130,11 +239,13 @@ class LSTM_MLP_ATTN(eqx.Module):
             decoder_keys = jax.random.split(keys[2], len(cross_vars))
             decoded_list = []
             for k, d_key in zip(cross_vars, decoder_keys):
-                decoded_list.append(self.decoders[k](query, encoded_data[k], static_bias, masks[k], d_key))
+                decoded_list.append(self.decoders[k](query, encoded_data[k],
+                                                     static_bias, masks[k], d_key))
             pooled_output = jnp.concatenate(decoded_list, axis=0)
 
         else:
             # Use self-attention for a single source
-            pooled_output = self.decoders['self'](query, query, static_bias, masks[source_var], keys[-1])
+            pooled_output = self.decoders['self'](query, query, static_bias,
+                                                  masks[source_var], keys[-1])
 
         return self.head(pooled_output)
