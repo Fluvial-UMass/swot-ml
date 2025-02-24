@@ -14,15 +14,23 @@ release = '0.1'
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
-extensions = []
+extensions = [
+    'sphinx.ext.autodoc',  # autodocument
+    'sphinx.ext.napoleon',  # google and numpy doc string support
+    'sphinx.ext.mathjax',  # latex rendering of equations using MathJax
+    'nbsphinx',  # for direct embedding of jupyter notebooks into sphinx docs
+    'nbsphinx_link'  # to be able to include notebooks from outside of the docs folder
+]
 
 templates_path = ['_templates']
-exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
-
-
+exclude_patterns = ['**.ipynb_checkpoints', '_build', 'Thumbs.db', '.DS_Store']
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
-html_theme = 'alabaster'
+html_theme = 'sphinx_rtd_themer'
+
 html_static_path = ['_static']
+
+# -- Napoleon autodoc options -------------------------------------------------
+napoleon_numpy_docstring = True
