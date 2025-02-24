@@ -17,9 +17,6 @@ release = '0.1'
 extensions = [
     'sphinx.ext.autodoc',  # autodocument
     'sphinx.ext.napoleon',  # google and numpy doc string support
-    'sphinx.ext.mathjax',  # latex rendering of equations using MathJax
-    'nbsphinx',  # for direct embedding of jupyter notebooks into sphinx docs
-    'nbsphinx_link'  # to be able to include notebooks from outside of the docs folder
 ]
 
 templates_path = ['_templates']
