@@ -3,6 +3,24 @@
 # For the full list of built-in configuration values, see the documentation:
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 
+# -- Path setup --------------------------------------------------------------
+
+# If extensions (or modules to document with autodoc) are in another directory,
+# add these directories to sys.path here. If the directory is relative to the
+# documentation root, use os.path.abspath to make it absolute, like shown here.
+#
+import sys
+from pathlib import Path
+
+docs_source_dir = Path(__file__).resolve()
+root_dir = docs_source_dir.parents[1]
+
+# Add the 'src' directory to sys.path
+sys.path.insert(0, root_dir / 'src')
+
+for p in sys.path:
+    print(p)
+
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
