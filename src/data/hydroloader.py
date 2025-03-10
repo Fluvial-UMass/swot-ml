@@ -12,8 +12,12 @@ class HydroDataLoader(DataLoader):
         torch.manual_seed(cfg['model_args']['seed'])
 
         num_workers = cfg.get('num_workers', 1)
-        persistent_workers = False if num_workers == 0 else cfg.get(
-            'persistent_workers', False)
+        if num_workers == 0:
+            timeout = 0
+            persistent_workers = False
+        else:
+            timeout = cfg.get('timeout', 900)
+            persistent_workers = cfg.get('persistent_workers', False)
 
         super().__init__(dataset,
                          collate_fn=self.collate_fn,
@@ -22,7 +26,7 @@ class HydroDataLoader(DataLoader):
                          num_workers=num_workers,
                          pin_memory=cfg.get('pin_memory', True),
                          drop_last=cfg.get('drop_last', False),
-                         timeout=cfg.get('timeout', 900),
+                         timeout=timeout,
                          persistent_workers=persistent_workers)
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 
