@@ -11,10 +11,13 @@ import traceback
 from argparse import ArgumentParser
 from pathlib import Path
 import pickle
+import copy
+
+from smac.utils.configspace import get_config_hash
 
 from config import *
 from data import HydroDataset, HydroDataLoader
-from train import Trainer, load_last_state
+from train import Trainer, load_last_state, update_smac_config, manual_smac_optimize
 from evaluate import *
 
 
@@ -58,7 +61,9 @@ def load_model(run_dir: Path):
     return cfg, model, trainer_state
 
 
-def train_from_config(cfg: dict, trainer_kwargs: dict = {}):
+def train_from_config(cfg: dict,
+                      trainer_kwargs: dict = {},
+                      model_finetune_kwargs: dict = {}):
     """Trains a model from a given configuration file.
 
     Parameters
@@ -84,6 +89,10 @@ def train_from_config(cfg: dict, trainer_kwargs: dict = {}):
     dataloader = HydroDataLoader(cfg, dataset)
 
     trainer = Trainer(cfg, dataloader, **trainer_kwargs)
+
+    if model_finetune_kwargs:
+        trainer.model.finetune_update(**model_finetune_kwargs)
+
     trainer.start_training()
     cleanup_dl(dataloader)
 
@@ -178,11 +187,17 @@ def finetune(finetune_yml: Path):
     cfg['num_epochs'] = stop_epoch + finetune.get('additional_epochs', 0)
     cfg['transition_begin'] = stop_epoch if finetune.get('reset_lr') else 0
     cfg['cfg_path'] = finetune_yml
+
     # Insert these params directly.
     cfg.update(finetune.get('config_update', {}))
 
-    trainer_kwargs = {'continue_from': run_dir}
-    cfg, trainer, dataset = train_from_config(cfg, trainer_kwargs)
+    trainer_kwargs = {
+        'continue_from': run_dir,
+        'static_leaves': finetune.get('static_leaves', [])
+    }
+    model_finetune_kwargs = finetune.get('model_update', None)
+    cfg, trainer, dataset = train_from_config(cfg, trainer_kwargs,
+                                              model_finetune_kwargs)
 
     return cfg, trainer.model, trainer.log_dir, dataset
 
@@ -250,6 +265,38 @@ def hyperparam_grid_search(config_yml: Path, idx: int):
 
         if dataloader:
             cleanup_dl(dataloader)
+
+
+def hyperparam_smac_optimize(config_yml: Path, n_workers: int, n_runs: int):
+    cfg, _ = read_config(config_yml)
+
+    def target_fun(updates, seed):
+        local_cfg, _ = read_config(updates['cfg_path'])
+        local_cfg = update_smac_config(local_cfg, updates)
+
+        trial_name = get_config_hash(updates)
+        path = Path(local_cfg['cfg_path'])
+        log_dir = path.parent / 'trials' / f'{path.stem}_{trial_name}'
+        trainer_kwargs = {'log_dir': log_dir}
+        local_cfg, trainer, dataset = train_from_config(local_cfg, trainer_kwargs)
+
+        eval_model(local_cfg,
+                   trainer.model,
+                   dataset,
+                   trainer.log_dir,
+                   run_test=True,
+                   run_predict=False,
+                   run_train=False,
+                   make_plots=False)
+
+        # Weird to load instead of returning directly but this is a bandaid.
+        results_file = trainer.log_dir / 'test_data.pkl'
+        with open(results_file, 'rb') as f:
+            results, bulk_metrics, basin_metrics = pickle.load(f)
+
+        return basin_metrics['flux']['RE'].median()
+
+    manual_smac_optimize(cfg, n_workers, n_runs, target_fun)
 
 
 def load_prediction_model(run_dir: Path, chunk_idx: int):
@@ -389,15 +436,15 @@ def eval_model(cfg: dict,
         if data_subset != "predict":
             bulk_metrics = get_all_metrics(results)
             basin_metrics = get_basin_metrics(results)
-            if make_plots:
-                make_all_plots(cfg, results, bulk_metrics, basin_metrics, data_subset,
-                               log_dir)
             out = (results, bulk_metrics, basin_metrics)
         else:
             out = results
-
         with open(results_file, 'wb') as f:
             pickle.dump(out, f)
+
+        if make_plots and data_subset != 'predict':
+            make_all_plots(cfg, results, bulk_metrics, basin_metrics, data_subset,
+                           log_dir)
 
     eval_data_subset('test', run_test)
     eval_data_subset('predict', run_predict)
@@ -445,6 +492,10 @@ def main(args: ArgumentParser):
         config_yml = Path(args.grid_search).resolve()
         hyperparam_grid_search(config_yml, args.grid_index)
         return
+    elif args.smac_optimize:
+        config_yml = Path(args.smac_optimize).resolve()
+        hyperparam_smac_optimize(config_yml, args.smac_workers, args.smac_runs)
+        return
     elif args.test:
         run_dir = args.test.resolve()
         cfg, model, _ = load_model(run_dir)
@@ -478,6 +529,9 @@ if __name__ == '__main__':
     group.add_argument('--grid_search',
                        type=Path,
                        help='Path to the grid search configuration file.')
+    group.add_argument('--smac_optimize',
+                       type=Path,
+                       help='Path to the smac optimization configuration file.')
     group.add_argument('--test',
                        type=Path,
                        help='Path to directory with model to test.')
@@ -485,21 +539,30 @@ if __name__ == '__main__':
                        type=Path,
                        help='Path to directory with model to use for predictions.')
 
-    # Add a new argument for grid search index
     parser.add_argument(
         '--ensemble_seed',
         type=int,
-        help='Integer to be added to the model seed (required if --grid_search is used)',
+        help='Integer to be added to the model seed (required with --train_ensemble)',
         required='--train_ensemble' in sys.argv)
-    # Add a new argument for grid search index
+
     parser.add_argument(
         '--grid_index',
         type=int,
         help=
-        'Index in the hyperparameter grid to evaluate (required if --grid_search is used)',
+        'Index in the hyperparameter grid to evaluate (required with --grid_search)',
         required='--grid_search' in sys.argv)
 
-    # Add a new argument for prediction chunk index
+    parser.add_argument(
+        '--smac_runs',
+        type=int,
+        help='Maximum number of hyperparameter tests (required with --smac_optimize)',
+        required='--smac_optimize' in sys.argv)
+    parser.add_argument(
+        '--smac_workers',
+        type=int,
+        help='Maximum number of SLURM jobs (required with --smac_optimize)',
+        required='--smac_optimize' in sys.argv)
+
     parser.add_argument('--basin_chunk_index',
                         type=int,
                         help='Index of the chunked basin list to predict on',

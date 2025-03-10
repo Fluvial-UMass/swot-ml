@@ -15,6 +15,9 @@ def read_yml(yml_path: str | Path) -> dict[str, Any]:
 
 
 def read_config(yml_path: str | Path) -> tuple[dict[str, Any], str]:
+    if isinstance(yml_path, str):
+        yml_path = Path(yml_path)
+
     raw_cfg = read_yml(yml_path)
     cfg = format_config(raw_cfg)
     validate_feature_dict(cfg)

@@ -68,6 +68,7 @@ class Trainer:
         Freezes or unfreezes specified components of the model.
     """
     cfg: dict
+    logger: logging.Logger
     dataloader: "data.HydroDataLoader"
     log_dir: Path
     num_epochs: int
@@ -80,12 +81,13 @@ class Trainer:
     filter_spec: PyTree
 
     def __init__(self,
-                 cfg,
-                 dataloader,
+                 cfg: dict,
+                 dataloader: "data.HydroDataLoader",
                  *,
-                 log_parent=None,
-                 log_dir=None,
-                 continue_from=None):
+                 log_parent: Path = None,
+                 log_dir: Path = None,
+                 continue_from: Path = None,
+                 static_leaves: list = []):
         """Initializes the Trainer.
 
         Sets up logging, the learning rate schedule, the model, the optimizer, and the
@@ -103,6 +105,9 @@ class Trainer:
             Specific directory for logging.
         continue_from : Path, optional
             Directory containing a previous training state to load.
+        static_leaves: list, optional
+            List of top-level PyTree leaves that will be frozen during training.
+            Defaults to none. 
         """
         self.cfg = cfg
         self.dataloader = dataloader
@@ -131,8 +136,8 @@ class Trainer:
         self.optim = optax.adam(self.lr_schedule(self.epoch))
         self.opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
 
-        # Set filterspec to train all components.
-        self.freeze_components(None, False)
+        # Initialize the filterspec. Defaults to training all components.
+        self.freeze_components(static_leaves)
 
     def setup_logging(self, log_parent=None, log_dir=None, continue_from=None):
         """Sets up logging for training.
@@ -168,11 +173,14 @@ class Trainer:
             pickle.dump(self.cfg, file)
 
         log_file = self.log_dir / "training.log"
-        logging.basicConfig(filename=log_file,
-                            filemode='a',
-                            level=logging.INFO,
-                            format='%(asctime)s - %(levelname)s - %(message)s',
-                            force=True)
+        self.logger = logging.getLogger("training_logger")
+        self.logger.setLevel(logging.INFO)
+
+        file_handler = logging.FileHandler(log_file,
+                                           mode='a')  # Explicitly set append mode
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        self.logger.addHandler(file_handler)
 
     def start_training(self, stop_at=np.inf):
         """Starts or continues training the model.
@@ -196,7 +204,7 @@ class Trainer:
 
             info_str = f"Epoch: {self.epoch}, Loss: {loss:.4f}"
             if self.cfg['log']:
-                logging.info(info_str)
+                self.logger.info(info_str)
             if self.cfg['quiet']:
                 print(info_str)
 
@@ -208,7 +216,7 @@ class Trainer:
                         warning_str += f"\n\t{tree_key}: {count}"
 
                     if self.cfg['log']:
-                        logging.warning(warning_str)
+                        self.logger.warning(warning_str)
                     else:
                         print(warning_str)
 
@@ -221,7 +229,7 @@ class Trainer:
         if self.cfg['log']:
             if self.epoch % self.log_interval != 0:
                 self.save_state()
-            logging.info("~~~ training stopped ~~~")
+            self.logger.info("~~~ training stopped ~~~")
 
     def _train_epoch(self) -> tuple[float, dict[str, dict]]:
         """Trains the model for one epoch.
@@ -294,7 +302,7 @@ class Trainer:
                     with open(error_dir / "exception.txt", "w") as f:
                         f.write(f"{str(e)}\n{traceback.format_exc()}")
                     error_str = f"{type(e).__name__} exception caught. See {error_dir} for data, model state, and trace."
-                    logging.error(error_str)
+                    self.logger.error(error_str)
 
                 else:
                     error_str = f"{str(e)}\n{traceback.format_exc()}"
@@ -371,9 +379,7 @@ class Trainer:
         epoch_dir = _last_epoch_dir(log_dir)
         return self.load_state(epoch_dir)
 
-    def freeze_components(self,
-                          component_names: list[str] | str | None = None,
-                          freeze: bool = True):
+    def freeze_components(self, component_names: list[str] | str = []):
         """Freezes or unfreezes specified components of the model.
 
         Updates the filter specification to control which parameters are updated 
@@ -381,12 +387,8 @@ class Trainer:
 
         Parameters
         ----------
-        component_names : list[str] | str | None, optional
-            List of component names to freeze/unfreeze. If None, all components
-            frozen or unfrozen.
-        freeze : bool, optional
-            If True, freezes the specified components. If False, unfreezes
-            them.
+        component_names : list[str] | str, optional
+            List of component names to freeze. If not passed, all components are unfrozen.
         """
         if isinstance(component_names, str):
             component_names = [component_names]
