@@ -17,7 +17,7 @@ while [[ "$#" -gt 0 ]]; do
       config_path="$2"
       shift
       ;;
-    --cpu|--ceewater|--gpu|--gpu-long)
+    --cpu|--ceewater|--gpu|--gpu-long|--gpupod)
       partition="$1"  
       ;;
     *)

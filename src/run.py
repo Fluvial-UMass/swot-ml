@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 # Required to run multiple processes on Unity for some reason.
 import multiprocessing as mp
 try:
@@ -8,7 +10,7 @@ mp.freeze_support()
 
 import sys
 import traceback
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from pathlib import Path
 import pickle
 import copy
@@ -17,7 +19,7 @@ from smac.utils.configspace import get_config_hash
 
 from config import *
 from data import HydroDataset, HydroDataLoader
-from train import Trainer, load_last_state, update_smac_config, manual_smac_optimize
+from train import Trainer, update_smac_config, manual_smac_optimize
 from evaluate import *
 
 
@@ -29,41 +31,7 @@ def cleanup_dl(dl: HydroDataLoader):
     del dl
 
 
-def load_model(run_dir: Path):
-    """Loads a model and its associated state from a specified directory.
-
-    Parameters
-    ----------
-    run_dir : Path
-        Path to the directory containing the saved model and state.
-
-    Returns
-    -------
-    cfg : dict
-        The configuration dictionary.
-    model : eqx.Module
-        The loaded model.
-    trainer_state : dict
-        A dictionary of the current epoch and lost list.
-
-    Raises
-    ------
-    RuntimeError
-        If the model could not be loaded from the specified directory.
-    """
-    model_loaded, state = load_last_state(run_dir)
-    if not model_loaded:
-        raise RuntimeError(f"Model could not be loaded from {run_dir}")
-
-    cfg = state[0]
-    model = state[1]
-    trainer_state = state[2]
-    return cfg, model, trainer_state
-
-
-def train_from_config(cfg: dict,
-                      trainer_kwargs: dict = {},
-                      model_finetune_kwargs: dict = {}):
+def train_from_config(cfg: dict, log_dir: Path | None = None):
     """Trains a model from a given configuration file.
 
     Parameters
@@ -84,44 +52,28 @@ def train_from_config(cfg: dict,
     dataset : HydroDataset
         The HydroDataset loaded for training.
     """
+    trainer = None
     dataset = HydroDataset(cfg)
     cfg = set_model_data_args(cfg, dataset)
     dataloader = HydroDataLoader(cfg, dataset)
 
-    trainer = Trainer(cfg, dataloader, **trainer_kwargs)
+    if log_dir and log_dir.is_dir():
+        trainer = Trainer.load_last_checkpoint(log_dir)
+        # Could fail to load if nothing was saved.
+        if trainer is not None:
+            trainer.dataloader = dataloader
+    if trainer is None:
+        trainer = Trainer(cfg, dataloader, log_dir=log_dir)
 
-    if model_finetune_kwargs:
-        trainer.model.finetune_update(**model_finetune_kwargs)
+    # trainer = Trainer(cfg, dataloader, **trainer_kwargs)
+
+    # if model_finetune_kwargs:
+    #     trainer.model.finetune_update(**model_finetune_kwargs)
 
     trainer.start_training()
     cleanup_dl(dataloader)
 
     return cfg, trainer, dataset
-
-
-def start_training(config_yml: Path):
-    """Starts training a new model from a configuration file.
-
-    Parameters
-    ----------
-    config_yml : Path
-        Path to the YAML configuration file.
-
-    Returns
-    -------
-    cfg : dict
-        The configuration dictionary.
-    model : eqx.Module
-        The trained model.
-    log_dir : Path
-        The directory where training logs and checkpoints were saved.
-    dataset : HydroDataset
-        The HydroDataset loaded for training.
-    """
-    cfg, _ = read_config(config_yml)
-    cfg, trainer, dataset = train_from_config(cfg)
-
-    return cfg, trainer.model, trainer.log_dir, dataset
 
 
 def train_ensemble(config_yml: Path, ensemble_seed: int):
@@ -150,56 +102,53 @@ def train_ensemble(config_yml: Path, ensemble_seed: int):
     cfg['model_args']['seed'] += ensemble_seed
 
     log_dir = config_yml.parent / "base_models" / f"seed_{ensemble_seed:02d}"
-    trainer_kwargs = {'log_dir': log_dir}
-    cfg, trainer, dataset = train_from_config(cfg, trainer_kwargs)
+    cfg, trainer, dataset = train_from_config(cfg, log_dir)
 
     return cfg, trainer.model, trainer.log_dir, dataset
 
 
-def finetune(finetune_yml: Path):
-    """Fine-tunes a pre-trained model using a separate configuration file.
+# def finetune(finetune_yml: Path):
+#     """Fine-tunes a pre-trained model using a separate configuration file.
 
-    Parameters
-    ----------
-    finetune_yml : Path
-        Path to the YAML file containing fine-tuning parameters. This file should be in
-        the same directory as the original model run. It contains minimal parameters,
-        only those that are updated.
+#     Parameters
+#     ----------
+#     finetune_yml : Path
+#         Path to the YAML file containing fine-tuning parameters. This file should be in
+#         the same directory as the original model run. It contains minimal parameters,
+#         only those that are updated.
 
-    Returns
-    -------
-    cfg : dict
-        The updated configuration dictionary.
-    model : eqx.Module
-        The fine-tuned model.
-    log_dir : Path
-        The directory where training logs and checkpoints were saved.
-    dataset : HydroDataset
-        The HydroDataset loaded for training.
-    """
-    # Load the config and manipulate it a bit
-    run_dir = finetune_yml.parent
-    cfg, _, trainer_state = load_model(run_dir)
-    stop_epoch = trainer_state['epoch']
+#     Returns
+#     -------
+#     cfg : dict
+#         The updated configuration dictionary.
+#     model : eqx.Module
+#         The fine-tuned model.
+#     log_dir : Path
+#         The directory where training logs and checkpoints were saved.
+#     dataset : HydroDataset
+#         The HydroDataset loaded for training.
+#     """
+#     # Load the config and manipulate it a bit
+#     run_dir = finetune_yml.parent
+#     trainer = Trainer.load_last_checkpoint(run_dir)
+#     cfg = trainer.cfg.copy()
 
-    # Read in the finetuning parameters
-    finetune = read_yml(finetune_yml)
-    cfg['num_epochs'] = stop_epoch + finetune.get('additional_epochs', 0)
-    cfg['transition_begin'] = stop_epoch if finetune.get('reset_lr') else 0
-    cfg['cfg_path'] = finetune_yml
+#     # Read in the finetuning parameters
+#     finetune = read_yml(finetune_yml)
+#     cfg['num_epochs'] = trainer.epoch + finetune.get('additional_epochs', 0)
+#     cfg['transition_begin'] = trainer.epoch if finetune.get('reset_lr') else 0
+#     cfg['cfg_path'] = finetune_yml
 
-    # Insert these params directly.
-    cfg.update(finetune.get('config_update', {}))
+#     # Insert these params directly.
+#     cfg.update(finetune.get('config_update', {}))
 
-    trainer_kwargs = {
-        'continue_from': run_dir,
-        'static_leaves': finetune.get('static_leaves', [])
-    }
-    model_finetune_kwargs = finetune.get('model_update', None)
-    cfg, trainer, dataset = train_from_config(cfg, trainer_kwargs,
-                                              model_finetune_kwargs)
+#     trainer_kwargs = {'continue_from': run_dir}
 
-    return cfg, trainer.model, trainer.log_dir, dataset
+#     model_finetune_kwargs = finetune.get('model_update', None)
+#     cfg, trainer, dataset = train_from_config(cfg, trainer_kwargs,
+#                                               model_finetune_kwargs)
+
+#     return cfg, trainer.model, trainer.log_dir, dataset
 
 
 def hyperparam_grid_search(config_yml: Path, idx: int):
@@ -241,7 +190,8 @@ def hyperparam_grid_search(config_yml: Path, idx: int):
         dataloader = HydroDataLoader(cfg, dataset)
 
         if log_dir.is_dir():
-            trainer = Trainer(cfg, dataloader, continue_from=log_dir)
+            trainer = Trainer.load_last_checkpoint(log_dir)
+            trainer.dataloader = dataloader
         else:
             trainer = Trainer(cfg, dataloader, log_dir=log_dir)
 
@@ -272,13 +222,13 @@ def hyperparam_smac_optimize(config_yml: Path, n_workers: int, n_runs: int):
 
     def target_fun(updates, seed):
         local_cfg, _ = read_config(updates['cfg_path'])
-        local_cfg = update_smac_config(local_cfg, updates)
+        local_cfg = update_smac_config(local_cfg, updates, seed)
 
         trial_name = get_config_hash(updates)
         path = Path(local_cfg['cfg_path'])
-        log_dir = path.parent / 'trials' / f'{path.stem}_{trial_name}'
-        trainer_kwargs = {'log_dir': log_dir}
-        local_cfg, trainer, dataset = train_from_config(local_cfg, trainer_kwargs)
+        log_dir = path.parent / 'trials' / f'{path.stem}_{trial_name}_{seed}'
+
+        local_cfg, trainer, dataset = train_from_config(local_cfg, log_dir)
 
         eval_model(local_cfg,
                    trainer.model,
@@ -294,12 +244,30 @@ def hyperparam_smac_optimize(config_yml: Path, n_workers: int, n_runs: int):
         with open(results_file, 'rb') as f:
             results, bulk_metrics, basin_metrics = pickle.load(f)
 
-        return basin_metrics['flux']['RE'].median()
+        # return basin_metrics['flux']['RE'].median()
+        return basin_metrics[:]['RE'].median().mean()
 
     manual_smac_optimize(cfg, n_workers, n_runs, target_fun)
 
 
-def load_prediction_model(run_dir: Path, chunk_idx: int):
+def calc_attributions(run_dir: Path):
+    trainer = Trainer.load_last_checkpoint(run_dir)
+    cfg = trainer.cfg
+    cfg['batch_size'] = cfg['batch_size'] // 10
+    cfg['data_subset'] = 'test'
+
+    dataset = HydroDataset(cfg)
+    cfg = set_model_data_args(cfg, dataset)
+    dataloader = HydroDataLoader(cfg, dataset)
+
+    save_dir = run_dir / 'figures' / 'attribution'
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    save_all_intgrads(cfg, trainer.model, dataloader, save_dir, m_steps=10)
+    plot_average_attribution(save_dir, dataset)
+
+
+def load_prediction_model(run_dir: Path, chunk_idx: int | None = None):
     """Loads a pre-trained model and chunk of the dataset into memory.
 
     Parameters
@@ -320,19 +288,22 @@ def load_prediction_model(run_dir: Path, chunk_idx: int):
     eval_dir : Path
         A directory for saving the results of this subset.
     """
-    cfg, model, _ = load_model(run_dir)
-    train_dataset = HydroDataset(cfg)
+    # cfg, model, _ = load_model(run_dir)
+    trainer = Trainer.load_last_checkpoint(run_dir)
+    cfg = trainer.cfg
 
+    train_dataset = HydroDataset(cfg)
     cfg['data_subset'] = 'predict'
-    cfg['basin_file'] = f'metadata/site_lists/predictions/chunk_{chunk_idx:02}.txt'
     cfg['shuffle'] = False  # No need to shuffle for inference
+    if chunk_idx:
+        cfg['basin_file'] = f'metadata/site_lists/predictions/chunk_{chunk_idx:02}.txt'
 
     predict_dataset = HydroDataset(cfg, train_ds=train_dataset, use_cache=False)
 
     eval_dir = run_dir / 'inference'
     eval_dir.mkdir(parents=True, exist_ok=True)
 
-    return cfg, model, predict_dataset, eval_dir
+    return cfg, trainer.model, predict_dataset, eval_dir
 
 
 def make_all_plots(cfg: dict, results: pd.DataFrame, bulk_metrics: dict,
@@ -481,13 +452,16 @@ def main(args: ArgumentParser):
 
     if args.train:
         config_yml = Path(args.train).resolve()
-        cfg, model, eval_dir, dataset = start_training(config_yml)
+        cfg, _ = read_config(config_yml)
+        cfg, trainer, dataset = train_from_config(cfg)
+        model = trainer.model
+        eval_dir = trainer.log_dir
     elif args.train_ensemble:
         config_yml = Path(args.train_ensemble).resolve()
         cfg, model, eval_dir, dataset = train_ensemble(config_yml, args.ensemble_seed)
-    elif args.finetune:
-        finetune_yml = Path(args.finetune).resolve()
-        cfg, model, eval_dir, dataset = finetune(finetune_yml)
+    # elif args.finetune:
+    #     finetune_yml = Path(args.finetune).resolve()
+    #     cfg, model, eval_dir, dataset = finetune(finetune_yml)
     elif args.grid_search:
         config_yml = Path(args.grid_search).resolve()
         hyperparam_grid_search(config_yml, args.grid_index)
@@ -498,9 +472,15 @@ def main(args: ArgumentParser):
         return
     elif args.test:
         run_dir = args.test.resolve()
-        cfg, model, _ = load_model(run_dir)
+        trainer = Trainer.load_last_checkpoint(run_dir)
+        cfg = trainer.cfg
+        model = trainer.model
         dataset = HydroDataset(cfg)
         eval_dir = run_dir
+    elif args.attribution:
+        run_dir = args.attribution.resolve()
+        calc_attributions(run_dir)
+        return
     elif args.prediction_model:
         run_test = run_train = False
         run_predict = f'chunk_{args.basin_chunk_index:02}'
@@ -509,6 +489,13 @@ def main(args: ArgumentParser):
             run_dir, args.basin_chunk_index)
 
     eval_model(cfg, model, dataset, eval_dir, run_test, run_predict, run_train)
+
+
+def positive_int(value):
+    """Custom argparse type to check for positive integers."""
+    if int(value) <= 0:
+        raise ArgumentTypeError(f"{value} is not a positive integer")
+    return int(value)
 
 
 if __name__ == '__main__':
@@ -535,6 +522,10 @@ if __name__ == '__main__':
     group.add_argument('--test',
                        type=Path,
                        help='Path to directory with model to test.')
+    group.add_argument(
+        '--attribution',
+        type=Path,
+        help='Path to directory with model to use for feature attributions.')
     group.add_argument('--prediction_model',
                        type=Path,
                        help='Path to directory with model to use for predictions.')
@@ -547,26 +538,28 @@ if __name__ == '__main__':
 
     parser.add_argument(
         '--grid_index',
-        type=int,
+        type=positive_int,
         help=
         'Index in the hyperparameter grid to evaluate (required with --grid_search)',
         required='--grid_search' in sys.argv)
 
     parser.add_argument(
         '--smac_runs',
-        type=int,
+        type=positive_int,
         help='Maximum number of hyperparameter tests (required with --smac_optimize)',
         required='--smac_optimize' in sys.argv)
     parser.add_argument(
         '--smac_workers',
-        type=int,
+        type=positive_int,
         help='Maximum number of SLURM jobs (required with --smac_optimize)',
         required='--smac_optimize' in sys.argv)
 
-    parser.add_argument('--basin_chunk_index',
-                        type=int,
-                        help='Index of the chunked basin list to predict on',
-                        required='--prediction_model' in sys.argv)
+    parser.add_argument(
+        '--basin_chunk_index',
+        type=positive_int,
+        help=
+        'Index of the chunked basin list to predict on. Must have a matching basin file.',
+        required='--prediction_model' in sys.argv)
 
     args = parser.parse_args()
 

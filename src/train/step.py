@@ -38,17 +38,26 @@ def flux_agreement(y_pred: Array, target_list: list):
     return jnp.mean(jnp.square(rel_error))
 
 
-@eqx.filter_value_and_grad
-def compute_loss(diff_model: PyTree,
-                 static_model: PyTree,
-                 data: dict[str:Array | dict[str:Array]],
-                 keys: list[PRNGKeyArray],
-                 denormalize_fn: Callable,
-                 *,
-                 loss_name: str = 'mse',
-                 target_weights: float | list[float] = 1,
-                 agreement_weight: float = 0,
-                 **kwargs) -> float:
+# def flux_agreement(y_pred: Array, target_list: list):
+#     """Calculates the normalized difference between direct SSF and SSC*Q flux estimates"""
+#     ssc = y_pred[:, target_list.index('ssc')] / 1E6  # mg/l -> kg/l
+#     flux = y_pred[:, target_list.index('flux')] / 1.102 / 1E3  # short ton/day -> kg/d
+#     q = y_pred[:, target_list.index('usgs_q')] * 24 * 3600 * 1000  # m^3/s -> l/d
+
+#     rel_error = (1 - (flux / (ssc * q)))
+#     return jnp.mean(jnp.square(rel_error))
+
+
+def compute_loss_fn(diff_model: PyTree,
+                    static_model: PyTree,
+                    data: dict[str:Array | dict[str:Array]],
+                    keys: list[PRNGKeyArray],
+                    denormalize_fn: Callable,
+                    *,
+                    loss_name: str = 'mse',
+                    target_weights: float | list[float] = 1,
+                    agreement_weight: float = 0,
+                    **kwargs) -> float:
     """Compute the loss between the predicted and true values.
 
     Includes options for per-target weighting and physics-based regularization for 
@@ -108,21 +117,6 @@ def compute_loss(diff_model: PyTree,
 
     loss = jnp.average(target_losses, weights=target_weights)
 
-    # Debugging
-    def print_func(operand):
-        y, y_pred = operand
-        jax.debug.print(
-            "y: {a}\ny_pred: {b}\nraw losses: {c}\nweights: {d}\nweighted losses: {e}",
-            a=y,
-            b=y_pred,
-            c=raw_losses,
-            d=target_weights,
-            e=loss)
-        return None
-
-    jax.lax.cond(jnp.isnan(loss), print_func, lambda *args: None, operand=(y, y_pred))
-    # Debugging
-
     if agreement_weight > 0:
         y_pred_denorm = denormalize_fn(y_pred)
         loss += agreement_weight * flux_agreement(y_pred_denorm, model.target)
@@ -152,18 +146,6 @@ def clip_gradients(grads: PyTree, max_norm: float) -> PyTree:
     total_norm = jnp.sqrt(total_norm)
     scale = jnp.minimum(max_norm / total_norm, 1.0)
     return jax.tree_map(lambda g: scale * g, grads)
-
-
-"""
-    Clip gradients to prevent them from exceeding a maximum norm.
-
-    Args:
-        grads (PyTree): The gradients to be clipped.
-        max_norm (float): The maximum norm for clipping.
-        
-    Returns:
-        PyTree: The clipped gradients.
-    """
 
 
 @eqx.filter_jit
@@ -203,8 +185,10 @@ def make_step(model: eqx.Module, data: dict[str:Array | dict[str:Array]],
         The updated optimizer state.
     """
     diff_model, static_model = eqx.partition(model, filter_spec)
-    loss, grads = compute_loss(diff_model, static_model, data, keys, denormalize_fn,
-                               **kwargs)
+
+    loss_fn_with_grad = eqx.filter_value_and_grad(compute_loss_fn)
+    loss, grads = loss_fn_with_grad(diff_model, static_model, data, keys,
+                                    denormalize_fn, **kwargs)
 
     if kwargs.get('max_grad_norm'):
         grads = clip_gradients(grads, kwargs.get('max_grad_norm'))

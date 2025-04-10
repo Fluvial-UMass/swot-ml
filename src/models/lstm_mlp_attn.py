@@ -85,6 +85,8 @@ class LSTM_MLP_ATTN(eqx.Module):
 
     Attributes
     ----------
+    active_source: dict
+        Boolean indicating if this data source (and encoder) are to be used.
     encoders: dict
         Encoders, one for each dynamic data source.
     static_embedder: StaticEmbedder
@@ -97,11 +99,12 @@ class LSTM_MLP_ATTN(eqx.Module):
     target: list
         Names of the target variables.
     """
-    encoders: dict
+    active_source: dict[str:bool]
+    encoders: dict[str:eqx.Module]
     static_embedder: StaticEmbedder
-    decoders: dict
+    decoders: dict[str:eqx.Module]
     head: eqx.nn.Linear
-    target: list
+    target: list[str]
 
     def __init__(self,
                  *,
@@ -114,7 +117,8 @@ class LSTM_MLP_ATTN(eqx.Module):
                  num_heads: int,
                  seed: int,
                  dropout: float,
-                 time_aware: dict = {}):
+                 time_aware: dict,
+                 active_source: dict = {}):
         """Initializes an LSTM_MLP_ATTN model.
 
         Parameters
@@ -137,9 +141,13 @@ class LSTM_MLP_ATTN(eqx.Module):
             A seed for the random number generator.
         dropout: float
             The dropout rate.
-        time_aware: dict, optional
-            A dictionary of booleans indicating whether each dynamic feature is time-aware.
-            Defaults to {}.
+        time_aware: dict
+            A dictionary of booleans indicating whether each dynamic feature is
+            time-aware.
+        active_source: dict, optional
+            A dicitonary of booleans indicating whether each dyanmic source
+            (collection of features), and the accompanying encoder will be used.
+            Defaults to using all sources.
         """
         key = jax.random.PRNGKey(seed)
         keys = jax.random.split(key, 5)
@@ -153,6 +161,12 @@ class LSTM_MLP_ATTN(eqx.Module):
         else:
             self.static_embedder = None
             static_size = 0
+
+        # Default all sources to true. Can be specified in the model args.
+        if len(active_source) == 0:
+            for source in dynamic_sizes.keys():
+                active_source[source] = True
+        self.active_source = active_source
 
         # Encoders for each dynamic data source.
         encoder_keys = jax.random.split(keys[0], len(dynamic_sizes))
@@ -196,6 +210,24 @@ class LSTM_MLP_ATTN(eqx.Module):
                                   key=keys[3])
         self.target = target
 
+    def finetune_update(self, *, active_source: dict):
+        """Updates the model configuration after initialization.
+        
+        These updates must not break the forward call of the model. Only some
+        things can reasonably change to ensure it does not break.
+
+        Parameters
+        ----------
+        active_source: dict
+            Boolean indicating if this data source (and encoder) are to be used.
+        """
+        for source, active in active_source.items():
+            if source in self.active_source:
+                self.active_source[source] = active
+            else:
+                raise ValueError(f"Source '{source}' not found in active_source.")
+        print(self.active_source)
+
     def __call__(self, data: dict[str, Array | dict[str, Array]], key: PRNGKeyArray):
         """The forward pass of the data through the model 
 
@@ -224,6 +256,10 @@ class LSTM_MLP_ATTN(eqx.Module):
         encoded_data = {}
         masks = {}
         for (var_name, encoder), e_key in zip(self.encoders.items(), encoder_keys):
+            if not self.active_source[var_name]:
+                encoded_data[var_name] = None
+                continue
+
             masks[var_name] = ~jnp.any(jnp.isnan(data['dynamic'][var_name]), axis=1)
             x_d = jnp.where(jnp.expand_dims(masks[var_name], 1),
                             data['dynamic'][var_name], 0.0)
@@ -239,8 +275,13 @@ class LSTM_MLP_ATTN(eqx.Module):
             decoder_keys = jax.random.split(keys[2], len(cross_vars))
             decoded_list = []
             for k, d_key in zip(cross_vars, decoder_keys):
-                decoded_list.append(self.decoders[k](query, encoded_data[k],
-                                                     static_bias, masks[k], d_key))
+                if self.active_source[k]:
+                    decoded = self.decoders[k](query, encoded_data[k], static_bias,
+                                               masks[k], d_key)
+                else:
+                    decoded = self.decoders[k](query, query, static_bias,
+                                               masks[source_var], d_key)
+                decoded_list.append(decoded)
             pooled_output = jnp.concatenate(decoded_list, axis=0)
 
         else:

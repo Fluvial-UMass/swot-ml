@@ -9,16 +9,16 @@ config_path=""
 # Parse named arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        --train|--continue|--finetune|--test|--plot)
+        --train|--continue|--finetune|--test|--attribution)
             if [[ -n "$flag" ]]; then
-                echo "Error: Cannot specify multiple modes (--train, --continue, --finetune, --test, --plot)."
+                echo "Error: Cannot specify multiple modes (--train, --continue, --finetune, --test, --attribution)."
                 exit 1
             fi
             flag="$1"
             config_path="$2"
             shift
             ;;
-        --cpu|--ceewater|--gpu|--gpu-long)
+        --cpu|--ceewater|--gpu|--gpu-long|--gpupod)
             # Strip the initial '--' and use the remainder as partition_name
             partition_name="${1:2}"  
             ;;
@@ -36,21 +36,24 @@ if [[ -z "$flag" ]]; then
     exit 1
 fi
 
-# Check if the path exists and matches flag type
-if [[ "$flag" == "--train" ]]; then
-    if [[ ! -f "$config_path" ]]; then
-        echo "Error: Training configuration file does not exist: $config_path"
-        exit 1
-    fi
-elif [[ "$flag" == "--continue" || "$flag" == "--test" ]]; then
-    if [[ ! -d "$config_path" ]]; then
-        echo "Error: Directory does not exist: $config_path"
-        exit 1
-    fi
-fi
+case "$flag" in
+    --train)
+        if [[ ! -f "$config_path" ]]; then
+            echo "Error: Training configuration file does not exist: $config_path"
+            exit 1
+        fi 
+        ;;
+    *)
+        if [[ ! -d "$config_path" ]]; then
+            echo "Error: Directory does not exist: $config_path"
+            exit 1
+        fi
+        ;;
+esac
+
 
 # Set the partition and runtime args based on partition_name
-n_workers=2
+n_workers=1
 SBATCH_DIRECTIVES=""
 ENVIRONMENT_LINES=""
 case $partition_name in
@@ -80,10 +83,22 @@ case $partition_name in
         SBATCH_DIRECTIVES+="#SBATCH -t 14-00:00:00\n"
         SBATCH_DIRECTIVES+="#SBATCH -p gpu\n"
         SBATCH_DIRECTIVES+="#SBATCH -q long\n"
-        SBATCH_DIRECTIVES+="#SBATCH --gpus=1\n"
-        SBATCH_DIRECTIVES+="#SBATCH --constraint=sm_61&vram11\n"
+        SBATCH_DIRECTIVES+="#SBATCH --gpus=2080ti:1\n"
+        # SBATCH_DIRECTIVES+="#SBATCH --constraint=sm_61&vram11\n"
         ENVIRONMENT_LINES+="module load cuda/12.6\n"
         ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_MEM_FRACTION=0.8\n"
+        ENVIRONMENT_LINES+="nvidia-smi -L\n"
+        ;;
+    gpupod)
+        SBATCH_DIRECTIVES+="#SBATCH -c $n_workers\n"
+        SBATCH_DIRECTIVES+="#SBATCH -t 14-00:00:00\n"
+        SBATCH_DIRECTIVES+="#SBATCH -p gpupod-l40s\n"
+        SBATCH_DIRECTIVES+="#SBATCH -q gpu-quota-16\n"
+        SBATCH_DIRECTIVES+="#SBATCH -A pi_cjgleason_umass_edu\n"
+        SBATCH_DIRECTIVES+="#SBATCH --gpus=l40s:1\n"
+        ENVIRONMENT_LINES+="module load cuda/12.6\n"
+        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_MEM_FRACTION=0.8\n"
+        ENVIRONMENT_LINES+="nvidia-smi -L\n"
         ;;
     *)
         echo "Unknown partition type: $partition_name"
@@ -105,7 +120,7 @@ sbatch_script=$(mktemp)
 cat << EOF > "$sbatch_script"
 #!/bin/bash
 #SBATCH --job-name="${config_parent}_${config_basename}"
-#SBATCH --mem=16G  # Requested Memory
+#SBATCH --mem=64G  # Requested Memory
 #SBATCH -o ${output_dir}/${config_basename}.out
 $(echo -e "$SBATCH_DIRECTIVES")
 
@@ -117,9 +132,9 @@ $(echo -e "$ENVIRONMENT_LINES")
 python /work/pi_kandread_umass_edu/tss-ml/src/run.py $flag $config_path
 EOF
 
-# Submit the job
-# cat $sbatch_script #for viewing the script.
+# Submit the job.
 sbatch "$sbatch_script"
 
-
+# # View the job script.
+# cat $sbatch_script
 

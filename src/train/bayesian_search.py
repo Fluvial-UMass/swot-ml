@@ -3,6 +3,7 @@ from pathlib import Path
 import ConfigSpace as CS
 import ConfigSpace.hyperparameters as CSH
 from smac import BlackBoxFacade, Scenario
+from smac.main.config_selector import ConfigSelector
 from smac.runhistory.dataclasses import TrialValue
 from dask_jobqueue import SLURMCluster
 from distributed import as_completed
@@ -32,7 +33,7 @@ def _create_configspace(cfg):
     return cs
 
 
-def update_smac_config(base_cfg, updates):
+def update_smac_config(base_cfg, updates, seed):
     for k, v in base_cfg.items():
         if isinstance(v, dict):
             for kk, vv in v.items():
@@ -41,6 +42,8 @@ def update_smac_config(base_cfg, updates):
         elif isinstance(v, int) or isinstance(v, float):
             if k in updates.keys():
                 base_cfg[k] = updates[k]
+
+    base_cfg['model_args']['seed'] = seed
     return base_cfg
 
 
@@ -71,21 +74,23 @@ def get_dask_client(cfg, n_workers):
 
 
 def get_smac_facade(cfg, target_fun, n_runs):
-    cs = _create_configspace(cfg)
+    configspace = _create_configspace(cfg)
     path = Path(cfg['cfg_path'])
 
     scenario = Scenario(
-        configspace=cs,
+        configspace=configspace,
         name="smac_opt",
         output_directory=path.parent,
         n_trials=n_runs,
     )
 
+    configselector = ConfigSelector(scenario=scenario, retrain_after=1)
+
     facade = BlackBoxFacade(
         scenario,
         target_fun,
         overwrite=False,  # Continues if a file with consistent metadata exists.
-    )
+        config_selector=configselector)
 
     return facade
 

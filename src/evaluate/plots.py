@@ -1,6 +1,10 @@
+from pathlib import Path
+import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.colors as mcolors
 
 
 def mosaic_scatter(cfg: dict, results: pd.DataFrame, metrics: pd.DataFrame, title: str):
@@ -10,24 +14,20 @@ def mosaic_scatter(cfg: dict, results: pd.DataFrame, metrics: pd.DataFrame, titl
         x = x[positive_mask]
         y = y[positive_mask]
 
-        min_val = 5E-1
-        max_val = 5E6
-        log_min = np.log10(min_val)
-        log_max = np.log10(max_val)
-
         hb = ax.hexbin(x,
                        y,
                        gridsize=(30, 20),
                        bins='log',
                        mincnt=5,
                        linewidth=0.2,
-                       extent=(log_min, log_max, log_min, log_max),
                        xscale='log',
                        yscale='log')
         plt.colorbar(hb, shrink=0.3, aspect=10, anchor=(-1, -0.55))
 
         # Add a 1:1 line over the min and max of x and y
-        ax.plot([min_val, max_val], [min_val, max_val], 'r--')
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        ax.plot(xlim, ylim, 'r--')
 
         textstr = '\n'.join([
             f"{key}: {metrics[target][key]:0.2f}"
@@ -44,8 +44,8 @@ def mosaic_scatter(cfg: dict, results: pd.DataFrame, metrics: pd.DataFrame, titl
 
         # Setting axes to be square and equal range
         ax.axis('square')
-        ax.set_xlim(min_val, max_val)
-        ax.set_ylim(min_val, max_val)
+        ax.set_xlim(min([xlim, ylim]))
+        ax.set_ylim(max([xlim, ylim]))
         ax.set_title(f"{target} (n {len(x):,})")
         ax.set_xlabel(f'Observed')
         ax.set_ylabel(f'Predicted')
@@ -124,3 +124,69 @@ def basin_metric_histograms(basin_metrics: pd.DataFrame,
         fig_dict[target] = fig
 
     return fig_dict
+
+
+def plot_average_attribution(save_dir: Path, dataset):
+    label_name_dict = {
+        'snowmelt_sum': 'Snowmelt',
+        'Blue': 'Blue',
+        'Swir2': 'SWIR 2',
+        'Green': 'Green',
+        'surface_runoff_sum': 'Surface runoff',
+        'total_evaporation_sum': 'Evaporation',
+        'Swir1': 'SWIR 1',
+        'Red': 'Red',
+        'surface_solar_radiation_downwards_sum': 'Shortwave radiation',
+        'dw': 'Dominant wavelength',
+        'surface_thermal_radiation_downwards_sum': 'Longwave radiation',
+        'temperature_2m': 'Air temperature (2m)',
+        'pCount_dswe1': 'Inundated pixel count',
+        'Surface_temp_kelvin': 'Surface temperature',
+        'Nir': 'NIR',
+        'hue': 'Hue',
+        'total_precipitation_sum': 'Precipitation'
+    }
+
+    targets = dataset.features['target']
+
+    feat_groups = list(dataset.features['dynamic'].keys())
+    colors = list(mcolors.TABLEAU_COLORS.keys())
+
+    # Create legend patches
+    leg_patches = [
+        mpatches.Patch(color=colors[i], label=g) for i, g in enumerate(feat_groups)
+    ]
+
+    plt.close('all')
+    fig, axes = plt.subplots(1, len(targets), figsize=(4 * len(targets), 5))
+    axes = [axes] if len(targets) == 1 else axes
+
+    for ax, target in zip(axes, targets):
+        pkl_file = save_dir / f'{target}_integrated_gradients.pkl'
+        with open(pkl_file, 'rb') as file:
+            ig = pickle.load(file)
+        ig.replace(np.nan, 0, inplace=True)
+
+        avg_imp = ig.mean(axis=0).abs()
+        avg_imp.drop([*dataset.d_encoding['encoded_columns'], target], inplace=True)
+        avg_imp = pd.DataFrame(avg_imp.rename('importance'))
+
+        for k in avg_imp.index:
+            for i, g in enumerate(feat_groups):
+                if k in dataset.features['dynamic'][g]:
+                    avg_imp.loc[k, 'color'] = colors[i]
+                    break
+
+        avg_imp.rename(label_name_dict, inplace=True)
+        avg_imp.sort_values(by='importance', inplace=True)
+
+        ax.barh(avg_imp.index, avg_imp['importance'], color=avg_imp['color'])
+
+        ax.legend(handles=leg_patches, loc='lower right')
+
+        ax.set_title(f"{target}")
+        ax.set_xlabel("Average IG")
+        ax.ticklabel_format(style='sci', axis='x', useMathText=True, scilimits=(0, 0))
+
+    plt.tight_layout()
+    fig.savefig(save_dir / "feature_attr.png", dpi=300)

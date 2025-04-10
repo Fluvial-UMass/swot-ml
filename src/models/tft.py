@@ -7,7 +7,6 @@ import jax.random as jrandom
 
 from models.lstm import EALSTM
 
-
 class GatedLinearUnit(eqx.Module):
     gates: eqx.nn.Linear
     linear: eqx.nn.Linear

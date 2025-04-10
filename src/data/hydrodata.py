@@ -314,6 +314,13 @@ class HydroDataset(Dataset):
             if not self.inference_mode:
                 batch['y'] = np.moveaxis(ds[self.target].to_array().values, 0, 2)
 
+        # # Testing devices
+        # for source, col_names in self.features['dynamic'].items():
+        #     batch['dynamic'][source] = jnp.array(batch['dynamic'][source])
+        #     batch['dynamic_dt'][source] = jnp.array(batch['dynamic_dt'][source])
+        # batch['static'] = jnp.array(batch['static'])
+        # batch['y'] = jnp.array(batch['y'])
+
         return basins, dates, batch
 
     def _encode_data(self, ds, feat_group, encoding):
@@ -512,6 +519,26 @@ class HydroDataset(Dataset):
 
         return ds, scale
 
+    def denormalize(self, x: np.ndarray | jnp.ndarray, name: str):
+        """
+        Denormalizes a feature or target by its name.
+        
+        Args:
+            x (np.ndarray or jnp.ndarray): Normalized data.
+            name (str): Name of the variable to denormalize.
+        
+        Returns:
+            np.ndarray or jnp.ndarray: Denormalized data.
+        """
+        offset = self.d_scale[name]['offset']
+        scale = self.d_scale[name]['scale']
+        log_norm = self.d_scale[name]['log_norm']
+
+        if log_norm:
+            return jnp.exp(x + offset) - self.log_pad
+        else:
+            return x * scale + offset
+
     def denormalize_target(self, y_normalized):
         """
         Denormalizes the target variable(s).
@@ -521,18 +548,10 @@ class HydroDataset(Dataset):
         y = jnp.empty_like(y_normalized)
 
         for i in range(len(self.target)):
-            # Retrieve the normalization parameters for the target variable
-            target = self.target[i]
-            offset = self.d_scale[target]['offset']
-            scale = self.d_scale[target]['scale']
-            log_norm = self.d_scale[target]['log_norm']
+            target_name = self.target[i]
+            denorm = self.denormalize(y_normalized[..., i], name=target_name)
+            y = y.at[..., i].set(denorm)
 
-            # Reverse the normalization process using .at and .set
-            if log_norm:
-                y = y.at[...,
-                         i].set(jnp.exp(y_normalized[..., i] + offset) - self.log_pad)
-            else:
-                y = y.at[..., i].set(y_normalized[..., i] * scale + offset)
         return y
 
     def _date_batching(self, valid_date_mask):
