@@ -27,10 +27,6 @@ class EarlyStopper:
         self.threshold = threshold  # Relative improvement threshold
         self.loss_list = []
 
-        logger.info(
-            f"EarlyStopper: Enabled with patience: {patience} and threshold: {threshold*100:0.02f}%"
-        )
-
     def __call__(self, current_loss):
         """Update the loss list and determine if training should stop."""
         self.loss_list.append(current_loss)

@@ -118,6 +118,7 @@ class Trainer:
 
         self.num_epochs = cfg['num_epochs']
         self.log_interval = cfg.get('log_interval', 5)
+        self.validate_interval = cfg.get('validate_interval', 5)
         self.lr_schedule = _create_lr_schedule(cfg)
 
         seed = cfg['model_args']['seed'] + 1
@@ -241,11 +242,14 @@ class Trainer:
                         warning_str += f"\n\t{tree_key}: {count}"
                     self.logger.info(warning_str)
 
-            if self.early_stopper:
+            if (self.epoch == 0) or (self.epoch % self.validate_interval == 0):
                 v_loss = self.get_validation_loss()
                 self.logger.info(f"Epoch: {self.epoch}, Validation Loss: {v_loss:.4f}")
-                stop_now = self.early_stopper(v_loss)
-                if stop_now:
+            else:
+                v_loss = None
+
+            if v_loss and self.early_stopper:
+                if self.early_stopper(v_loss):
                     self.logger.info("Training stopped by EarlyStopper.")
                     self.cfg['num_epochs'] = self.epoch
                     self.save_state()
@@ -285,7 +289,7 @@ class Trainer:
                     desc=f"Epoch:{self.epoch:03.0f}")
         for data_tuple in pbar:
             basins, dates, batch = data_tuple
-            batch = self.dataloader.shard_batch(batch)
+            # batch = self.dataloader.shard_batch(batch)
             batch_count += 1
 
             # Split and update training key for dropout
@@ -497,7 +501,8 @@ class Trainer:
 
     @classmethod
     def load_last_checkpoint(cls, log_dir: Path):
-        """Finds the directory of the last saved epoch.
+        """Finds the directory of the last saved epoch or loads a fresh Trainer from config if no checkpoints exist.
+
 
         Parameters
         ----------
@@ -519,7 +524,16 @@ class Trainer:
             checkpoint_dir = log_dir / f"epoch{epoch_strs[last_epoch_idx]}"
             return cls.load_checkpoint(checkpoint_dir)
         else:
-            return None
+            # --- Load Config and create fresh Trainer instance ---
+            config_path = log_dir / "config.pkl"
+            if config_path.exists():
+                with open(config_path, 'rb') as f:
+                    cfg = pickle.load(f)
+                print("No checkpoints found. Creating Trainer from config...")
+                return cls(cfg=cfg, log_dir=log_dir)
+            else:
+                raise FileNotFoundError(
+                    f"No checkpoints or config.pkl found in {log_dir}")
 
 
 def _create_lr_schedule(cfg):

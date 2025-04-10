@@ -38,16 +38,6 @@ def flux_agreement(y_pred: Array, target_list: list):
     return jnp.mean(jnp.square(rel_error))
 
 
-# def flux_agreement(y_pred: Array, target_list: list):
-#     """Calculates the normalized difference between direct SSF and SSC*Q flux estimates"""
-#     ssc = y_pred[:, target_list.index('ssc')] / 1E6  # mg/l -> kg/l
-#     flux = y_pred[:, target_list.index('flux')] / 1.102 / 1E3  # short ton/day -> kg/d
-#     q = y_pred[:, target_list.index('usgs_q')] * 24 * 3600 * 1000  # m^3/s -> l/d
-
-#     rel_error = (1 - (flux / (ssc * q)))
-#     return jnp.mean(jnp.square(rel_error))
-
-
 def compute_loss_fn(diff_model: PyTree,
                     static_model: PyTree,
                     data: dict[str:Array | dict[str:Array]],
