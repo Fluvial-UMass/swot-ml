@@ -128,8 +128,9 @@ module load conda/latest
 conda activate tss-ml
 
 $(echo -e "$ENVIRONMENT_LINES")
-    
-python /work/pi_kandread_umass_edu/tss-ml/src/run.py $flag $config_path
+
+cd "$(dirname "$0")/../src"
+python run.py $flag $config_path
 EOF
 
 # Submit the job.
