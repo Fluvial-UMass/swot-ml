@@ -1,4 +1,3 @@
-import sys
 import pandas as pd
 import numpy as np
 import jax
@@ -6,9 +5,6 @@ import jax.numpy as jnp
 import equinox as eqx
 import pickle
 from tqdm.auto import tqdm
-from pathlib import Path
-from copy import deepcopy
-import itertools
 import warnings
 
 
@@ -21,11 +17,16 @@ def _calculate_ig_single(model, single_input_tree, baseline_tree, target_idx, m_
         pred = model(interpolated_input, key=key)
         return pred[target_idx]
 
-    alphas = jnp.linspace(start=0., stop=1., num=m_steps + 1)
+    alphas = jnp.linspace(start=0.0, stop=1.0, num=m_steps + 1)
 
     # Interpolate inputs: Pytree leaves become shape (m_steps+1, *original_shape)
-    interpolated_inputs = jax.vmap(lambda alpha: jax.tree.map(
-        lambda x, b: b + alpha * (x - b), single_input_tree, baseline_tree))(alphas)
+    interpolated_inputs = jax.vmap(
+        lambda alpha: jax.tree.map(
+            lambda x, b: b + alpha * (x - b),
+            single_input_tree,
+            baseline_tree,
+        )
+    )(alphas)
 
     # Calculate gradients at each interpolated step
     # Pytree leaves become shape (m_steps+1, *original_shape)
@@ -39,9 +40,16 @@ def _calculate_ig_single(model, single_input_tree, baseline_tree, target_idx, m_
     avg_grads = jax.tree.map(trapezoid_avg, interpolated_grads)
 
     # Calculate diff and final attribution: (input - baseline) * avg_grads
-    input_diff = jax.tree.map(lambda x, b: x - b, single_input_tree, baseline_tree)
-    ig_attribs = jax.tree.map(lambda diff, avg_grad: diff * avg_grad, input_diff,
-                              avg_grads)
+    input_diff = jax.tree.map(
+        lambda x, b: x - b,
+        single_input_tree,
+        baseline_tree,
+    )
+    ig_attribs = jax.tree.map(
+        lambda diff, avg_grad: diff * avg_grad,
+        input_diff,
+        avg_grads,
+    )
 
     return ig_attribs
 
@@ -52,28 +60,42 @@ def _get_batch_ig(model, batch, target_idx, m_steps):
     baseline = jax.tree.map(jnp.zeros_like, batch)
 
     # Vmap the single calculation over the batch
-    batched_ig_fn = jax.vmap(_calculate_ig_single, in_axes=(None, 0, 0, None, None))
-    batch_ig_attribs_tree = batched_ig_fn(model, batch, baseline, target_idx, m_steps)
+    batched_ig_fn = jax.vmap(
+        _calculate_ig_single,
+        in_axes=(None, 0, 0, None, None),
+    )
+    batch_ig_attribs_tree = batched_ig_fn(
+        model,
+        batch,
+        baseline,
+        target_idx,
+        m_steps,
+    )
 
     # Extract and concatenate dynamic features from the last time step
     feat_imp_list = []
-    dynamic_feature_keys = list(batch['dynamic'].keys())  # Ensure consistent order
+    dynamic_feature_keys = list(batch["dynamic"].keys())  # Ensure consistent order
 
     for feat_group in dynamic_feature_keys:
         # Summing attributions across the sequence length dimension (axis=1)
-        summed_attributions = jnp.nansum(batch_ig_attribs_tree['dynamic'][feat_group],
-                                         axis=1)
+        summed_attributions = jnp.nansum(
+            batch_ig_attribs_tree["dynamic"][feat_group],
+            axis=1,
+        )
         feat_imp_list.append(summed_attributions)
 
     # Concatenate along the feature dimension: -> (batch, total_dynamic_features)
-    final_ig_attributions = jnp.concatenate(feat_imp_list, axis=-1)
+    final_ig_attributions = jnp.concatenate(
+        feat_imp_list,
+        axis=-1,
+    )
     return final_ig_attributions
 
 
 @eqx.filter_jit
 def _get_batch_predictions(model, batch, target_idx):
     """Helper to get predictions for a batch."""
-    key = jax.random.PRNGKey(0)  #keys are only used for dropout.
+    key = jax.random.PRNGKey(0)  # keys are only used for dropout.
 
     def predict_single(single_input):
         return model(single_input, key=key)[target_idx]
@@ -99,20 +121,27 @@ def get_intgrads_df(cfg, model, dataloader, target, m_steps=50, max_iter=np.inf)
     # Set model to inference mode (no dropout)
     model = eqx.nn.inference_mode(model)
 
-    targets = cfg['features']['target']
+    targets = cfg["features"]["target"]
     target_idx = targets.index(target)
 
-    results = {'basin': [], 'date': [], target: [], 'ig_attribs': []}
+    results = {
+        "basin": [],
+        "date": [],
+        target: [],
+        "ig_attribs": [],
+    }
 
     if (max_iter != np.inf) and (max_iter < len(dataloader)):
         n_iter = max_iter
     else:
         n_iter = len(dataloader)
 
-    pbar = tqdm(dataloader,
-                total=n_iter,
-                disable=cfg['quiet'],
-                desc=f"Calculating IG for {target}")
+    pbar = tqdm(
+        dataloader,
+        total=n_iter,
+        disable=cfg["quiet"],
+        desc=f"Calculating IG for {target}",
+    )
 
     # --- Main Loop ---
     for i, (basin, date, batch) in enumerate(pbar):
@@ -120,8 +149,8 @@ def get_intgrads_df(cfg, model, dataloader, target, m_steps=50, max_iter=np.inf)
             break
 
         # Remove auxiliary data if necessary before passing to model/IG calc
-        if 'dynamic_dt' in batch:
-            batch.pop('dynamic_dt')
+        if "dynamic_dt" in batch:
+            batch.pop("dynamic_dt")
 
         # Calculate Predictions (more efficient to do it once here)
         batch_preds = _get_batch_predictions(model, batch, target_idx)
@@ -131,39 +160,45 @@ def get_intgrads_df(cfg, model, dataloader, target, m_steps=50, max_iter=np.inf)
         batch_ig_attributions = _get_batch_ig(model, batch, target_idx, m_steps)
 
         # Store results (use device_get to move from JAX arrays to host)
-        results['basin'].extend(list(basin))
-        results['date'].extend(list(date))
-        results['ig_attribs'].append(jax.device_get(batch_ig_attributions))
+        results["basin"].extend(list(basin))
+        results["date"].extend(list(date))
+        results["ig_attribs"].append(jax.device_get(batch_ig_attributions))
         results[target].append(jax.device_get(y_denorm))
 
-    final_ig_attributions = np.concatenate(results['ig_attribs'], axis=0)
+    final_ig_attributions = np.concatenate(results["ig_attribs"], axis=0)
     final_target_values = np.concatenate(results[target], axis=0)
 
     # Get feature names in the correct order
-    dynamic_features = dataloader.dataset.features['dynamic']
+    dynamic_features = dataloader.dataset.features["dynamic"]
     feature_names = [f for k in dynamic_features for f in dynamic_features[k]]
 
     # Create DataFrame
-    output_df = pd.DataFrame({
-        "basin": results['basin'],
-        "date": results['date'],
-        target: final_target_values,
-    })
+    output_df = pd.DataFrame(
+        {
+            "basin": results["basin"],
+            "date": results["date"],
+            target: final_target_values,
+        }
+    )
     ig_cols_df = pd.DataFrame(final_ig_attributions, columns=feature_names)
 
     final_df = pd.concat(
-        [output_df.reset_index(drop=True),
-         ig_cols_df.reset_index(drop=True)], axis=1)
-    final_df.set_index(['basin', 'date'], inplace=True)
+        [
+            output_df.reset_index(drop=True),
+            ig_cols_df.reset_index(drop=True),
+        ],
+        axis=1,
+    )
+    final_df.set_index(["basin", "date"], inplace=True)
 
     return final_df
 
 
 def save_all_intgrads(cfg, model, dataloader, save_dir, m_steps=50):
-    for target in cfg['features']['target']:
+    for target in cfg["features"]["target"]:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             data = get_intgrads_df(cfg, model, dataloader, target, m_steps)
 
-        with open(save_dir / f'{target}_integrated_gradients.pkl', 'wb') as file:
+        with open(save_dir / f"{target}_integrated_gradients.pkl", "wb") as file:
             pickle.dump(data, file)

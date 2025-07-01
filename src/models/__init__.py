@@ -2,12 +2,22 @@ import jax
 from jaxtyping import PyTree
 import equinox as eqx
 
+from config import Config, SeqAttnArgs, GraphLSTMArgs
+from data import HydroDataLoader, HydroDataset
 from models.flexible_hybrid import FlexibleHybrid
 from models.lstm_mlp_attn import LSTM_MLP_ATTN
 from models.rg_lstm import Graph_LSTM
 
 
-def make(cfg: dict):
+# Dictionary of valid model names and their constructors
+MODEL_MAP = {
+    "flexible_hybrid": FlexibleHybrid,
+    "lstm_mlp_attn": LSTM_MLP_ATTN,
+    "graph_lstm": Graph_LSTM,
+}
+
+
+def make(cfg: Config, dl: HydroDataLoader = None):
     """Creates a model based on the provided configuration.
 
     Parameters
@@ -17,26 +27,38 @@ def make(cfg: dict):
 
     Returns
     -------
+    Config
+        The config object used to make the model.
     eqx.Module
         The created model.
     """
-    name = cfg['model'].lower()
-    if name == "flexible_hybrid":
-        model_fn = FlexibleHybrid
-    elif name == "lstm_mlp_attn":
-        model_fn = LSTM_MLP_ATTN
-    elif name == 'graph_lstm':
-        model_fn = Graph_LSTM
-    else:
-        err_str = (f"{cfg['model']} is not a valid model name. " +
-                   "Check /src/models/__init__.py for model config.")
-        raise ValueError(err_str)
+    if dl is not None:
+        cfg = set_model_data_args(cfg, dl.dataset)
 
-    model = model_fn(**cfg['model_args'])
+    model_fn = MODEL_MAP[cfg.model_args.name]
+    model = model_fn(**cfg.model_args.as_kwargs())
     num_params, memory_bytes = count_parameters(model)
     size, unit = human_readable_size(memory_bytes)
     print(f"Model contains {num_params:,} parameters, using {size:.2f}{unit} memory.")
-    return model
+    return cfg, model
+
+
+def set_model_data_args(cfg: Config, dataset: HydroDataset):
+    """Set model arguments based on configuration and dataset."""
+    cfg.model_args.target = dataset.target
+
+    if isinstance(cfg.model_args, SeqAttnArgs):
+        cfg.model_args.seq_length = cfg.sequence_length
+        cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dataset.features["dynamic"].items()}
+        cfg.model_args.static_size = len(dataset.features["static"])
+        cfg.model_args.time_aware = dataset.time_gaps
+    elif isinstance(cfg.model_args, GraphLSTMArgs):
+        cfg.model_args.dynamic_size = len(dataset.features["dynamic"]["era5"])
+        cfg.model_args.static_size = len(dataset.features["static"])
+        cfg.model_args.graph_matrix = dataset.graph_matrix
+    else:
+        raise ValueError(f"Unknown model_args type: {type(cfg.model_args)}")
+    return cfg
 
 
 def count_parameters(model: PyTree):
@@ -61,14 +83,13 @@ def count_parameters(model: PyTree):
     num_params = sum(param.size for param in params if eqx.is_inexact_array(param))
     # Calculate memory usage assuming 4 bytes per parameter (32-bit float)
     memory_bytes = num_params * 4
-
     return num_params, memory_bytes
 
 
 # Convert bytes to a human-readable format
 def human_readable_size(size):
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size < 1024.0 or unit == 'TB':
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024.0 or unit == "TB":
             break
         size /= 1024.0
     return size, unit

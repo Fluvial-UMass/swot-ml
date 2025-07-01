@@ -13,10 +13,12 @@ def _model_map(model, batch: dict[str:Array], keys: list[PRNGKeyArray]):
     return jax.vmap(model)(batch, keys)
 
 
-def model_iterate(model: eqx.Module,
-                  dataloader,
-                  quiet: bool = False,
-                  denormalize: bool = True) -> Iterator[dict]:
+def model_iterate(
+    model: eqx.Module,
+    dataloader,
+    quiet: bool = False,
+    denormalize: bool = True,
+) -> Iterator[dict]:
     """Iterates through a dataloader and yields predictions from the model.
 
     Parameters
@@ -54,26 +56,25 @@ def model_iterate(model: eqx.Module,
         if denormalize:
             y_pred = dataloader.dataset.denormalize_target(y_pred)
 
-        out_dict = {'basin': basin, 'date': date, 'y_pred': y_pred}
+        out_dict = {"basin": basin, "date": date, "y_pred": y_pred}
 
         if not inference_mode:
-            y = batch['y'][:, -1, :]
+            y = batch["y"][:, -1, :]
             if denormalize:
                 y = dataloader.dataset.denormalize_target(y)
-            out_dict['y'] = y
+            out_dict["y"] = y
 
-        if 'dynamic_dt' in batch.keys():
-            dt_arr = np.stack([v[:, -1] for v in batch['dynamic_dt'].values()], axis=1)
-            out_dict['dt'] = dt_arr
+        if "dynamic_dt" in batch.keys():
+            dt_arr = np.stack(
+                [v[:, -1] for v in batch["dynamic_dt"].values()],
+                axis=1,
+            )
+            out_dict["dt"] = dt_arr
 
         yield out_dict
 
 
-def predict(model: eqx.Module,
-            dataloader,
-            *,
-            quiet: bool = False,
-            denormalize: bool = True):
+def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: bool = True):
     """Generates predictions from a model and dataloader.
 
     The function iterates through the dataloader, applies the model to each batch, and
@@ -106,26 +107,26 @@ def predict(model: eqx.Module,
     y_list = []
     dt_list = []
 
-    # Iterate through the dataset,make predictions and collect data in lists.
+    # Iterate through the dataset, make predictions and collect data in lists.
     for result_dict in model_iterate(model, dataloader, quiet, denormalize):
-        basins.extend(result_dict['basin'])
-        dates.extend(result_dict['date'])
-        y_hat_list.append(result_dict['y_pred'])
-        if 'y' in result_dict.keys():
-            y_list.append(result_dict.get('y'))
-        if 'dt' in result_dict.keys():
-            dt_list.append(result_dict.get('dt'))
+        basins.extend(result_dict["basin"])
+        dates.extend(result_dict["date"])
+        y_hat_list.append(result_dict["y_pred"])
+        if "y" in result_dict.keys():
+            y_list.append(result_dict.get("y"))
+        if "dt" in result_dict.keys():
+            dt_list.append(result_dict.get("dt"))
 
-    # Concate all the data lists into arrays.
+    # Concatenate all the data lists into arrays.
     y_hat_arr = np.concatenate(y_hat_list)
 
     if len(y_list) > 0:
         y_arr = np.concatenate(y_list)
         data = np.concatenate((y_arr, y_hat_arr), axis=-1)
-        cols = ['obs', 'pred']
+        cols = ["obs", "pred"]
     else:
         data = y_hat_arr
-        cols = ['pred']
+        cols = ["pred"]
 
     if dataloader.dataset.graph_mode:
         n_samples = len(basins)
@@ -136,16 +137,26 @@ def predict(model: eqx.Module,
         data = data.reshape(n_samples * graph_nodes, data.shape[-1])
 
     # Place the data arrays into a dataframe with multilevel indices.
-    datetime_index = pd.MultiIndex.from_arrays([basins, dates], names=['basin', 'date'])
-    column_index = pd.MultiIndex.from_product([cols, dataloader.dataset.target],
-                                              names=['Type', 'Feature'])
-    results = pd.DataFrame(data, index=datetime_index, columns=column_index)
+    datetime_index = pd.MultiIndex.from_arrays(
+        [basins, dates],
+        names=["basin", "date"],
+    )
+    column_index = pd.MultiIndex.from_product(
+        [cols, dataloader.dataset.target],
+        names=["Type", "Feature"],
+    )
+    results = pd.DataFrame(
+        data,
+        index=datetime_index,
+        columns=column_index,
+    )
 
     # Might break if dt is implemented for graph mode. Not planned.
     if len(dt_list) > 0:
         dt_index = pd.MultiIndex.from_product(
-            [['dt'], dataloader.dataset.features['dynamic'].keys()],
-            names=['Type', 'Feature'])
+            [["dt"], dataloader.dataset.features["dynamic"].keys()],
+            names=["Type", "Feature"],
+        )
         results[dt_index] = np.concatenate(dt_list)
 
     return results

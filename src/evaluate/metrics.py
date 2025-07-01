@@ -26,13 +26,15 @@ def get_basin_metrics(df: pd.DataFrame, disp: bool = False):
         A DataFrame containing the calculated metrics for each basin and feature.
         The columns are MultiIndexed with levels 'Feature' and 'Metric'.
     """
-    per_basin_metrics = df.groupby(level='basin').apply(get_all_metrics)
+    per_basin_metrics = df.groupby(level="basin").apply(get_all_metrics)
 
     # Initialize an empty DataFrame to store results with multi-level columns
-    feature_names = df['obs'].columns
+    feature_names = df["obs"].columns
     metric_names = per_basin_metrics.iloc[0][feature_names[0]].keys()
-    multi_index_columns = pd.MultiIndex.from_product([feature_names, metric_names],
-                                                     names=['Feature', 'Metric'])
+    multi_index_columns = pd.MultiIndex.from_product(
+        [feature_names, metric_names],
+        names=["Feature", "Metric"],
+    )
     results_df = pd.DataFrame(columns=multi_index_columns)
 
     # Populate the DataFrame with the metrics results
@@ -75,25 +77,25 @@ def get_all_metrics(df: pd.DataFrame, disp: bool = False):
     """
     metrics = {}
 
-    for feature in df['obs'].columns:
-        y = df[('obs', feature)]
-        y_hat = df[('pred', feature)]
+    for feature in df["obs"].columns:
+        y = df[("obs", feature)]
+        y_hat = df[("pred", feature)]
 
         metrics[feature] = {
-            'num_obs': np.sum(~np.isnan(y)),
-            'R2': mask_nan(skm.r2_score)(y, y_hat),
-            'MAPE': calc_mape(y, y_hat),
-            'nBias': calc_nbias(y, y_hat),
-            'RE': calc_rel_err(y, y_hat),
-            'RB': calc_rel_bias(y, y_hat),
-            'qRE': calc_q_rel_err(y, y_hat),
-            'qnBias': calc_q_nbias(y, y_hat),
-            'MAE': calc_mae(y, y_hat),
-            'RMSE': calc_rmse(y, y_hat),
-            'rRMSE': calc_rrmse(y, y_hat),
-            'KGE': calc_kge(y, y_hat),
-            'NSE': calc_nse(y, y_hat),
-            'Agreement': calc_agreement(y, y_hat)
+            "num_obs": np.sum(~np.isnan(y)),
+            "R2": mask_nan(skm.r2_score)(y, y_hat),
+            "MAPE": calc_mape(y, y_hat),
+            "nBias": calc_nbias(y, y_hat),
+            "RE": calc_rel_err(y, y_hat),
+            "RB": calc_rel_bias(y, y_hat),
+            "qRE": calc_q_rel_err(y, y_hat),
+            "qnBias": calc_q_nbias(y, y_hat),
+            "MAE": calc_mae(y, y_hat),
+            "RMSE": calc_rmse(y, y_hat),
+            "rRMSE": calc_rrmse(y, y_hat),
+            "KGE": calc_kge(y, y_hat),
+            "NSE": calc_nse(y, y_hat),
+            "Agreement": calc_agreement(y, y_hat),
         }
 
     if disp:
@@ -173,14 +175,13 @@ def calc_q_nbias(y, y_hat):
 
 @mask_nan
 def calc_rmse(y, y_hat):
-    return np.sqrt(np.mean((y - y_hat)**2))
+    return np.sqrt(np.mean((y - y_hat) ** 2))
 
 
 @mask_nan
 def calc_rrmse(y, y_hat):
     rmse = calc_rmse(y, y_hat)
     mean_y_hat = np.mean(y_hat)
-
     if mean_y_hat == 0:
         return np.nan
     else:
@@ -194,19 +195,18 @@ def calc_kge(y, y_hat):
     mean_y_hat = np.mean(y_hat)
     std_y = np.std(y)
     std_y_hat = np.std(y_hat)
-
     if std_y == 0 or mean_y == 0:
         return np.nan
     else:
-        return 1 - np.sqrt((correlation - 1)**2 + (std_y_hat / std_y - 1)**2 +
-                           (mean_y_hat / mean_y - 1)**2)
+        return 1 - np.sqrt(
+            (correlation - 1) ** 2 + (std_y_hat / std_y - 1) ** 2 + (mean_y_hat / mean_y - 1) ** 2
+        )
 
 
 @mask_nan
 def calc_nse(y, y_hat):
-    denominator = ((y_hat - y_hat.mean())**2).sum()
-    numerator = ((y - y_hat)**2).sum()
-
+    denominator = ((y_hat - y_hat.mean()) ** 2).sum()
+    numerator = ((y - y_hat) ** 2).sum()
     if denominator == 0:
         return np.nan
     else:
@@ -222,16 +222,14 @@ def calc_lnse(y, y_hat):
 
 @mask_nan
 def calc_agreement(y, y_hat):
-    """ https://www.nature.com/articles/srep19401 """
+    """https://www.nature.com/articles/srep19401"""
     corr = np.corrcoef(y, y_hat)[0, 1]
     if corr >= 0:
         kappa = 0
     else:
         kappa = 2 * np.abs(np.mean((y - np.mean(y)) * (y_hat - np.mean(y_hat))))
-
-    numerator = np.mean((y - y_hat)**2)
-    denominator = np.var(y) + np.var(y_hat) + (np.mean(y) - np.mean(y_hat))**2 + kappa
-
+    numerator = np.mean((y - y_hat) ** 2)
+    denominator = np.var(y) + np.var(y_hat) + (np.mean(y) - np.mean(y_hat)) ** 2 + kappa
     if denominator == 0:
         return np.nan
     else:

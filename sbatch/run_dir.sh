@@ -46,7 +46,7 @@ process_and_submit() {
 
   # If confirmed, submit each job
   for item in "${items[@]}"; do
-    ./run.sh "$partition" "$flag" "$item"
+    ./sbatch/run.sh "$partition" "$flag" "$item"
   done
 }
 

@@ -1,0 +1,34 @@
+[project]
+name = "swot-ml"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "equinox>=0.12.2",
+    "geopandas>=1.1.0",
+    "ipykernel>=6.29.5",
+    "ipympl>=0.9.7",
+    "jax[cuda12]<0.6.0",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.3",
+    "netcdf4>=1.7.2",
+    "notebook>=7.4.3",
+    "numpy>1.0",
+    "optax>=0.2.5",
+    "pandas>=2.3.0",
+    "pyarrow>=20.0.0",
+    "scikit-learn>=1.7.0",
+    "smac>=1.5.0,<3.0.0",
+    "torch>=2.0.1",
+    "tqdm>=4.67.1",
+    "xarray>=2025.6.1",
+]
+
+[tool.ruff]
+exclude = ["src/models/needs_updated"]
+line-length = 100
+indent-width = 4
+
+[tool.ruff.lint.extend-per-file-ignores]
+"__init__.py" = ["F401"]

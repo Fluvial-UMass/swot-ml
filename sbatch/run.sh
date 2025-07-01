@@ -124,8 +124,7 @@ cat << EOF > "$sbatch_script"
 #SBATCH -o ${output_dir}/${config_basename}.out
 $(echo -e "$SBATCH_DIRECTIVES")
 
-module load conda/latest
-conda activate tss-ml
+source .venv/bin/activate
 
 $(echo -e "$ENVIRONMENT_LINES")
 
