@@ -2,18 +2,19 @@ import jax
 from jaxtyping import PyTree
 import equinox as eqx
 
-from config import Config, SeqAttnArgs, GraphLSTMArgs
+from config import Config, SeqAttnArgs, StackArgs, GraphLSTMArgs
 from data import HydroDataLoader, HydroDataset
-from models.flexible_hybrid import FlexibleHybrid
+
 from models.lstm_mlp_attn import LSTM_MLP_ATTN
-from models.rg_lstm import Graph_LSTM
+from models.stacked_lstm import STACKED_LSTM
+# from models.rg_lstm import Graph_LSTM
 
 
 # Dictionary of valid model names and their constructors
 MODEL_MAP = {
-    "flexible_hybrid": FlexibleHybrid,
     "lstm_mlp_attn": LSTM_MLP_ATTN,
-    "graph_lstm": Graph_LSTM,
+    "stacked_lstm": STACKED_LSTM,
+    # "graph_lstm": Graph_LSTM,
 }
 
 
@@ -52,6 +53,9 @@ def set_model_data_args(cfg: Config, dataset: HydroDataset):
         cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dataset.features["dynamic"].items()}
         cfg.model_args.static_size = len(dataset.features["static"])
         cfg.model_args.time_aware = dataset.time_gaps
+    elif isinstance(cfg.model_args, StackArgs):
+        pass
+
     elif isinstance(cfg.model_args, GraphLSTMArgs):
         cfg.model_args.dynamic_size = len(dataset.features["dynamic"]["era5"])
         cfg.model_args.static_size = len(dataset.features["static"])

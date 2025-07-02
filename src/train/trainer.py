@@ -172,7 +172,9 @@ class Trainer:
             print(f"Logging at {log_dir}")
             cfg_file = log_dir / "config.json"
             with open(cfg_file, "w") as file:
-                file.write(self.cfg.model_dump_json(indent=4, exclude_none=True, exclude_unset=True))
+                file.write(
+                    self.cfg.model_dump_json(indent=4, exclude_none=True, exclude_unset=True)
+                )
             log_file = log_dir / "training.log"
             file_handler = logging.FileHandler(log_file, mode="a")
             file_handler.setFormatter(formatter)
@@ -404,9 +406,9 @@ class Trainer:
         with open(save_dir / "config.json", "w") as f:
             cfg_out = self.cfg.model_copy(deep=True)
 
-            graph_mat = getattr(cfg_out.model_args, 'graph_matrix', None)
+            graph_mat = getattr(cfg_out.model_args, "graph_matrix", None)
             if graph_mat and isinstance(graph_mat, np.ndarray):
-               cfg_out.model_args.graph_matrix = graph_mat.tolist()
+                cfg_out.model_args.graph_matrix = graph_mat.tolist()
 
             cfg_json_str = cfg_out.model_dump_json(indent=4, exclude_none=True, exclude_unset=True)
             f.write(cfg_json_str)
@@ -418,7 +420,7 @@ class Trainer:
         # --- Load Config ---
         with open(checkpoint_dir / "config.json", "r") as f:
             cfg_dict = json.load(f)
-            if cfg_dict.get('graph_matrix'):
+            if cfg_dict.get("graph_matrix"):
                 cfg_dict["graph_matrix"] = np.array(cfg_dict["graph_matrix"])
             cfg = Config(**cfg_dict)
         lr_schedule = _create_lr_schedule(cfg)

@@ -75,4 +75,5 @@ class GatedResidualNetwork(eqx.Module):
         eta1 = self.eta1_linear(eta2)
         eta1 = self.dropout(eta1, key=key)
         output = self.skip(input, eta1)
+
         return output

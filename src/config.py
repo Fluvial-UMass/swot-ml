@@ -27,43 +27,49 @@ class StepKwargs(BaseModel):
     max_grad_norm: float | None = None
     agreement_weight: float = 0.0
 
-    
+
 class EarlyStopKwargs(BaseModel):
     patience: int = Field(0, gt=0)
     threshold: float = Field(..., gt=0, lt=1.0)
 
 
-class SeqAttnArgs(BaseModel):
-    name: Literal["lstm_mlp_attn", "flexible_hybrid"]
+class BaseModelArgs(BaseModel):
     hidden_size: int = Field(..., gt=0)
-    num_layers: int = Field(..., gt=0)
-    num_heads: int = Field(..., gt=0)
     dropout: float = Field(..., ge=0, lt=1.0)
     seed: int = 0
+
+    def as_kwargs(self) -> dict:
+        return self.model_dump(exclude={"name"})
+
+
+class SeqAttnArgs(BaseModelArgs):
+    name: Literal["lstm_mlp_attn", "flexible_hybrid"]
+    num_layers: int = Field(..., gt=0)
+    num_heads: int = Field(..., gt=0)
     target: list[str] = None
     seq_length: int = None
     dynamic_sizes: dict[str, int] = None
     static_size: int = None
     time_aware: dict[str, bool] = None
 
-    def as_kwargs(self) -> dict:
-        return self.model_dump(exclude={"name"})
+
+class StackArgs(BaseModelArgs):
+    name: Literal["stacked_lstm"]
+    in_targets: list[str] = None
+    out_targets: list[str] = None
+    dynamic_size: int = None
+    static_size: int = None
+    seq2seq: bool = True
 
 
-class GraphLSTMArgs(BaseModel):
+class GraphLSTMArgs(BaseModelArgs):
     name: Literal["graph_lstm"]
-    hidden_size: int = Field(..., gt=0)
     num_layers: int = Field(..., gt=0)
     num_heads: int = Field(..., gt=0)
-    dropout: float = Field(..., ge=0, lt=1.0)
-    seed: int = 0
     target: list[str] = None
     dynamic_size: int = None
     static_size: int = None
     graph_matrix: Any = None
-
-    def as_kwargs(self) -> dict:
-        return self.model_dump(exclude={"name"})
 
 
 class ValueFilter(BaseModel):

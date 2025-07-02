@@ -25,7 +25,7 @@ def mosaic_scatter(cfg: Config, results: pd.DataFrame, metrics: pd.DataFrame, ti
             xscale="log",
             yscale="log",
         )
-        plt.colorbar(hb,shrink=0.3,aspect=10,anchor=(-1, -0.55))
+        plt.colorbar(hb, shrink=0.3, aspect=10, anchor=(-1, -0.55))
 
         # Add a 1:1 line over the min and max of x and y
         xlim = ax.get_xlim()
@@ -36,7 +36,15 @@ def mosaic_scatter(cfg: Config, results: pd.DataFrame, metrics: pd.DataFrame, ti
             [f"{key}: {metrics[target][key]:0.2f}" for key in ["R2", "RE", "MAPE", "nBias"]]
         )
         props = dict(boxstyle="round", facecolor="white", alpha=0.5)
-        ax.text(0,-0.4,textstr,transform=ax.transAxes,fontsize=10,verticalalignment="top",bbox=props)
+        ax.text(
+            0,
+            -0.4,
+            textstr,
+            transform=ax.transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            bbox=props,
+        )
 
         # Setting axes to be square and equal range
         ax.axis("square")
