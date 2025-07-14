@@ -1,4 +1,4 @@
-from .hydrodata import HydroDataset
+from .hydrodata import GraphData, HydroDataset
 from .hydroloader import HydroDataLoader
 
-__all__ = [HydroDataset, HydroDataLoader]
+__all__ = [GraphData, HydroDataset, HydroDataLoader]

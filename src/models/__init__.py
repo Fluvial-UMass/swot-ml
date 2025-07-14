@@ -2,11 +2,24 @@ import jax
 from jaxtyping import PyTree
 import equinox as eqx
 
-from config import Config, SeqAttnArgs, StackArgs, GraphLSTMArgs
+from config import Config
+from config.model_args import (
+    SeqAttnArgs,
+    StackArgs,
+    GraphLSTMArgs,
+    MSAttnArgs,
+    RaindropArgs,
+    STGTArgs,
+    STGATArgs,
+)
 from data import HydroDataLoader, HydroDataset
 
 from models.lstm_mlp_attn import LSTM_MLP_ATTN
 from models.stacked_lstm import STACKED_LSTM
+from models.ms_attention import MS_ATTN
+from models.raindrop import RAINDROP
+from models.st_graph_transformer import ST_Graph_Transformer
+from models.graph_transformer import ST_GATransformer
 # from models.rg_lstm import Graph_LSTM
 
 
@@ -14,6 +27,10 @@ from models.stacked_lstm import STACKED_LSTM
 MODEL_MAP = {
     "lstm_mlp_attn": LSTM_MLP_ATTN,
     "stacked_lstm": STACKED_LSTM,
+    "ms_attn": MS_ATTN,
+    "raindrop": RAINDROP,
+    "st_graph_transformer": ST_Graph_Transformer,
+    "st_gat": ST_GATransformer,
     # "graph_lstm": Graph_LSTM,
 }
 
@@ -46,18 +63,47 @@ def make(cfg: Config, dl: HydroDataLoader = None):
 
 def set_model_data_args(cfg: Config, dataset: HydroDataset):
     """Set model arguments based on configuration and dataset."""
-    cfg.model_args.target = dataset.target
+    dyn_feat = dict(dataset.features["dynamic"])
 
     if isinstance(cfg.model_args, SeqAttnArgs):
+        cfg.model_args.target = dataset.target
         cfg.model_args.seq_length = cfg.sequence_length
-        cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dataset.features["dynamic"].items()}
+        cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dyn_feat.items()}
         cfg.model_args.static_size = len(dataset.features["static"])
         cfg.model_args.time_aware = dataset.time_gaps
+
+    elif isinstance(cfg.model_args, STGATArgs):
+        cfg.model_args.target = dataset.target
+        cfg.model_args.seq_length = cfg.sequence_length
+        cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dyn_feat.items()}
+        cfg.model_args.static_size = len(dataset.features["static"])
+
+    elif isinstance(cfg.model_args, STGTArgs):
+        cfg.model_args.target = dataset.target
+        cfg.model_args.seq_length = cfg.sequence_length
+        cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dyn_feat.items()}
+        cfg.model_args.static_size = len(dataset.features["static"])
+
+    elif isinstance(cfg.model_args, RaindropArgs):
+        cfg.model_args.target = dataset.target
+        cfg.model_args.seq_length = cfg.sequence_length
+        cfg.model_args.num_locations = dataset.graph_matrix.shape[0]
+        cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dyn_feat.items()}
+        cfg.model_args.static_size = len(dataset.features["static"])
+
     elif isinstance(cfg.model_args, StackArgs):
-        pass
+        cfg.model_args.dynamic_size = len(list(dyn_feat.values())[0])
+        cfg.model_args.static_size = len(dataset.features["static"])
+
+    elif isinstance(cfg.model_args, MSAttnArgs):
+        cfg.model_args.target = dataset.target
+        cfg.model_args.seq_length = cfg.sequence_length
+        cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dyn_feat.items()}
+        cfg.model_args.static_size = len(dataset.features["static"])
 
     elif isinstance(cfg.model_args, GraphLSTMArgs):
-        cfg.model_args.dynamic_size = len(dataset.features["dynamic"]["era5"])
+        cfg.model_args.target = dataset.target
+        cfg.model_args.dynamic_size = len(list(dyn_feat.values())[0])
         cfg.model_args.static_size = len(dataset.features["static"])
         cfg.model_args.graph_matrix = dataset.graph_matrix
     else:

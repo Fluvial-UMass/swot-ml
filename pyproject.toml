@@ -13,6 +13,7 @@ dependencies = [
     "jupyter>=1.1.1",
     "matplotlib>=3.10.3",
     "netcdf4>=1.7.2",
+    "networkx>=3.5",
     "notebook>=7.4.3",
     "numpy>1.0",
     "optax>=0.2.5",

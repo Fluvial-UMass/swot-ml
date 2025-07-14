@@ -303,7 +303,7 @@ class CrossAttnDecoder(eqx.Module):
         self,
         daily_encoded: Array,
         irregular_encoded: Array,
-        static_encoded: Array,
+        static_encoded: Array | None,
         mask: Array | None,
         key: PRNGKeyArray,
     ) -> Array:

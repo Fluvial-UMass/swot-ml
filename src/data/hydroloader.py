@@ -4,7 +4,7 @@ import jax.sharding as jshard
 import torch
 from torch.utils.data import DataLoader
 
-from config import Config
+from config.config import Config
 from .hydrodata import HydroDataset
 
 
@@ -72,7 +72,12 @@ class HydroDataLoader(DataLoader):
 
     def shard_batch(self, batch: dict):
         def map_fn(path, leaf):
-            keys = [p.key for p in path]
+            # Extract names/keys/indexes from all PyTree path parts
+            keys = [
+                getattr(p, 'name', getattr(p, 'key', getattr(p, 'index', str(p))))
+                for p in path
+            ]
+            # keys = [p.key for p in path]
             if "dynamic_dt" in keys:
                 return leaf
             return jax.device_put(jnp.array(leaf), self.sharding)

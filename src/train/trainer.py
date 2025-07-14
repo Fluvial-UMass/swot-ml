@@ -1,10 +1,3 @@
-import equinox as eqx
-import optax
-import jax
-import jax.numpy as jnp
-import jax.tree_util as jtu
-from jaxtyping import PyTree
-import numpy as np
 import logging
 import pickle
 import json
@@ -12,9 +5,17 @@ import os
 import sys
 import re
 import traceback
-from tqdm.auto import tqdm
 from pathlib import Path
 from datetime import datetime
+
+import numpy as np
+import equinox as eqx
+import optax
+import jax
+import jax.numpy as jnp
+import jax.tree_util as jtu
+from jaxtyping import PyTree
+from tqdm import tqdm
 
 import models
 from config import Config
@@ -136,8 +137,8 @@ class Trainer:
             self.cfg, self.model = models.make(cfg, dataloader)
             self.optim = optax.adam(self.lr_schedule(self.epoch))
             self.opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
-            if cfg.early_stopping.patience > 0:
-                self.early_stopper = EarlyStopper(**cfg.early_stopping.model_dump())
+            if cfg.early_stop_kwargs is not None:
+                self.early_stopper = EarlyStopper(**cfg.early_stop_kwargs.model_dump())
             else:
                 self.early_stopper = None
         # Initialize the filterspec. Defaults to training all components.
@@ -169,16 +170,14 @@ class Trainer:
                 current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
                 log_dir = cfg_path.parent / f"{cfg_path.stem}_{current_date}"
             log_dir.mkdir(parents=True, exist_ok=True)
+
             print(f"Logging at {log_dir}")
-            cfg_file = log_dir / "config.json"
-            with open(cfg_file, "w") as file:
-                file.write(
-                    self.cfg.model_dump_json(indent=4, exclude_none=True, exclude_unset=True)
-                )
             log_file = log_dir / "training.log"
             file_handler = logging.FileHandler(log_file, mode="a")
             file_handler.setFormatter(formatter)
             self.logger.addHandler(file_handler)
+
+            self.cfg.to_json(log_dir / "config.json")  # dump config to log dir
         return log_dir
 
     def _cleanup_logger(self):
@@ -403,26 +402,14 @@ class Trainer:
                 state["early_stopper"] = self.early_stopper.get_state()
             json.dump(state, f, default=float)
 
-        with open(save_dir / "config.json", "w") as f:
-            cfg_out = self.cfg.model_copy(deep=True)
-
-            graph_mat = getattr(cfg_out.model_args, "graph_matrix", None)
-            if graph_mat and isinstance(graph_mat, np.ndarray):
-                cfg_out.model_args.graph_matrix = graph_mat.tolist()
-
-            cfg_json_str = cfg_out.model_dump_json(indent=4, exclude_none=True, exclude_unset=True)
-            f.write(cfg_json_str)
+        self.cfg.to_json(save_dir / "config.json")
 
     @classmethod
     def load_checkpoint(cls, checkpoint_dir: Path):
         """Loads the trainer state from a checkpoint directory and returns a new Trainer instance."""
 
         # --- Load Config ---
-        with open(checkpoint_dir / "config.json", "r") as f:
-            cfg_dict = json.load(f)
-            if cfg_dict.get("graph_matrix"):
-                cfg_dict["graph_matrix"] = np.array(cfg_dict["graph_matrix"])
-            cfg = Config(**cfg_dict)
+        cfg = Config.from_file(checkpoint_dir / "config.json")
         lr_schedule = _create_lr_schedule(cfg)
 
         # --- Load Trainer State (JSON) ---
@@ -499,10 +486,8 @@ class Trainer:
             # --- Load Config and create fresh Trainer instance ---
             config_path = log_dir / "config.json"
             if config_path.exists():
-                with open(config_path, "r") as f:
-                    cfg_dict = json.load(f)
-                    cfg = Config(**cfg_dict)
                 print("No checkpoints found. Creating Trainer from config...")
+                cfg = Config.from_file(config_path)
                 return cls(cfg=cfg, log_dir=log_dir)
             else:
                 raise FileNotFoundError(f"No checkpoints or config.pkl found in {log_dir}")

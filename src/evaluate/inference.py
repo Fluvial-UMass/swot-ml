@@ -2,7 +2,7 @@ import equinox as eqx
 import jax
 import pandas as pd
 import numpy as np
-from tqdm.auto import tqdm
+from tqdm import tqdm
 from typing import Iterator
 from jaxtyping import Array, PRNGKeyArray
 
@@ -10,7 +10,14 @@ from jaxtyping import Array, PRNGKeyArray
 @eqx.filter_jit
 def _model_map(model, batch: dict[str:Array], keys: list[PRNGKeyArray]):
     """Applies the model to a batch of data using jax.vmap."""
-    return jax.vmap(model)(batch, keys)
+    # TODO: If we start training with mixes of different basins we will need to fix this.
+    static_keys = ["graph"]
+    in_axes_data = {k: (None if k in static_keys and k in batch else 0) for k in batch}
+    in_axes_keys = 0
+    y_pred = jax.vmap(model, in_axes=(in_axes_data, in_axes_keys))(batch, keys)
+    return y_pred
+
+    # return jax.vmap(model)(batch, keys)
 
 
 def model_iterate(

@@ -79,7 +79,15 @@ def compute_loss_fn(
     loss : float
     """
     model = eqx.combine(diff_model, static_model)
-    y_pred = jax.vmap(model)(data, keys)
+
+    # TODO: If we start training with mixes of different basins we will need to fix this.
+    static_keys = ["graph"]
+    in_axes_data = {k: (None if k in static_keys and k in data else 0) for k in data}
+    in_axes_keys = 0
+    y_pred = jax.vmap(model, in_axes=(in_axes_data, in_axes_keys))(data, keys)
+
+    # y_pred = jax.vmap(model)(data, keys)
+
     y = data["y"][:, -1, ...]  # End of time dimension
     valid_mask = ~jnp.isnan(y)
     masked_y = jnp.where(valid_mask, y, 0)

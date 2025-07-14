@@ -1,16 +1,26 @@
 import hashlib
-import yaml
-import pickle
-from tqdm.auto import tqdm
 import itertools
+import pickle
+import warnings
+import json
+
+import yaml
+from tqdm import tqdm
 import pandas as pd
 import xarray as xr
+import networkx as nx
 import numpy as np
 import jax.numpy as jnp
-import warnings
-
 from torch.utils.data import Dataset
+from typing import NamedTuple
+
 from config import Config, DataSubset
+
+
+class GraphData(NamedTuple):
+    edge_index: jnp.ndarray
+    edge_features: jnp.ndarray
+    node_features: jnp.ndarray
 
 
 class HydroDataset(Dataset):
@@ -34,6 +44,7 @@ class HydroDataset(Dataset):
 
         self._read_basin_files()
         self.x_s = self._load_attributes()
+        self.graph = self._load_graph_network_data()
         self.x_d = self._load_or_read_basin_data(use_cache)
         self.date_ranges = self._precompute_date_ranges()
 
@@ -49,7 +60,6 @@ class HydroDataset(Dataset):
         data_dir = self.cfg.data_dir
         train_basin_file = self.cfg.train_basin_file
         test_basin_file = self.cfg.test_basin_file
-        graph_network_file = self.cfg.graph_network_file
 
         def read_file(fp):
             with open(fp, "r") as file:
@@ -60,29 +70,6 @@ class HydroDataset(Dataset):
         self.train_basins = read_file(data_dir / train_basin_file)
         self.test_basins = read_file(data_dir / test_basin_file)
         self.all_basins = list(set(self.train_basins + self.test_basins))
-
-        if graph_network_file:
-            self.graph_mode = True
-            if self.train_basins == self.test_basins:
-                self.graph_matrix = np.loadtxt(data_dir / graph_network_file)
-                if self.graph_matrix.shape[0] != len(self.train_basins):
-                    raise ValueError(
-                        "Graph network matrix shape be square of number of training basins.\n"
-                        + f"Graph network matrix shape: {self.graph_matrix.shape}\n"
-                        + f"Number of training basins: {len(self.train_basins)}."
-                    )
-                if self.graph_matrix.shape[0] != self.graph_matrix.shape[1]:
-                    raise ValueError(
-                        "Graph network matrix must be square.\n"
-                        + f"Graph network matrix shape: {self.graph_matrix.shape}."
-                    )
-            else:
-                raise ValueError(
-                    "Graph network modeling does not currently support different training and testing networks."
-                )
-        else:
-            self.graph_matrix = None
-            self.graph_mode = False
 
     def _load_or_read_basin_data(self, use_cache):
         print("Loading dynamic data")
@@ -231,7 +218,7 @@ class HydroDataset(Dataset):
 
         return ds
 
-    def _load_attributes(self):
+    def _load_attributes(self) -> xr.Dataset:
         """
         Loads the basin attributes from a CSV file.
 
@@ -241,6 +228,11 @@ class HydroDataset(Dataset):
         print("Loading static attributes")
         df = pd.read_csv(self.cfg.attributes_file, index_col="index")
         df.index = df.index.astype(str)
+
+        # Immediately sort the DataFrame into the canonical order
+        # Any node not in the canonical list will be dropped.
+        # Any node in the list but not in the df will have NaN values (handle later).
+        df = df.reindex(self.all_basins)
 
         if self.inference_mode:
             unencoded_cols = [k for k, v in self.s_scale.items() if not v["encoded"]]
@@ -277,6 +269,90 @@ class HydroDataset(Dataset):
 
         return x_s
 
+    def _load_graph_network_data(self) -> GraphData:
+        """
+        Loads a pre-computed networkx graph from a JSON file and converts it
+        to a sparse representation for the model.
+        """
+        if self.cfg.graph_network_file is None:
+            self.graph_mode = False
+            return
+
+        print("Loading graph network file")
+        self.graph_mode = True
+        if self.train_basins != self.test_basins:
+            raise ValueError(
+                "Graph network modeling does not currently support different "
+                "training and testing networks."
+            )
+
+        # Load graph from JSON file
+        graph_path = self.cfg.data_dir / self.cfg.graph_network_file
+        with open(graph_path, "r") as f:
+            graph_json = json.load(f)
+        G = nx.readwrite.json_graph.node_link_graph(graph_json, edges="edges")
+
+        # Validate that the graph nodes match the expected basins
+        graph_nodes = {str(node_data["id"]) for node_data in graph_json["nodes"]}
+        if set(self.train_basins) != graph_nodes:
+            raise ValueError("The nodes in the graph file do not match the training basins.")
+
+        # Create sparse representation (edge_index, edge_features)
+        return self._create_sparse_graph_from_nx(G)
+
+    def _create_sparse_graph_from_nx(self, G: nx.DiGraph) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Converts a networkx graph into a sparse edge index and edge features.
+
+        Args:
+            G: The input graph. Assumes nodes have an 'original_index' attribute
+               that maps them to the desired integer indices for the model.
+               Assumes edges have a 'distance' attribute.
+
+        Returns:
+            A tuple containing the edge_index and edge_features numpy arrays.
+        """
+        # Create a mapping from each node's ID to its integer index
+        node_to_int_index = {node: data["original_index"] for node, data in G.nodes(data=True)}
+
+        source_nodes = []
+        dest_nodes = []
+        distances = []
+        for source_id, dest_id, data in G.edges(data=True):
+            if "distance" not in data:
+                raise ValueError(
+                    f"Edge from {source_id} to {dest_id} is missing 'distance' attribute."
+                )
+
+            # Map node IDs to their integer indices
+            source_nodes.append(node_to_int_index[source_id])
+            dest_nodes.append(node_to_int_index[dest_id])
+            distances.append(data["distance"])
+
+        edge_index = np.array([source_nodes, dest_nodes], dtype=np.int32)
+        distances = np.array(distances, dtype=np.float32)
+
+        # Normalize the distances to create edge features
+        if np.any(distances <= 0):
+            raise ValueError("Edge distance must be greater than 0.")
+
+        mean_dist = np.mean(distances)
+        std_dist = np.std(distances)
+        # std would be zero if we had a distance-regular graph, such as a fixed grid raster.
+        # We need to check this case and avoid division by zero for safety
+        std_dist = 1 if std_dist == 0 else std_dist
+        # TODO: Could implement a basis expansion here for more complex spatial decay
+        edge_dist_norm = (distances - mean_dist) / std_dist
+
+        node_features = self.x_s.to_array(dim="features").T.values
+
+        G = GraphData(
+            edge_index=edge_index,
+            edge_features=edge_dist_norm[:, None],
+            node_features=node_features
+        )
+        return G
+
     def _precompute_date_ranges(self):
         unique_dates = self.x_d["date"].values
         date_ranges = {
@@ -293,7 +369,7 @@ class HydroDataset(Dataset):
         last_valid_index = np.maximum.accumulate(valid_indices, axis=1)
 
         first_values = valid_mask[:, 0].astype(int)[:, None]
-        dt = np.concat([first_values, np.diff(last_valid_index, axis=1)], axis=1)
+        dt = np.concatenate([first_values, np.diff(last_valid_index, axis=1)], axis=1)
 
         return dt
 
@@ -317,10 +393,7 @@ class HydroDataset(Dataset):
         if self.graph_mode:
             batch = {"dynamic": {}}
             # Dynamic data. Shape (batch, sequence, nodes, features)
-            for (
-                source,
-                col_names,
-            ) in self.features["dynamic"].items():
+            for source, col_names in self.features["dynamic"].items():
                 batch["dynamic"][source] = np.moveaxis(
                     ds[col_names].to_array().values, [0, 1, 3], [-1, 0, 1]
                 )
@@ -331,6 +404,10 @@ class HydroDataset(Dataset):
             if self.x_s is not None:
                 static_ds = self.x_s.sel(basin=basins_da)
                 batch["static"] = np.moveaxis(static_ds.to_array().values, 0, -1)
+
+            # TODO: If we start training with mixes of different basins we will need to fix this.
+            batch["graph"] = self.graph
+            # batch['graph'] = jnp.stack([self.graph] * len(ids))
 
             # Target data. Shape (batch, sequence, features)
             if not self.inference_mode:
@@ -712,7 +789,7 @@ class HydroDataset(Dataset):
         else:
             self._basin_date_batching(valid_date_mask)
 
-    def add_smoothed_features(self, ds, window_sizes):
+    def add_smoothed_features(self, ds: xr.Dataset, window_sizes: list[int]):
         new_ds = ds.copy()
         data_vars = ds.data_vars
         for window_size in window_sizes:
@@ -744,7 +821,7 @@ class HydroDataset(Dataset):
         ]
         data_config = {k: getattr(self.cfg, k) for k in cfg_keys}
         data_config["basins"] = sorted(self.all_basins)
-        data_config["graph_matrix"] = self.graph_matrix
+        data_config["graph"] = self.graph
         """Generate a SHA256 hash for the contents of the dict."""
         hasher = hashlib.sha256()
         # Convert the dictionary to a sorted, consistent string representation

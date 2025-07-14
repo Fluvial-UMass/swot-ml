@@ -11,15 +11,19 @@ except RuntimeError as e:
 
 import sys
 import traceback
-from argparse import ArgumentParser, ArgumentTypeError
 from pathlib import Path
 import pickle
+
+import typer
 import pandas as pd
 
-import config, data, train, evaluate  # noqa: E401
+# import config, data, train, evaluate
+from config import Config, DataSubset
+from data import HydroDataset, HydroDataLoader
+from train import Trainer
 
 
-def cleanup_dl(dl: data.HydroDataLoader):
+def cleanup_dl(dl: HydroDataLoader):
     if dl is None:
         return
     if dl._iterator:
@@ -27,12 +31,12 @@ def cleanup_dl(dl: data.HydroDataLoader):
     del dl
 
 
-def train_from_config(cfg: config.Config, log_dir: Path | None = None):
+def train_from_config(cfg: Config, log_dir: Path | None = None):
     """Trains a model from a given configuration file.
 
     Parameters
     ----------
-    cfg : config.Config
+    cfg : Config
         The configuration object.
     trainer_kwargs : dict, optional
         Additional keyword arguments to pass to the Trainer constructor. This is useful
@@ -40,7 +44,7 @@ def train_from_config(cfg: config.Config, log_dir: Path | None = None):
 
     Returns
     -------
-    cfg : config.Config
+    cfg : Config
         The updated configuration object.
     trainer : Trainer
         The Trainer object after training. Contains the model and other useful attributes.
@@ -48,16 +52,16 @@ def train_from_config(cfg: config.Config, log_dir: Path | None = None):
         The HydroDataset loaded for training.
     """
     trainer = None
-    dataset = data.HydroDataset(cfg)
-    dataloader = data.HydroDataLoader(cfg, dataset)
+    dataset = HydroDataset(cfg)
+    dataloader = HydroDataLoader(cfg, dataset)
 
     if log_dir and log_dir.is_dir():
-        trainer = train.Trainer.load_last_checkpoint(log_dir)
+        trainer = Trainer.load_last_checkpoint(log_dir)
         # Could fail to load if nothing was saved.
         if trainer is not None:
             trainer.dataloader = dataloader
     if trainer is None:
-        trainer = train.Trainer(cfg, dataloader, log_dir=log_dir)
+        trainer = Trainer(cfg, dataloader, log_dir=log_dir)
 
     trainer.start_training()
     cleanup_dl(dataloader)
@@ -65,12 +69,12 @@ def train_from_config(cfg: config.Config, log_dir: Path | None = None):
     return cfg, trainer, dataset
 
 
-def train_ensemble(config_yml: Path, ensemble_seed: int):
+def train_from_config_ensemble(config_path: Path, ensemble_seed: int):
     """Trains a model for an ensemble by modifying the random seed.
 
     Parameters
     ----------
-    config_yml : Path
+    config_path : Path
         Path to the YAML configuration file.
     ensemble_seed : int
         Seed used to differentiate ensemble members. This seed is added to the random
@@ -87,10 +91,10 @@ def train_ensemble(config_yml: Path, ensemble_seed: int):
     dataset : HydroDataset
         The HydroDataset loaded for training.
     """
-    cfg = config.read_config(config_yml)
+    cfg = Config.from_file(config_path)
     cfg.model_args.seed += ensemble_seed
 
-    log_dir = config_yml.parent / "base_models" / f"seed_{ensemble_seed:02d}"
+    log_dir = config_path.parent / "base_models" / f"seed_{ensemble_seed:02d}"
     cfg, trainer, dataset = train_from_config(cfg, log_dir)
 
     return cfg, trainer.model, trainer.log_dir, dataset
@@ -140,13 +144,13 @@ def train_ensemble(config_yml: Path, ensemble_seed: int):
 #     return cfg, trainer.model, trainer.log_dir, dataset
 
 
-def hyperparam_grid_search(config_yml: Path, idx: int):
+def hyperparam_grid_search(config_path: Path, idx: int):
     """Performs a single hyperparameter grid search trial using k-fold
     cross-validation.
 
     Parameters
     ----------
-    config_yml : Path
+    config_path : Path
         Path to the YAML configuration file.
     idx : int
         Index of the current hyperparameter combination in the grid.
@@ -161,12 +165,12 @@ def hyperparam_grid_search(config_yml: Path, idx: int):
         If the configuration file does not exist.
     """
 
-    cfg = config.read_config(config_yml)
-    cfg = config.update_cfg_from_grid(cfg, idx)
+    cfg = Config.from_file(config_path)
+    cfg = cfg.update_from_grid(idx)
 
     k = 4
     for i in range(k):
-        log_dir = config_yml.parent / "trials" / f"index_{idx}" / f"fold_{i}"
+        log_dir = config_path.parent / "trials" / f"index_{idx}" / f"fold_{i}"
         out_file = log_dir / "test_data.pkl"
         if out_file.is_file():
             print(f"Fold {i + 1} of {k} was already completed.")
@@ -174,14 +178,14 @@ def hyperparam_grid_search(config_yml: Path, idx: int):
 
         cfg.test_basin_file = f"metadata/site_lists/k_folds/test_{i}_{k}.txt"
         cfg.train_basin_file = f"metadata/site_lists/k_folds/train_{i}_{k}.txt"
-        dataset = data.HydroDataset(cfg)
-        dataloader = data.HydroDataLoader(cfg, dataset)
+        dataset = HydroDataset(cfg)
+        dataloader = HydroDataLoader(cfg, dataset)
 
         if log_dir.is_dir():
-            trainer = train.Trainer.load_last_checkpoint(log_dir)
+            trainer = Trainer.load_last_checkpoint(log_dir)
             trainer.dataloader = dataloader
         else:
-            trainer = train.Trainer(cfg, dataloader, log_dir=log_dir)
+            trainer = Trainer(cfg, dataloader, log_dir=log_dir)
 
         start_epoch = trainer.epoch
         while trainer.epoch < trainer.num_epochs:
@@ -207,14 +211,15 @@ def hyperparam_grid_search(config_yml: Path, idx: int):
             cleanup_dl(dataloader)
 
 
-def hyperparam_smac_optimize(config_yml: Path, n_workers: int, n_runs: int):
+def hyperparam_smac_optimize(config_path: Path, n_workers: int, n_runs: int):
+    from train import update_smac_config, manual_smac_optimize
     from smac.utils.configspace import get_config_hash
 
-    cfg = config.read_config(config_yml)
+    cfg = Config.read_file(config_path)
 
     def target_fun(updates, seed):
-        local_cfg = config.read_config(updates["cfg_path"])
-        local_cfg = train.update_smac_config(local_cfg, updates, seed)
+        local_cfg = Config.read_file(updates["cfg_path"])
+        local_cfg = update_smac_config(local_cfg, updates, seed)
 
         trial_name = get_config_hash(updates)
         path = Path(local_cfg.cfg_path)
@@ -241,23 +246,25 @@ def hyperparam_smac_optimize(config_yml: Path, n_workers: int, n_runs: int):
         # return basin_metrics['flux']['RE'].median()
         return basin_metrics[:]["RE"].median().mean()
 
-    train.manual_smac_optimize(cfg, n_workers, n_runs, target_fun)
+    manual_smac_optimize(cfg, n_workers, n_runs, target_fun)
 
 
 def calc_attributions(run_dir: Path):
-    trainer = train.Trainer.load_last_checkpoint(run_dir)
+    from evaluate import save_all_intgrads, plot_average_attribution
+
+    trainer = Trainer.load_last_checkpoint(run_dir)
     cfg = trainer.cfg
     cfg.batch_size = cfg.batch_size // 10
-    cfg.data_subset = config.DataSubset.test
+    cfg.data_subset = DataSubset.test
 
-    dataset = data.HydroDataset(cfg)
-    dataloader = data.HydroDataLoader(cfg, dataset)
+    dataset = HydroDataset(cfg)
+    dataloader = HydroDataLoader(cfg, dataset)
 
     save_dir = run_dir / "figures" / "attribution"
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    evaluate.save_all_intgrads(cfg, trainer.model, dataloader, save_dir, m_steps=10)
-    evaluate.plot_average_attribution(save_dir, dataset)
+    save_all_intgrads(cfg, trainer.model, dataloader, save_dir, m_steps=10)
+    plot_average_attribution(save_dir, dataset)
 
 
 def load_prediction_model(run_dir: Path, chunk_idx: int | None = None):
@@ -282,16 +289,16 @@ def load_prediction_model(run_dir: Path, chunk_idx: int | None = None):
         A directory for saving the results of this subset.
     """
     # cfg, model, _ = load_model(run_dir)
-    trainer = train.Trainer.load_last_checkpoint(run_dir)
+    trainer = Trainer.load_last_checkpoint(run_dir)
     cfg = trainer.cfg
 
-    train_dataset = data.HydroDataset(cfg)
-    cfg.data_subset = config.DataSubset.predict
+    train_dataset = HydroDataset(cfg)
+    cfg.data_subset = DataSubset.predict
     cfg.shuffle = False  # No need to shuffle for inference
     if chunk_idx:
         cfg.basin_file = f"metadata/site_lists/predictions/chunk_{chunk_idx:02}.txt"
 
-    predict_dataset = data.HydroDataset(cfg, train_ds=train_dataset, use_cache=False)
+    predict_dataset = HydroDataset(cfg, train_ds=train_dataset, use_cache=False)
 
     eval_dir = run_dir / "inference"
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -300,18 +307,18 @@ def load_prediction_model(run_dir: Path, chunk_idx: int | None = None):
 
 
 def make_all_plots(
-    cfg: config.Config,
+    cfg: Config,
     results: pd.DataFrame,
     bulk_metrics: dict,
     basin_metrics: pd.DataFrame,
-    data_subset: str,
+    data_subset: DataSubset,
     log_dir: Path,
 ):
     """Generates and saves some accuracy plots for a given data subset.
 
     Parameters
     ----------
-    cfg : config.Config
+    cfg : Config
         The configuration object.
     results : pd.DataFrame
         The model predictions and observations.
@@ -328,22 +335,23 @@ def make_all_plots(
     -------
     None. Figures are saved to the specified directory.
     """
+    from evaluate import mosaic_scatter, basin_metric_histograms
 
-    fig_dir = log_dir / "figures" / data_subset
+    fig_dir = log_dir / "figures" / data_subset.value
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    fig = evaluate.mosaic_scatter(cfg, results, bulk_metrics, str(log_dir))
+    fig = mosaic_scatter(cfg, results, bulk_metrics, str(log_dir))
     fig.savefig(fig_dir / "density_scatter.png", dpi=300)
 
-    figs = evaluate.basin_metric_histograms(basin_metrics)
+    figs = basin_metric_histograms(basin_metrics)
     for target, fig in figs.items():
         fig.savefig(fig_dir / f"{target}_metrics_hist.png", dpi=300)
 
 
 def eval_model(
-    cfg: config.Config,
+    cfg: Config,
     model,
-    dataset: data.HydroDataset,
+    dataset: HydroDataset,
     log_dir: Path,
     run_test: bool | str = True,
     run_predict: bool | str = True,
@@ -354,7 +362,7 @@ def eval_model(
 
     Parameters
     ----------
-    cfg : config.Config
+    cfg : Config
         The model training configuration object.
     model : eqx.Module
         The pre-trained model weights and structure.
@@ -375,8 +383,9 @@ def eval_model(
     -----
     Pickled results, bulk metrics, and basin metrics for each data subset. Plots in the `log_dir` directory if `make_plots` is `True`.
     """
+    from evaluate import predict, get_all_metrics, get_basin_metrics
 
-    def eval_data_subset(data_subset, out_stem=None):
+    def eval_data_subset(data_subset: DataSubset, out_stem=None):
         if out_stem is False:
             return
         elif isinstance(out_stem, str):
@@ -385,194 +394,96 @@ def eval_model(
             else:
                 print("Pass string")
         else:
-            out_stem = f"{data_subset}_data.pkl"
+            out_stem = f"{data_subset.value}_data.pkl"
 
         results_file = log_dir / out_stem
-        print(f"Evaluating {data_subset} subset and saving to: {results_file}")
+        print(f"Evaluating {data_subset.value} subset and saving to: {results_file}")
 
         dataset.cfg.exclude_target_from_index = None
         dataset.update_indices(data_subset)
-        dataloader = data.HydroDataLoader(cfg, dataset)
+        dataloader = HydroDataLoader(cfg, dataset)
 
-        results = evaluate.predict(model, dataloader, quiet=cfg.quiet, denormalize=True)
+        results = predict(model, dataloader, quiet=cfg.quiet, denormalize=True)
         cleanup_dl(dataloader)
 
         if data_subset != "predict":
-            bulk_metrics = evaluate.get_all_metrics(results)
-            basin_metrics = evaluate.get_basin_metrics(results)
+            bulk_metrics = get_all_metrics(results)
+            basin_metrics = get_basin_metrics(results)
             out = (results, bulk_metrics, basin_metrics)
         else:
             out = results
         with open(results_file, "wb") as f:
             pickle.dump(out, f)
 
-        if make_plots and data_subset != "predict":
+        if make_plots and (data_subset != DataSubset.predict):
             make_all_plots(cfg, results, bulk_metrics, basin_metrics, data_subset, log_dir)
 
-    eval_data_subset("test", run_test)
-    eval_data_subset("predict", run_predict)
-    eval_data_subset("train", run_train)
+    eval_data_subset(DataSubset.test, run_test)
+    eval_data_subset(DataSubset.predict, run_predict)
+    eval_data_subset(DataSubset.train, run_train)
 
 
-def main(args: ArgumentParser):
-    """Command-line interface for training, testing, and evaluating deep learning models.
+# ┌────────────────────────────────┐ #
+# │         Command Line           │ #
+# └────────────────────────────────┘ #
+app = typer.Typer(help="Train, test, or run predictions with the hydrological model.")
 
-    Parameters
-    ----------
-    args: ArgumentParser
-        Parsed command line arguments. The following arguments are supported:
 
-        - **train**: Path to the training configuration file.
-        - **train_ensemble**: Path to the training configuration file for ensemble training.
-        - **finetune**: Path to the fine-tuning configuration file.
-        - **grid_search**: Path to the grid search configuration file.
-        - **test**: Path to the directory containing the model to test.
-        - **prediction_model**: Path to the directory containing the model to use for predictions.
-        - **ensemble_seed**: Integer seed to be added to the model seed (required for ensemble training).
-        - **grid_index**: Index of the hyperparameter grid to evaluate (required for grid search).
-        - **basin_chunk_index**: Index of the chunked basin list to predict on (required for prediction).
+@app.command()
+def train(config: Path):
+    config_path = config.resolve()
+    cfg = Config.from_file(config_path)
+    cfg, trainer, dataset = train_from_config(cfg)
+    eval_model(cfg, trainer.model, dataset, trainer.log_dir, True, True, True)
 
-    Notes
-    -----
-    This script provides a command-line interface for training, testing, and evaluating a hydrological model.
-    It supports various modes of operation, including training, fine-tuning, grid search, testing, and prediction.
-    The specific actions performed by the script depend on the command-line arguments provided by the user.
-    """
 
-    # Default values
-    run_test = run_predict = run_train = True
+@app.command()
+def train_ensemble(config_path: Path, ensemble_seed: int):
+    config_path = config_path.resolve()
+    cfg, model, eval_dir, dataset = train_from_config_ensemble(config_path, ensemble_seed)
+    eval_model(cfg, model, dataset, eval_dir, True, True, True)
 
-    if args.train:
-        config_yml = Path(args.train).resolve()
-        cfg = config.read_config(config_yml)
-        cfg, trainer, dataset = train_from_config(cfg)
-        model = trainer.model
-        eval_dir = trainer.log_dir
-    elif args.train_ensemble:
-        config_yml = Path(args.train_ensemble).resolve()
-        cfg, model, eval_dir, dataset = train_ensemble(config_yml, args.ensemble_seed)
-    # elif args.finetune:
-    #     finetune_yml = Path(args.finetune).resolve()
-    #     cfg, model, eval_dir, dataset = finetune(finetune_yml)
-    elif args.grid_search:
-        config_yml = Path(args.grid_search).resolve()
-        hyperparam_grid_search(config_yml, args.grid_index)
-        return
-    elif args.smac_optimize:
-        config_yml = Path(args.smac_optimize).resolve()
-        hyperparam_smac_optimize(config_yml, args.smac_workers, args.smac_runs)
-        return
-    elif args.test:
-        run_dir = args.test.resolve()
-        trainer = train.Trainer.load_last_checkpoint(run_dir)
-        cfg = trainer.cfg
-        model = trainer.model
-        dataset = data.HydroDataset(cfg)
-        eval_dir = run_dir
-    elif args.attribution:
-        run_dir = args.attribution.resolve()
-        calc_attributions(run_dir)
-        return
-    elif args.prediction_model:
-        run_test = run_train = False
-        run_predict = f"chunk_{args.basin_chunk_index:02}"
-        run_dir = Path(args.prediction_model).resolve()
-        cfg, model, dataset, eval_dir = load_prediction_model(run_dir, args.basin_chunk_index)
 
+# @app.command()
+# def finetune(config: Path = typer.Option(..., exists=True, help="Path to fine-tuning config file.")):
+#     cfg, model, eval_dir, dataset = finetune(config.resolve())
+#     eval_model(cfg, model, dataset, eval_dir, True, True, True)
+
+
+@app.command()
+def grid_search(config_path: Path, grid_index: int):
+    hyperparam_grid_search(config_path.resolve(), grid_index)
+
+
+@app.command()
+def smac_optimize(config_path: Path, smac_runs: int, smac_workers: int):
+    hyperparam_smac_optimize(config_path.resolve(), smac_workers, smac_runs)
+
+
+@app.command()
+def test(training_dir: Path):
+    trainer = Trainer.load_last_checkpoint(training_dir.resolve())
+    cfg = trainer.cfg
+    dataset = HydroDataset(cfg)
+    eval_model(cfg, trainer.model, dataset, training_dir, True, True, True)
+
+
+@app.command()
+def attribute(training_dir: Path):
+    calc_attributions(training_dir.resolve())
+
+
+@app.command()
+def predict(model_dir: Path, basin_chunk_index: int):
+    run_test = run_train = False
+    run_predict = f"chunk_{basin_chunk_index:02}"
+    cfg, model, dataset, eval_dir = load_prediction_model(model_dir.resolve(), basin_chunk_index)
     eval_model(cfg, model, dataset, eval_dir, run_test, run_predict, run_train)
 
 
-def positive_int(value):
-    """Custom argparse type to check for positive integers."""
-    if int(value) <= 0:
-        raise ArgumentTypeError(f"{value} is not a positive integer")
-    return int(value)
-
-
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Run model based on the command line arguments.")
-
-    # Create a mutually exclusive arg group for train/continue/test.
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--train",
-        type=Path,
-        help="Path to the training configuration file.",
-    )
-    group.add_argument(
-        "--train_ensemble",
-        type=Path,
-        help="Path to the training configuration file.",
-    )
-    group.add_argument(
-        "--finetune",
-        type=Path,
-        help="Path to the finetune configuration yml file.",
-    )
-    group.add_argument(
-        "--grid_search",
-        type=Path,
-        help="Path to the grid search configuration file.",
-    )
-    group.add_argument(
-        "--smac_optimize",
-        type=Path,
-        help="Path to the smac optimization configuration file.",
-    )
-    group.add_argument(
-        "--test",
-        type=Path,
-        help="Path to directory with model to test.",
-    )
-    group.add_argument(
-        "--attribution",
-        type=Path,
-        help="Path to directory with model to use for feature attributions.",
-    )
-    group.add_argument(
-        "--prediction_model",
-        type=Path,
-        help="Path to directory with model to use for predictions.",
-    )
-
-    parser.add_argument(
-        "--ensemble_seed",
-        type=int,
-        help="Integer to be added to the model seed (required with --train_ensemble)",
-        required="--train_ensemble" in sys.argv,
-    )
-
-    parser.add_argument(
-        "--grid_index",
-        type=positive_int,
-        help="Index in the hyperparameter grid to evaluate (required with --grid_search)",
-        required="--grid_search" in sys.argv,
-    )
-
-    parser.add_argument(
-        "--smac_runs",
-        type=positive_int,
-        help="Maximum number of hyperparameter tests (required with --smac_optimize)",
-        required="--smac_optimize" in sys.argv,
-    )
-    parser.add_argument(
-        "--smac_workers",
-        type=positive_int,
-        help="Maximum number of SLURM jobs (required with --smac_optimize)",
-        required="--smac_optimize" in sys.argv,
-    )
-
-    parser.add_argument(
-        "--basin_chunk_index",
-        type=positive_int,
-        help="Index of the chunked basin list to predict on. Must have a matching basin file.",
-        required="--prediction_model" in sys.argv,
-    )
-
-    args = parser.parse_args()
-
     try:
-        main(args)
+        app()
     except Exception as e:
         print(f"An error occurred: {e}")
         traceback.print_exc()

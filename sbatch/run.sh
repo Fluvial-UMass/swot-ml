@@ -1,53 +1,36 @@
 #!/bin/bash
 # Wrapper script to submit SLURM job with dynamic output path based on named argument
+# Usage:
+#   ./run.sh <partition> <python args...>
 
-# Initialize variables
-partition_name="cpu"  # Default to CPU
-flag=""
-config_path=""
-
-# Parse named arguments
-while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        --train|--continue|--finetune|--test|--attribution)
-            if [[ -n "$flag" ]]; then
-                echo "Error: Cannot specify multiple modes (--train, --continue, --finetune, --test, --attribution)."
-                exit 1
-            fi
-            flag="$1"
-            config_path="$2"
-            shift
-            ;;
-        --cpu|--ceewater|--gpu|--gpu-long|--gpupod)
-            # Strip the initial '--' and use the remainder as partition_name
-            partition_name="${1:2}"  
-            ;;
-        *)
-            echo "Unknown parameter passed: $1"
-            exit 1
-            ;;
-    esac
-    shift
-done
-
-# Validate input
-if [[ -z "$flag" ]]; then
-    echo "Error: Must specify one of --train <config-file.yml>, --continue <directory>, or --test <directory>."
+if [[ $# -lt 2 ]]; then
+    echo "Usage: $0 <partition> <python CLI arguments>"
     exit 1
 fi
 
-case "$flag" in
-    --train)
-        if [[ ! -f "$config_path" ]]; then
-            echo "Error: Training configuration file does not exist: $config_path"
-            exit 1
-        fi 
-        ;;
-    *)
-        if [[ ! -d "$config_path" ]]; then
-            echo "Error: Directory does not exist: $config_path"
+partition_name="$1"
+shift
+python_args=("$@")  # Everything after the partition name
+
+# Roughly validate method and path args.
+method="${python_args[0]}"
+path_arg="${python_args[1]}"
+
+case "$method" in
+    train|train_ensemble|grid_search|smac_optimize)
+        if [[ ! -f "$path_arg" ]]; then
+            echo "Error: Expected a file path for '$method', but got: $path_arg"
             exit 1
         fi
+        ;;
+    test|predict|attribute)
+        if [[ ! -d "$path_arg" ]]; then
+            echo "Error: Expected a directory path for '$method', but got: $path_arg"
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Warning: Unknown method '$method'. Skipping path validation."
         ;;
 esac
 
@@ -106,30 +89,32 @@ case $partition_name in
         ;;
 esac
 
-# Define the output directory and create it if it doesn't exist
-config_dir=$(dirname "$config_path")
-config_dir=$(realpath "$config_dir")
+# Determine job name components from the config path
+config_abs_path=$(realpath "$path_arg")
+config_dir=$(dirname "$config_abs_path")
+
+# expecting runs/<experiment>/<config> where they will be many configs per experiment.
+config_name=$(basename "$config_abs_path" .yml)
+experiment_name=$(basename "$config_dir")
+
+# Output directory: e.g., runs/experiment/_slurm_outputs
 output_dir="${config_dir}/_slurm_outputs"
 mkdir -p "$output_dir"
-
-config_basename=$(basename "$config_path" .yml)
-config_parent=$(basename "$(dirname "$config_path")")
 
 # Create the SBATCH script with dynamic output path and partition
 sbatch_script=$(mktemp)
 cat << EOF > "$sbatch_script"
 #!/bin/bash
-#SBATCH --job-name="${config_parent}_${config_basename}"
+#SBATCH --job-name="${experiment_name}_${config_name}"
 #SBATCH --mem=64G  # Requested Memory
-#SBATCH -o ${output_dir}/${config_basename}.out
+#SBATCH -o ${output_dir}/${config_name}.out
 $(echo -e "$SBATCH_DIRECTIVES")
 
 source .venv/bin/activate
-
 $(echo -e "$ENVIRONMENT_LINES")
 
 cd "$(dirname "$0")/../src"
-python run.py $flag $config_path
+python run.py ${python_args[*]}
 EOF
 
 # Submit the job.

@@ -14,7 +14,7 @@ if [ "$#" -ne 3 ]; then
     echo ""
     echo "Example: $0 ./configs .model_args.hidden_size 128"
     echo "Example: $0 ./configs .data_dir \"/new/path/string\""
-    echo "Example (Delete): $0 ./configs .optimizer DELETE"
+    echo "Example: $0 ./configs .optimizer DELETE"
     echo ""
     echo "WARNING: This script modifies files IN-PLACE."
     exit 1
@@ -46,7 +46,6 @@ else
 fi
 
 
-# --- Script Logic ---
 # --- Script Logic ---
 echo "--- YAML Modification Script ---"
 echo "Directory:      $CONFIG_DIR"

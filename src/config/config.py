@@ -2,17 +2,21 @@ from pathlib import Path
 from typing import Literal, Any
 from enum import Enum
 import yaml
+import functools
+
 import numpy as np
-import itertools
+import json
 from pydantic import (
     BaseModel,
     Field,
-    ValidationError,
     model_validator,
     field_validator,
 )
 from pydantic.types import DirectoryPath, FilePath
 from datetime import datetime
+
+# Import model argument classes from model_args.py
+from .model_args import ModelArgs
 
 
 class Features(BaseModel):
@@ -31,45 +35,6 @@ class StepKwargs(BaseModel):
 class EarlyStopKwargs(BaseModel):
     patience: int = Field(0, gt=0)
     threshold: float = Field(..., gt=0, lt=1.0)
-
-
-class BaseModelArgs(BaseModel):
-    hidden_size: int = Field(..., gt=0)
-    dropout: float = Field(..., ge=0, lt=1.0)
-    seed: int = 0
-
-    def as_kwargs(self) -> dict:
-        return self.model_dump(exclude={"name"})
-
-
-class SeqAttnArgs(BaseModelArgs):
-    name: Literal["lstm_mlp_attn", "flexible_hybrid"]
-    num_layers: int = Field(..., gt=0)
-    num_heads: int = Field(..., gt=0)
-    target: list[str] = None
-    seq_length: int = None
-    dynamic_sizes: dict[str, int] = None
-    static_size: int = None
-    time_aware: dict[str, bool] = None
-
-
-class StackArgs(BaseModelArgs):
-    name: Literal["stacked_lstm"]
-    in_targets: list[str] = None
-    out_targets: list[str] = None
-    dynamic_size: int = None
-    static_size: int = None
-    seq2seq: bool = True
-
-
-class GraphLSTMArgs(BaseModelArgs):
-    name: Literal["graph_lstm"]
-    num_layers: int = Field(..., gt=0)
-    num_heads: int = Field(..., gt=0)
-    target: list[str] = None
-    dynamic_size: int = None
-    static_size: int = None
-    graph_matrix: Any = None
 
 
 class ValueFilter(BaseModel):
@@ -100,6 +65,43 @@ class DataSubset(str, Enum):
 
 
 class Config(BaseModel):
+    def to_json(self, path: str | Path, exclude_none: bool = True, exclude_unset: bool = True):
+        """Dump the config to a JSON file."""
+        cfg_out = self.model_copy(deep=True)
+        json_str = cfg_out.model_dump_json(
+            indent=4, exclude_none=exclude_none, exclude_unset=exclude_unset
+        )
+        with open(path, "w") as f:
+            f.write(json_str)
+
+    @classmethod
+    def from_file(cls, file_path: Path | str) -> "Config":
+        """
+        Load the config from a YAML or JSON file. Automatically detects file type by extension.
+        """
+        if isinstance(file_path, str):
+            file_path = Path(file_path)
+
+        ext = file_path.suffix.lower()
+        if ext in [".yml", ".yaml"]:
+            with open(file_path, "r") as f:
+                cfg_dict = yaml.safe_load(f)
+        elif ext == ".json":
+            with open(file_path, "r") as f:
+                cfg_dict = json.load(f)
+        else:
+            raise ValueError(f"Unsupported config file extension: {ext}")
+
+        cfg = cls(**cfg_dict)
+        cfg.cfg_path = file_path
+        return cfg
+
+    def __str__(self) -> str:
+        """
+        Provides a nicely formatted JSON string of all model attributes,
+        """
+        return self.model_dump_json(indent=4)
+
     # Data paths
     data_dir: DirectoryPath
     time_series_dir: DirectoryPath
@@ -137,7 +139,7 @@ class Config(BaseModel):
 
     # Model
     sequence_length: int
-    model_args: SeqAttnArgs | GraphLSTMArgs = Field(discriminator="name")
+    model_args: ModelArgs = Field(discriminator="name")
 
     # Trainer
     num_epochs: int = Field(..., gt=0)
@@ -146,7 +148,10 @@ class Config(BaseModel):
     decay_rate: float = Field(..., gt=0, lt=1.0)
     transition_begin: int = Field(0, ge=0)
     step_kwargs: StepKwargs
-    early_stopping: EarlyStopKwargs
+    early_stop_kwargs: EarlyStopKwargs = None
+
+    # Meta
+    parameter_search_grid: dict = Field(default_factory=dict)
 
     # Outputs
     quiet: bool = True
@@ -249,108 +254,54 @@ class Config(BaseModel):
             v.target_weights = [1] * len(cfg["features"].target)
         return v
 
+    def rgetattr(self, attr: str, *args):
+        """
+        Recursively get attribute from the instance using dot notation.
+        """
 
-def read_yml(yml_path: str | Path) -> dict[str, Any]:
-    if not isinstance(yml_path, Path):
-        yml_path = Path(yml_path)
-    with open(yml_path, "r") as f:
-        yml = yaml.safe_load(f)
-    return yml
+        def _getattr(obj, attr):
+            return getattr(obj, attr, *args)
 
+        return functools.reduce(_getattr, [self] + attr.split("."))
 
-def read_config(yml_path: str | Path) -> Config:
-    if isinstance(yml_path, str):
-        yml_path = Path(yml_path)
-    raw_cfg = read_yml(yml_path)
-    try:
-        cfg = Config(**raw_cfg)
-    except ValidationError as e:
-        print(f"Configuration validation error: {e}")
-        raise
-    cfg.cfg_path = yml_path
-    return cfg
+    def rsetattr(self, attr: str, value: Any):
+        """
+        Recursively set attribute on the instance using dot notation.
+        """
+        pre, _, post = attr.rpartition(".")
+        return setattr(self.rgetattr(pre) if pre else self, post, value)
 
+    def update_from_grid(self, idx: int) -> "Config":
+        param_dict = self.parameter_search_grid
+        if param_dict == {}:
+            raise AttributeError("param_search_dict is empty. Cannot update from grid.")
 
-def get_grid_update_tuples(
-    param_dict: dict[str : list | dict[str:list]],
-) -> tuple[list[str | tuple, list[tuple]]]:
-    """Generates shuffled lists of keys and hyperparameter combinations for grid search.
+        def flatten_param_dict(d: dict, prefix=""):
+            for k, v in d.items():
+                full_key = f"{prefix}.{k}" if prefix else k
+                if isinstance(v, dict):
+                    yield from flatten_param_dict(v, full_key)
+                elif isinstance(v, list):
+                    yield full_key, v
+                else:
+                    raise ValueError(f"Invalid type at {full_key}: {type(v).__name__}")
 
-    Parameters
-    ----------
-    param_dict : dict[str:list | dict[str:list]]
-        A dictionary containing keys and values that outline the entire hyperparameter grid space.
+        dotted_keys, value_set = zip(*flatten_param_dict(param_dict))
 
-    Returns
-    -------
-    list[str | tuple[str, str]]
-        The order of hyperparameters in the update tuples
-    list[tuple]
-        A shuffled list of all possible hyperparameter combinations.
+        # Compute the total number of combinations
+        sizes = [len(v) for v in value_set]
+        n_total = np.prod(sizes)
+        if idx < 0 or idx >= n_total:
+            raise IndexError(f"Index {idx} is out of range for grid of size {n_total}")
 
-    Raises
-    ------
-    ValueError
-        If the 'param_search_dict' contains anything other than lists and dictionaries of lists.
-    RuntimeError
-        If tuple keys have length other than 2.
-    """
-    key_list = []
-    value_list = []
-    for k1, v1 in param_dict.items():
-        if isinstance(v1, dict):
-            for k2, v2 in v1.items():
-                key_list.append((k1, k2))
-                value_list.append(v2)
-        elif isinstance(v1, list):
-            key_list.append(k1)
-            value_list.append(v1)
-        else:
-            raise ValueError("param_dict must contain only lists and dicts of lists")
-    rng = np.random.default_rng(42)  # Do not change!
-    param_grid_list = list(itertools.product(*value_list))
-    rng.shuffle(param_grid_list)
-    return key_list, param_grid_list
+        # Do not change the seed! This ensures deterministic grid shuffling between runs.
+        rng = np.random.default_rng(42)
+        # Shuffle the grid indices (permutation of size n_total) and select our index
+        grid_idx = rng.permutation(n_total)[idx]
 
+        # Convert grid_idx to N-dimensional indices for each parameter
+        unravel = np.unravel_index(grid_idx, sizes)
+        new_values = [v[i] for v, i in zip(value_set, unravel)]
 
-def update_cfg_from_grid(cfg: Config, idx: int) -> Config:
-    """Updates the configuration dictionary with a hyperparameter combination from the grid.
-
-    Parameters
-    ----------
-    cfg : Config
-        The configuration object.
-    idx : int
-        The index of the hyperparameter combination to use.
-
-    Returns
-    -------
-    Config
-        The updated configuration object.
-
-    Raises
-    ------
-    IndexError
-        If `idx` is out of range for the `param_grid_list`.
-    RuntimeError
-        If tuple keys have length other than 2.
-    """
-    # Check if 'param_search_dict' exists in the config before calling get_grid_update_tuples
-    if not hasattr(cfg, "param_search_dict") or (not cfg.param_search_dict):
-        raise AttributeError(
-            "param_search_dict not found in the configuration. Cannot update from grid."
-        )
-    key_list, param_grid_list = get_grid_update_tuples(cfg.param_search_dict)
-    updates = param_grid_list[idx]
-    # Create a mutable dictionary from the config object
-    cfg_dict = cfg.model_dump()
-    # Insert the updates into the config dictionary
-    for k, v in zip(key_list, updates):
-        if isinstance(k, tuple):
-            if len(k) != 2:
-                raise RuntimeError("tuple keys in 'param_search_dict' must have length 2")
-            cfg_dict[k[0]][k[1]] = v
-        else:
-            cfg_dict[k] = v
-    # Re-validate and create a new Config object
-    return Config(**cfg_dict)
+        for attr, value in zip(dotted_keys, new_values):
+            self.rsetattr(attr, value)

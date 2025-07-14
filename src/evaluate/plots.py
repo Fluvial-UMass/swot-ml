@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
 
-from config import Config
+from config.config import Config
 
 
 def mosaic_scatter(cfg: Config, results: pd.DataFrame, metrics: pd.DataFrame, title: str):
@@ -27,10 +27,14 @@ def mosaic_scatter(cfg: Config, results: pd.DataFrame, metrics: pd.DataFrame, ti
         )
         plt.colorbar(hb, shrink=0.3, aspect=10, anchor=(-1, -0.55))
 
-        # Add a 1:1 line over the min and max of x and y
+        # Set the same limits for x and y, then plot a 1:1 line
         xlim = ax.get_xlim()
         ylim = ax.get_ylim()
-        ax.plot(xlim, ylim, "r--")
+        min_lim = min(xlim[0], ylim[0])
+        max_lim = max(xlim[1], ylim[1])
+        ax.set_xlim(min_lim, max_lim)
+        ax.set_ylim(min_lim, max_lim)
+        ax.plot([min_lim, max_lim], [min_lim, max_lim], "r--")
 
         textstr = "\n".join(
             [f"{key}: {metrics[target][key]:0.2f}" for key in ["R2", "RE", "MAPE", "nBias"]]
@@ -77,7 +81,7 @@ def basin_metric_histograms(
     basin_metrics: pd.DataFrame,
     metric_args: dict | None = None,
     cdf: bool = True,
-):
+) -> dict[str, plt.Figure]:
     if metric_args is None:
         metric_args = {
             "R2": {"range": [-1, 1]},
