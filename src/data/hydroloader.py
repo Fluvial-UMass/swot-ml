@@ -74,8 +74,7 @@ class HydroDataLoader(DataLoader):
         def map_fn(path, leaf):
             # Extract names/keys/indexes from all PyTree path parts
             keys = [
-                getattr(p, 'name', getattr(p, 'key', getattr(p, 'index', str(p))))
-                for p in path
+                getattr(p, "name", getattr(p, "key", getattr(p, "index", str(p)))) for p in path
             ]
             # keys = [p.key for p in path]
             if "dynamic_dt" in keys:

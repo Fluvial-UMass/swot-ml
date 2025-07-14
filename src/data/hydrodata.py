@@ -349,7 +349,7 @@ class HydroDataset(Dataset):
         G = GraphData(
             edge_index=edge_index,
             edge_features=edge_dist_norm[:, None],
-            node_features=node_features
+            node_features=node_features,
         )
         return G
 

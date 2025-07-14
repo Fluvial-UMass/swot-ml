@@ -57,7 +57,7 @@ def model_iterate(
 
     inference_mode = dataloader.dataset.inference_mode
     for basin, date, batch in tqdm(dataloader, disable=quiet):
-        batch = dataloader.shard_batch(batch)
+        # batch = dataloader.shard_batch(batch)
         y_pred = _model_map(model, batch, keys)
 
         if denormalize:
