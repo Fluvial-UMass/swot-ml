@@ -16,10 +16,9 @@ class ST_GATransformer(BaseModel):
     time_embedding: Array
     sensors: list[str]
     edge_feature_size: int
+    return_weights: bool
 
-    static_encoder: eqx.nn.MLP
     sensor_embed: dict[str, eqx.nn.Linear]
-    # The model now has a list of recurrent cells instead of simple GAT layers.
     recurrent_layers: list[SpatioTemporalLSTMCell]
 
     def __init__(
@@ -34,6 +33,7 @@ class ST_GATransformer(BaseModel):
         seed: int,
         dropout: float,
         edge_feature_size: int,
+        return_weights: bool,
     ):
         key = jrandom.PRNGKey(seed)
         keys = list(jrandom.split(key, 10))
@@ -47,14 +47,7 @@ class ST_GATransformer(BaseModel):
         self.num_layers = num_layers
         self.time_embedding = sinusoidal_encoding(hidden_size, seq_length)
         self.edge_feature_size = edge_feature_size
-
-        self.static_encoder = eqx.nn.MLP(
-            in_size=static_size,
-            out_size=hidden_size,
-            width_size=hidden_size * 2,
-            depth=2,
-            key=keys.pop(0),
-        )
+        self.return_weights = return_weights
 
         embed_keys = jrandom.split(keys.pop(0), num_sensors)
         self.sensor_embed = {
@@ -62,7 +55,7 @@ class ST_GATransformer(BaseModel):
             for (e_name, e_size), e_key in zip(dynamic_sizes.items(), embed_keys)
         }
 
-        # --- REFACTORED: Create a list of SpatioTemporalLSTMCells ---
+        # Create a list of SpatioTemporalLSTMCells
         layer_keys = jrandom.split(keys.pop(0), num_layers)
         self.recurrent_layers = [
             SpatioTemporalLSTMCell(
@@ -112,7 +105,7 @@ class ST_GATransformer(BaseModel):
         down_edge_index = jnp.concatenate(down_node_edge_index, axis=1)
         down_edge_features = jnp.concatenate(down_node_edge_features, axis=0)
 
-        # --- Input Feature Preparation (same as before) ---
+        # --- Input Feature Preparation ---
         sensor_embeddings, padding_masks = [], []
         for s_name, s_emb in self.sensor_embed.items():
             features = data["dynamic"][s_name]
@@ -129,11 +122,9 @@ class ST_GATransformer(BaseModel):
             .reshape(seq_length, num_nodes, self.hidden_size)
         )
         x = x + self.time_embedding[:, None, :]
-        static_loc_embeddings = jax.vmap(self.static_encoder)(data["static"])
-        static_node_bias = jnp.repeat(static_loc_embeddings, len(self.sensors), axis=0)
-        x = x + static_node_bias[None, :, :]
 
         # --- Recurrent Processing Loop ---
+        all_layer_weights = []  # store the weights from each layer
         layer_keys = jrandom.split(key, self.num_layers)
         h_sequence = x  # Use input features as the initial "hidden state" for the first layer
 
@@ -147,13 +138,13 @@ class ST_GATransformer(BaseModel):
             scan_inputs = (h_sequence, padding_mask, scan_keys)
 
             def process_one_timestep(state_prev, scan_slice):
-                h_prev, c_prev = state_prev
+                h_0, c_0 = state_prev
                 x_t, mask_t, step_key = scan_slice
 
                 # Perform one step of the spatio-temporal update
-                h_candidate, c_candidate = layer(
+                layer_out = layer(
                     x_t,
-                    (h_prev, c_prev),
+                    (h_0, c_0),
                     data["graph"].node_features,
                     mask_t,
                     up_edge_index,
@@ -162,23 +153,32 @@ class ST_GATransformer(BaseModel):
                     down_edge_features,
                     key=step_key,
                 )
+                (h_1, c_1), (up_w, down_w) = layer_out
 
-                # --- CRITICAL: Handle Missing Data ---
-                # If the input at this timestep was masked (NaN), do not update the state.
-                # Instead, carry forward the previous state.
-                mask_t_expanded = mask_t[:, None]
-                h_final = jnp.where(mask_t_expanded, h_prev, h_candidate)
-                c_final = jnp.where(mask_t_expanded, c_prev, c_candidate)
+                # # If the input at this timestep was masked (NaN), do not update the state.
+                # # Instead, carry forward the previous state.
+                # mask_t_expanded = mask_t[:, None]
+                # h_1 = jnp.where(mask_t_expanded, h_0, h_1)
+                # c_1 = jnp.where(mask_t_expanded, c_0, c_1)
 
-                state_final = (h_final, c_final)
-                return state_final, h_final  # Output the hidden state for the next layer
+                # Return the new states for the next layer and states/weights for accumulation
+                return (h_1, c_1), (h_1, up_w, down_w)
 
             # Scan over the time sequence
-            _, h_sequence = jax.lax.scan(process_one_timestep, initial_state, scan_inputs)
+            _, (scan_accum) = jax.lax.scan(process_one_timestep, initial_state, scan_inputs)
+            h_sequence, up_w, down_w = scan_accum
+
+            # Store the collected weights and gates for this layer
+            all_layer_weights.append({"up_w": up_w, "down_w": down_w})
 
         # --- Aggregation and Prediction (Unchanged) ---
         final_representation = h_sequence[-1, :, :]
-        aggregated_states = final_representation.reshape(
-            (num_locations, len(self.sensors) * self.hidden_size)
-        )
-        return jax.vmap(self.head)(aggregated_states)
+
+        out_shape = (num_locations, len(self.sensors) * self.hidden_size)
+        aggregated_states = final_representation.reshape(out_shape)
+        predictions = jax.vmap(self.head)(aggregated_states)
+
+        if self.return_weights:
+            return predictions, all_layer_weights
+        else:
+            return predictions

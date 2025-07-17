@@ -28,6 +28,20 @@ def huber_loss(y: Array, y_pred: Array, mask: Array, *, huber_delta: float = 1.0
     return jnp.mean(jnp.where(condition, squared_loss, linear_loss), where=mask)
 
 
+def nse_loss(y: Array, y_pred: Array, mask: Array):
+    """
+    Calculates the smooth-joint NSE from Kratzert et al., 2019
+    https://doi.org/10.5194/hess-23-5089-2019
+    """
+    # Arrays can be either [batch, basins, time] or [basins, time] depending on model config.
+    # Graph models use the former because they need to predict over multiple basins for each step.
+    sq_error = jnp.square(y - y_pred) * mask
+    std_y = jnp.std(y, axis=-1, where=mask.astype(bool))  # Per-basin standard deviation
+    se_sum = jnp.sum(sq_error, axis=-1)  # Sum of squared errors per basin
+    denom = jnp.square(std_y + 0.1)  # Denominator with smoothing and epsilon for stability
+    return jnp.mean(se_sum / denom)
+
+
 def flux_agreement(y_pred: Array, target_list: list):
     """Calculates the normalized difference between direct SSF and SSC*Q flux estimates"""
     ssc = y_pred[:, target_list.index("ssc")] / 1e6  # mg/l -> kg/l
@@ -35,6 +49,9 @@ def flux_agreement(y_pred: Array, target_list: list):
     q = y_pred[:, target_list.index("usgs_q")] * 24 * 3600 * 1000  # m^3/s -> l/d
     rel_error = ((ssc * q) - flux) / ((ssc * q + flux) / 2)
     return jnp.mean(jnp.square(rel_error))
+
+
+LOSS_FN_MAP = {"mse": mse_loss, "mae": mae_loss, "huber": huber_loss, "nse": nse_loss}
 
 
 def compute_loss_fn(
@@ -88,18 +105,21 @@ def compute_loss_fn(
 
     # y_pred = jax.vmap(model)(data, keys)
 
-    y = data["y"][:, -1, ...]  # End of time dimension
+    # NSE calc requires the full time series, not just the final value.
+    if loss_name == "nse":
+        y = data["y"]
+    else:
+        y = data["y"][:, -1, ...]  # End of time dimension
+
     valid_mask = ~jnp.isnan(y)
     masked_y = jnp.where(valid_mask, y, 0)
     masked_y_pred = jnp.where(valid_mask, y_pred, 0)
-    if loss_name == "mse":
-        loss_fn = mse_loss
-    elif loss_name == "mae":
-        loss_fn = mae_loss
-    elif loss_name == "huber":
-        loss_fn = huber_loss
-    else:
-        raise ValueError("Invalid loss function name.")
+
+    try:
+        loss_fn = LOSS_FN_MAP[loss_name]
+    except KeyError:
+        raise ValueError("loss name not recognized by LOSS_FN_MAP in step.py")
+
     vectorized_loss_fn = jax.vmap(loss_fn, in_axes=(-1, -1, -1))  # Features dimension
     raw_losses = vectorized_loss_fn(masked_y, masked_y_pred, valid_mask)
     # Exclude any nan target losses from average.

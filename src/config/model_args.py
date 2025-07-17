@@ -15,6 +15,7 @@ class STGATArgs(BaseModelArgs):
     name: Literal["st_gat"]
     num_layers: int = Field(..., gt=0)
     edge_feature_size: int = Field(..., gt=0)
+    return_weights: bool = False
     target: list[str] = None
     seq_length: int = None
     dynamic_sizes: dict[str, int] = None

@@ -28,7 +28,7 @@ class HydroDataset(Dataset):
     DataLoader class for loading and preprocessing hydrological time series data.
     """
 
-    def __init__(self, cfg: Config, *, train_ds=None, use_cache=True):
+    def __init__(self, cfg: Config, *, train_ds: "HydroDataset" = None, use_cache=True):
         self.cfg = cfg
         self.log_pad = 0.001
         self.dataloader_kwargs = {}
@@ -44,7 +44,7 @@ class HydroDataset(Dataset):
 
         self._read_basin_files()
         self.x_s = self._load_attributes()
-        self.graph = self._load_graph_network_data()
+        self.graph = self._create_sparse_graph_from_nx()
         self.x_d = self._load_or_read_basin_data(use_cache)
         self.date_ranges = self._precompute_date_ranges()
 
@@ -69,9 +69,32 @@ class HydroDataset(Dataset):
 
         self.train_basins = read_file(data_dir / train_basin_file)
         self.test_basins = read_file(data_dir / test_basin_file)
-        self.all_basins = list(set(self.train_basins + self.test_basins))
 
-    def _load_or_read_basin_data(self, use_cache):
+        self.nx_graph = self._load_graph_network()
+        if self.graph_mode:
+            self.all_basins = [str(n) for n in self.nx_graph.nodes]
+        else:
+            self.all_basins = list(set(self.train_basins + self.test_basins))
+
+    def _load_graph_network(self) -> nx.DiGraph:
+        """
+        Loads a pre-computed networkx graph from a JSON file
+        """
+        self.graph_mode = self.cfg.graph_network_file is not None
+        if not self.graph_mode:
+            return
+
+        print("Loading graph network file")
+
+        # Load graph from JSON file
+        graph_path = self.cfg.data_dir / self.cfg.graph_network_file
+        with open(graph_path, "r") as f:
+            graph_json = json.load(f)
+        G = nx.readwrite.json_graph.node_link_graph(graph_json, edges="edges")
+
+        return G
+
+    def _load_or_read_basin_data(self, use_cache) -> xr.Dataset:
         print("Loading dynamic data")
         if use_cache:
             data_hash = self.get_data_hash()
@@ -269,49 +292,11 @@ class HydroDataset(Dataset):
 
         return x_s
 
-    def _load_graph_network_data(self) -> GraphData:
-        """
-        Loads a pre-computed networkx graph from a JSON file and converts it
-        to a sparse representation for the model.
-        """
-        if self.cfg.graph_network_file is None:
-            self.graph_mode = False
-            return
-
-        print("Loading graph network file")
-        self.graph_mode = True
-        if self.train_basins != self.test_basins:
-            raise ValueError(
-                "Graph network modeling does not currently support different "
-                "training and testing networks."
-            )
-
-        # Load graph from JSON file
-        graph_path = self.cfg.data_dir / self.cfg.graph_network_file
-        with open(graph_path, "r") as f:
-            graph_json = json.load(f)
-        G = nx.readwrite.json_graph.node_link_graph(graph_json, edges="edges")
-
-        # Validate that the graph nodes match the expected basins
-        graph_nodes = {str(node_data["id"]) for node_data in graph_json["nodes"]}
-        if set(self.train_basins) != graph_nodes:
-            raise ValueError("The nodes in the graph file do not match the training basins.")
-
-        # Create sparse representation (edge_index, edge_features)
-        return self._create_sparse_graph_from_nx(G)
-
-    def _create_sparse_graph_from_nx(self, G: nx.DiGraph) -> tuple[np.ndarray, np.ndarray]:
+    def _create_sparse_graph_from_nx(self) -> GraphData:
         """
         Converts a networkx graph into a sparse edge index and edge features.
-
-        Args:
-            G: The input graph. Assumes nodes have an 'original_index' attribute
-               that maps them to the desired integer indices for the model.
-               Assumes edges have a 'distance' attribute.
-
-        Returns:
-            A tuple containing the edge_index and edge_features numpy arrays.
         """
+        G = self.nx_graph
         # Create a mapping from each node's ID to its integer index
         node_to_int_index = {node: data["original_index"] for node, data in G.nodes(data=True)}
 
@@ -339,19 +324,19 @@ class HydroDataset(Dataset):
         mean_dist = np.mean(distances)
         std_dist = np.std(distances)
         # std would be zero if we had a distance-regular graph, such as a fixed grid raster.
-        # We need to check this case and avoid division by zero for safety
+        # We need to check this case and avoid division by zero for safety.
         std_dist = 1 if std_dist == 0 else std_dist
-        # TODO: Could implement a basis expansion here for more complex spatial decay
+        # TODO: Could implement a basis expansion here for more complex spatial functions
         edge_dist_norm = (distances - mean_dist) / std_dist
 
         node_features = self.x_s.to_array(dim="features").T.values
 
-        G = GraphData(
+        GD = GraphData(
             edge_index=edge_index,
             edge_features=edge_dist_norm[:, None],
             node_features=node_features,
         )
-        return G
+        return GD
 
     def _precompute_date_ranges(self):
         unique_dates = self.x_d["date"].values
@@ -377,7 +362,7 @@ class HydroDataset(Dataset):
         """Generate one batch of data."""
         # Collect all basin and date information for the indices
         if self.graph_mode:
-            basins = np.tile(self.basin_subset, (len(ids), 1))
+            basins = np.tile(self.all_basins, (len(ids), 1))
             basins_da = xr.DataArray(basins, dims=["sample", "basins"])
             dates = [self.sequence_indices[idx] for idx in ids]
         else:
@@ -397,7 +382,7 @@ class HydroDataset(Dataset):
                 batch["dynamic"][source] = np.moveaxis(
                     ds[col_names].to_array().values, [0, 1, 3], [-1, 0, 1]
                 )
-                # dt calcs not yet implemented for new dimension.
+                # dt calcs not yet implemented for new dimension. (also not yet needed)
                 # batch['dynamic_dt'][source] = self._calc_var_dt(batch['dynamic'][source])
 
             # Static data. Shape (batch, nodes, features)
@@ -409,9 +394,15 @@ class HydroDataset(Dataset):
             batch["graph"] = self.graph
             # batch['graph'] = jnp.stack([self.graph] * len(ids))
 
-            # Target data. Shape (batch, sequence, features)
+            # Target data. Shape (batch, sequence, nodes, features)
             if not self.inference_mode:
-                batch["y"] = np.moveaxis(ds[self.target].to_array().values, [0, 1, 3], [-1, 0, 1])
+                # Need to mask out data outside the current subset of basins. We need this data in place in the other
+                # input data to make the graphs work, but exclude it here to avoid influencing loss during
+                # training/validation and error etimates during testing.
+                y = np.moveaxis(ds[self.target].to_array().values, [0, 1, 3], [-1, 0, 1])
+                mask = np.isin(self.all_basins, self.basin_subset)
+                mask = mask[None, None, :, None]  # shape: (1, 1, nodes, 1)
+                batch["y"] = np.where(mask, y, np.nan)
 
         else:
             batch = {"dynamic": {}, "dynamic_dt": {}}

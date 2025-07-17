@@ -13,7 +13,7 @@ def segment_softmax(scores: Array, segment_ids: Array, num_segments: int) -> Arr
     return exp_scores / (sum_exp_scores[segment_ids] + 1e-9)
 
 
-class DirectionalGATMessagePassing(eqx.Module):
+class DirectionalGAT(eqx.Module):
     """
     Directionally-aware Graph Attention message passing.
     It computes and aggregates messages from upstream and downstream neighbors separately,
@@ -33,24 +33,25 @@ class DirectionalGATMessagePassing(eqx.Module):
         *,
         key: PRNGKeyArray,
     ):
-        up_key, down_key, update_key = jax.random.split(key, 3)
+        keys = list(jax.random.split(key, 10))
 
+        input_size = (node_hidden_size * 2) + (static_feature_size * 2) + edge_feature_size
         # Attention mechanism for messages coming from upstream nodes
         self.up_attention_mlp = eqx.nn.MLP(
-            in_size=(node_hidden_size * 2) + (static_feature_size * 2) + edge_feature_size,
+            in_size=input_size,
             out_size=1,
             width_size=node_hidden_size * 2,
             depth=1,
-            key=up_key,
+            key=keys.pop(),
         )
 
         # Attention mechanism for messages going to downstream nodes
         self.down_attention_mlp = eqx.nn.MLP(
-            in_size=(node_hidden_size * 2) + (static_feature_size * 2) + edge_feature_size,
+            in_size=input_size,
             out_size=1,
             width_size=node_hidden_size * 2,
             depth=1,
-            key=down_key,
+            key=keys.pop(),
         )
 
         # MLP to update the node state after aggregating messages from both directions
@@ -59,12 +60,18 @@ class DirectionalGATMessagePassing(eqx.Module):
             out_size=node_hidden_size,
             width_size=node_hidden_size * 3,
             depth=1,
-            key=update_key,
+            key=keys.pop(),
         )
         self.activation = jax.nn.relu
 
     def _compute_messages(
-        self, x, x_s, node_mask, edge_index, edge_features, attention_mlp: eqx.nn.MLP
+        self,
+        x: Array,
+        x_s: Array,
+        node_mask: Array,
+        edge_index: tuple[Array, Array],
+        edge_features: Array,
+        attention_mlp: eqx.nn.MLP,
     ):
         """Helper to compute attention-weighted messages for a given direction."""
         num_nodes = x.shape[0]
@@ -89,21 +96,25 @@ class DirectionalGATMessagePassing(eqx.Module):
         )
 
         # Compute raw attention scores and apply leaky ReLU
-        logits = jax.vmap(attention_mlp)(attention_input).squeeze(-1)
-        logits = jax.nn.leaky_relu(logits)
+        raw_scores = jax.vmap(attention_mlp)(attention_input).squeeze(-1)
+        raw_scores = jax.nn.leaky_relu(raw_scores)
+
+        # Temperature scaling for numerical stability
+        temperature = jnp.sqrt(x.shape[-1])
+        scaled_scores = raw_scores / temperature
 
         # An edge is invalid if its source node has invalid data for this timestep.
         # By setting the score to -inf, it becomes zero after the softmax.
         source_mask = node_mask[source_nodes]
-        masked_attention_scores = jnp.where(source_mask, jnp.finfo(logits.dtype).min, logits)
-        attention_weights = segment_softmax(masked_attention_scores, dest_nodes, num_nodes)
-
+        masked_scores = jnp.where(source_mask, jnp.finfo(scaled_scores.dtype).min, scaled_scores)
+        attention_weights = segment_softmax(masked_scores, dest_nodes, num_nodes)
+        
         # Weight the source node features by attention and aggregate at destination nodes
         weighted_messages = source_hidden_feats * attention_weights[:, None]
         aggregated_feats = jax.ops.segment_sum(
             weighted_messages, dest_nodes, num_segments=num_nodes
         )
-        return aggregated_feats
+        return aggregated_feats, attention_weights
 
     def __call__(
         self,
@@ -125,18 +136,29 @@ class DirectionalGATMessagePassing(eqx.Module):
             down_edge_features: Features for downstream edges.
         """
         # Compute aggregated messages from upstream neighbors
-        up_messages = self._compute_messages(
-            x, x_s, node_mask, up_edge_index, up_edge_features, self.up_attention_mlp
+        up_messages, up_w = self._compute_messages(
+            x,
+            x_s,
+            node_mask,
+            up_edge_index,
+            up_edge_features,
+            self.up_attention_mlp,
         )
 
         # Compute aggregated messages from downstream neighbors (e.g., backwater effects)
-        down_messages = self._compute_messages(
-            x, x_s, node_mask, down_edge_index, down_edge_features, self.down_attention_mlp
+        down_messages, down_w = self._compute_messages(
+            x,
+            x_s,
+            node_mask,
+            down_edge_index,
+            down_edge_features,
+            self.down_attention_mlp,
         )
 
         # Combine current state with messages from both directions and update
         update_input = jnp.concatenate([x, up_messages, down_messages], axis=-1)
-        return self.activation(jax.vmap(self.update_mlp)(update_input))
+        update = self.activation(jax.vmap(self.update_mlp)(update_input))
+        return update, up_w, down_w
 
 
 class SpatioTemporalLSTMCell(eqx.Module):
@@ -146,7 +168,7 @@ class SpatioTemporalLSTMCell(eqx.Module):
     """
 
     norm: eqx.nn.LayerNorm
-    gat: DirectionalGATMessagePassing
+    gat: DirectionalGAT
     lstm_cell: eqx.nn.LSTMCell
     dropout: eqx.nn.Dropout
 
@@ -161,7 +183,7 @@ class SpatioTemporalLSTMCell(eqx.Module):
     ):
         gat_key, lstm_key = jax.random.split(key)
         self.norm = eqx.nn.LayerNorm(node_hidden_size)
-        self.gat = DirectionalGATMessagePassing(
+        self.gat = DirectionalGAT(
             node_hidden_size=node_hidden_size,
             static_feature_size=static_feature_size,
             edge_feature_size=edge_feature_size,
@@ -203,16 +225,24 @@ class SpatioTemporalLSTMCell(eqx.Module):
         # First, combine the current input with the previous hidden state.
         # This allows the GAT to be aware of the node's current memory.
         norm_h = jax.vmap(self.norm)(h_prev)
+
         spatial_input = x_t + norm_h
 
         # Get a spatial context vector by aggregating neighbor information.
-        spatial_context = self.gat(
-            spatial_input, x_s, node_mask, up_edge_index, up_edge_features, down_edge_index, down_edge_features
+        gat_out = self.gat(
+            spatial_input,
+            x_s,
+            node_mask,
+            up_edge_index,
+            up_edge_features,
+            down_edge_index,
+            down_edge_features,
         )
+        spatial_context, up_w, down_w = gat_out
         spatial_context = self.dropout(spatial_context, key=key)
 
         # --- Temporal Update ---
         # Vmap'd over each location
         h_new, c_new = jax.vmap(self.lstm_cell)(spatial_context, (h_prev, c_prev))
 
-        return h_new, c_new
+        return (h_new, c_new), (up_w, down_w)

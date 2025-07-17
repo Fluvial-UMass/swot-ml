@@ -26,7 +26,7 @@ class Features(BaseModel):
 
 
 class StepKwargs(BaseModel):
-    loss: Literal["mse", "mae", "huber"] = "mse"
+    loss: Literal["mse", "mae", "huber", "nse"] = "mse"
     target_weights: list[float] | None = None
     max_grad_norm: float | None = None
     agreement_weight: float = 0.0
