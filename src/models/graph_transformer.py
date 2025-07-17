@@ -12,14 +12,13 @@ from .layers.graph_attn import SpatioTemporalLSTMCell
 
 class ST_GATransformer(BaseModel):
     hidden_size: int
-    num_layers: int
     time_embedding: Array
     sensors: list[str]
     edge_feature_size: int
     return_weights: bool
 
     sensor_embed: dict[str, eqx.nn.Linear]
-    recurrent_layers: list[SpatioTemporalLSTMCell]
+    gat_lstm: SpatioTemporalLSTMCell
 
     def __init__(
         self,
@@ -29,7 +28,7 @@ class ST_GATransformer(BaseModel):
         dynamic_sizes: dict[str, int],
         static_size: int,
         hidden_size: int,
-        num_layers: int,
+        k_hops: int,
         seed: int,
         dropout: float,
         edge_feature_size: int,
@@ -44,7 +43,6 @@ class ST_GATransformer(BaseModel):
         super().__init__(hidden_size * num_sensors, target, key=keys.pop(0))
 
         self.hidden_size = hidden_size
-        self.num_layers = num_layers
         self.time_embedding = sinusoidal_encoding(hidden_size, seq_length)
         self.edge_feature_size = edge_feature_size
         self.return_weights = return_weights
@@ -56,17 +54,14 @@ class ST_GATransformer(BaseModel):
         }
 
         # Create a list of SpatioTemporalLSTMCells
-        layer_keys = jrandom.split(keys.pop(0), num_layers)
-        self.recurrent_layers = [
-            SpatioTemporalLSTMCell(
-                node_hidden_size=hidden_size,
-                static_feature_size=static_size,
-                edge_feature_size=self.edge_feature_size,
-                dropout_p=dropout,
-                key=l_key,
-            )
-            for l_key in layer_keys
-        ]
+        self.gat_lstm = SpatioTemporalLSTMCell(
+            node_hidden_size=hidden_size,
+            static_feature_size=static_size,
+            edge_feature_size=self.edge_feature_size,
+            k_hops=k_hops,
+            dropout_p=dropout,
+            key=keys.pop(0),
+        )
 
     def __call__(
         self, data: dict[str, Array | GraphData | dict[str, Array]], key: PRNGKeyArray
@@ -124,61 +119,46 @@ class ST_GATransformer(BaseModel):
         x = x + self.time_embedding[:, None, :]
 
         # --- Recurrent Processing Loop ---
-        all_layer_weights = []  # store the weights from each layer
-        layer_keys = jrandom.split(key, self.num_layers)
-        h_sequence = x  # Use input features as the initial "hidden state" for the first layer
+        def process_one_timestep(state_prev, scan_slice):
+            h_0, c_0 = state_prev
+            x_t, mask_t, step_key = scan_slice
 
-        for layer, lkey in zip(self.recurrent_layers, layer_keys):
-            # Initial states for the LSTM are zeros
-            initial_h = jnp.zeros((num_nodes, self.hidden_size))
-            initial_c = jnp.zeros((num_nodes, self.hidden_size))
-            initial_state = (initial_h, initial_c)
+            # Perform one step of the spatio-temporal update
+            layer_out = self.gat_lstm(
+                x_t,
+                (h_0, c_0),
+                data["graph"].node_features,
+                mask_t,
+                up_edge_index,
+                up_edge_features,
+                down_edge_index,
+                down_edge_features,
+                key=step_key,
+            )
+            (h_1, c_1), (up_w, down_w) = layer_out
 
-            scan_keys = jrandom.split(lkey, seq_length)
-            scan_inputs = (h_sequence, padding_mask, scan_keys)
+            # Return the new states for the next layer and states/weights for accumulation
+            return (h_1, c_1), (h_1, up_w, down_w)
 
-            def process_one_timestep(state_prev, scan_slice):
-                h_0, c_0 = state_prev
-                x_t, mask_t, step_key = scan_slice
+        # Initial states for the LSTM are zeros
+        initial_h = jnp.zeros((num_nodes, self.hidden_size))
+        initial_c = jnp.zeros((num_nodes, self.hidden_size))
+        initial_state = (initial_h, initial_c)
 
-                # Perform one step of the spatio-temporal update
-                layer_out = layer(
-                    x_t,
-                    (h_0, c_0),
-                    data["graph"].node_features,
-                    mask_t,
-                    up_edge_index,
-                    up_edge_features,
-                    down_edge_index,
-                    down_edge_features,
-                    key=step_key,
-                )
-                (h_1, c_1), (up_w, down_w) = layer_out
+        scan_keys = jrandom.split(key, seq_length)
+        scan_inputs = (x, padding_mask, scan_keys)
+        
+        # Scan over the time sequence
+        (final_h, final_c), (scan_accum) = jax.lax.scan(process_one_timestep, initial_state, scan_inputs)
+        all_h, up_w, down_w = scan_accum
 
-                # # If the input at this timestep was masked (NaN), do not update the state.
-                # # Instead, carry forward the previous state.
-                # mask_t_expanded = mask_t[:, None]
-                # h_1 = jnp.where(mask_t_expanded, h_0, h_1)
-                # c_1 = jnp.where(mask_t_expanded, c_0, c_1)
-
-                # Return the new states for the next layer and states/weights for accumulation
-                return (h_1, c_1), (h_1, up_w, down_w)
-
-            # Scan over the time sequence
-            _, (scan_accum) = jax.lax.scan(process_one_timestep, initial_state, scan_inputs)
-            h_sequence, up_w, down_w = scan_accum
-
-            # Store the collected weights and gates for this layer
-            all_layer_weights.append({"up_w": up_w, "down_w": down_w})
-
-        # --- Aggregation and Prediction (Unchanged) ---
-        final_representation = h_sequence[-1, :, :]
-
+        # Aggregation and Prediction
         out_shape = (num_locations, len(self.sensors) * self.hidden_size)
-        aggregated_states = final_representation.reshape(out_shape)
+        aggregated_states = final_h.reshape(out_shape)
         predictions = jax.vmap(self.head)(aggregated_states)
 
         if self.return_weights:
-            return predictions, all_layer_weights
+            weights = {'up': up_w, 'down': down_w}
+            return predictions, weights
         else:
             return predictions

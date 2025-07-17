@@ -105,10 +105,12 @@ class DirectionalGAT(eqx.Module):
 
         # An edge is invalid if its source node has invalid data for this timestep.
         # By setting the score to -inf, it becomes zero after the softmax.
-        source_mask = node_mask[source_nodes]
-        masked_scores = jnp.where(source_mask, jnp.finfo(scaled_scores.dtype).min, scaled_scores)
-        attention_weights = segment_softmax(masked_scores, dest_nodes, num_nodes)
-        
+        # source_mask = node_mask[source_nodes]
+        # masked_scores = jnp.where(source_mask, jnp.finfo(scaled_scores.dtype).min, scaled_scores)
+        # attention_weights = segment_softmax(masked_scores, dest_nodes, num_nodes)
+
+        attention_weights = segment_softmax(scaled_scores, dest_nodes, num_nodes)
+
         # Weight the source node features by attention and aggregate at destination nodes
         weighted_messages = source_hidden_feats * attention_weights[:, None]
         aggregated_feats = jax.ops.segment_sum(
@@ -161,6 +163,77 @@ class DirectionalGAT(eqx.Module):
         return update, up_w, down_w
 
 
+class StackedGAT(eqx.Module):
+    """
+    Applies the DirectionalGAT layer k_hops times sequentially to expand the spatial
+    receptive field. Residual connections and layer normalization are used for stability.
+    """
+
+    gats: list[DirectionalGAT]
+    norm: eqx.nn.LayerNorm
+    k_hops: int
+
+    def __init__(
+        self,
+        node_hidden_size: int,
+        static_feature_size: int,
+        edge_feature_size: int,
+        k_hops: int,
+        *,
+        key: PRNGKeyArray,
+    ):
+        self.k_hops = k_hops
+        keys = jax.random.split(key, k_hops)
+
+        self.gats = [
+            DirectionalGAT(
+                node_hidden_size=node_hidden_size,
+                static_feature_size=static_feature_size,
+                edge_feature_size=edge_feature_size,
+                key=k,
+            )
+            for k in keys
+        ]
+        self.norm = eqx.nn.LayerNorm(node_hidden_size)
+
+    def __call__(
+        self,
+        x: Array,
+        x_s: Array,
+        node_mask: Array,
+        up_edge_index: Array,
+        up_edge_features: Array,
+        down_edge_index: Array,
+        down_edge_features: Array,
+    ) -> tuple[Array, Array, Array]:
+        up_ws = []
+        down_ws = []
+
+        for gat in self.gats:
+            # Normalize input and apply GAT
+            gat_input = jax.vmap(self.norm)(x)
+            gat_out, up_w, down_w = gat(
+                gat_input,
+                x_s,
+                node_mask,
+                up_edge_index,
+                up_edge_features,
+                down_edge_index,
+                down_edge_features,
+            )
+            
+            x = x + gat_out # Residual connection for training stability
+            up_ws.append(up_w)
+            down_ws.append(down_w)
+
+        # Stack and mean over hops
+        up_w_agg = jnp.mean(jnp.stack(up_ws), axis=0)
+        down_w_agg = jnp.mean(jnp.stack(down_ws), axis=0)
+
+        # Return the output and weights
+        return x, up_w_agg, down_w_agg
+
+
 class SpatioTemporalLSTMCell(eqx.Module):
     """
     A recurrent cell that first uses a DirectionalGAT to aggregate spatial information
@@ -168,7 +241,7 @@ class SpatioTemporalLSTMCell(eqx.Module):
     """
 
     norm: eqx.nn.LayerNorm
-    gat: DirectionalGAT
+    gat: StackedGAT
     lstm_cell: eqx.nn.LSTMCell
     dropout: eqx.nn.Dropout
 
@@ -177,16 +250,18 @@ class SpatioTemporalLSTMCell(eqx.Module):
         node_hidden_size: int,
         static_feature_size: int,
         edge_feature_size: int,
+        k_hops: int,
         dropout_p: float,
         *,
         key: PRNGKeyArray,
     ):
         gat_key, lstm_key = jax.random.split(key)
         self.norm = eqx.nn.LayerNorm(node_hidden_size)
-        self.gat = DirectionalGAT(
+        self.gat = StackedGAT(
             node_hidden_size=node_hidden_size,
             static_feature_size=static_feature_size,
             edge_feature_size=edge_feature_size,
+            k_hops=k_hops,
             key=gat_key,
         )
         self.lstm_cell = eqx.nn.LSTMCell(
@@ -222,15 +297,9 @@ class SpatioTemporalLSTMCell(eqx.Module):
         h_prev, c_prev = state
 
         # --- Spatial Update ---
-        # First, combine the current input with the previous hidden state.
-        # This allows the GAT to be aware of the node's current memory.
-        norm_h = jax.vmap(self.norm)(h_prev)
-
-        spatial_input = x_t + norm_h
-
         # Get a spatial context vector by aggregating neighbor information.
         gat_out = self.gat(
-            spatial_input,
+            x_t,
             x_s,
             node_mask,
             up_edge_index,
