@@ -18,27 +18,8 @@ class STGATArgs(BaseModelArgs):
     return_weights: bool = False
     target: list[str] = None
     seq_length: int = None
-    dynamic_sizes: dict[str, int] = None
-    static_size: int = None
-
-
-class STGTArgs(BaseModelArgs):
-    name: Literal["st_graph_transformer"]
-    num_heads: int = Field(..., gt=0)
-    num_layers: int = Field(..., gt=0)
-    target: list[str] = None
-    seq_length: int = None
-    dynamic_sizes: dict[str, int] = None
-    static_size: int = None
-
-
-class RaindropArgs(BaseModelArgs):
-    name: Literal["raindrop"]
-    time_embedding_size: int = Field(..., gt=0)
-    target: list[str] = None
-    seq_length: int = None
-    num_locations: int = None
-    dynamic_sizes: dict[str, int] = None
+    dense_sizes: dict[str, int] = None
+    sparse_sizes: dict[str, int] = None
     static_size: int = None
 
 
@@ -83,5 +64,5 @@ class MSAttnArgs(BaseModelArgs):
 
 
 ModelArgs: TypeAlias = (
-    SeqAttnArgs | StackArgs | GraphLSTMArgs | MSAttnArgs | RaindropArgs | STGTArgs | STGATArgs
+    SeqAttnArgs | StackArgs | GraphLSTMArgs | MSAttnArgs | STGATArgs
 )

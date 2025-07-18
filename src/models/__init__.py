@@ -8,8 +8,6 @@ from config.model_args import (
     StackArgs,
     GraphLSTMArgs,
     MSAttnArgs,
-    RaindropArgs,
-    STGTArgs,
     STGATArgs,
 )
 from data import HydroDataLoader, HydroDataset
@@ -17,8 +15,6 @@ from data import HydroDataLoader, HydroDataset
 from models.lstm_mlp_attn import LSTM_MLP_ATTN
 from models.stacked_lstm import STACKED_LSTM
 from models.ms_attention import MS_ATTN
-from models.raindrop import RAINDROP
-from models.st_graph_transformer import ST_Graph_Transformer
 from models.graph_transformer import ST_GATransformer
 # from models.rg_lstm import Graph_LSTM
 
@@ -28,8 +24,6 @@ MODEL_MAP = {
     "lstm_mlp_attn": LSTM_MLP_ATTN,
     "stacked_lstm": STACKED_LSTM,
     "ms_attn": MS_ATTN,
-    "raindrop": RAINDROP,
-    "st_graph_transformer": ST_Graph_Transformer,
     "st_gat": ST_GATransformer,
     # "graph_lstm": Graph_LSTM,
 }
@@ -75,20 +69,14 @@ def set_model_data_args(cfg: Config, dataset: HydroDataset):
     elif isinstance(cfg.model_args, STGATArgs):
         cfg.model_args.target = dataset.target
         cfg.model_args.seq_length = cfg.sequence_length
-        cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dyn_feat.items()}
-        cfg.model_args.static_size = len(dataset.features["static"])
-
-    elif isinstance(cfg.model_args, STGTArgs):
-        cfg.model_args.target = dataset.target
-        cfg.model_args.seq_length = cfg.sequence_length
-        cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dyn_feat.items()}
-        cfg.model_args.static_size = len(dataset.features["static"])
-
-    elif isinstance(cfg.model_args, RaindropArgs):
-        cfg.model_args.target = dataset.target
-        cfg.model_args.seq_length = cfg.sequence_length
-        cfg.model_args.num_locations = dataset.graph_matrix.shape[0]
-        cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dyn_feat.items()}
+        cfg.model_args.dense_sizes = {
+            k: len(dataset.features['dynamic'][k]) 
+            for k,v in dataset.time_gaps.items() if not v
+        }
+        cfg.model_args.sparse_sizes = {
+            k: len(dataset.features['dynamic'][k]) 
+            for k,v in dataset.time_gaps.items() if v
+        }
         cfg.model_args.static_size = len(dataset.features["static"])
 
     elif isinstance(cfg.model_args, StackArgs):
