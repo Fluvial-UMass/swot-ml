@@ -22,7 +22,11 @@ class DirectionalGAT(eqx.Module):
 
     fwd_attention_mlp: eqx.nn.MLP
     rev_gate_mlp: eqx.nn.MLP
-    update_mlp: eqx.nn.MLP
+
+    # Gating MLPs for a GRU-style update
+    reset_gate_mlp: eqx.nn.MLP
+    update_gate_mlp: eqx.nn.MLP
+    candidate_mlp: eqx.nn.MLP
 
     def __init__(
         self,
@@ -53,9 +57,24 @@ class DirectionalGAT(eqx.Module):
             key=keys.pop(),
         )
 
-        # MLP to update the node state after aggregating messages from both directions
-        self.update_mlp = eqx.nn.MLP(
-            in_size=node_hidden_size * 3,  # Current state + upstream messages + downstream messages
+        # MLPs for GRU-style update gates and candidate state
+        gate_input_size = node_hidden_size * 3  # Current state (x) + fwd_messages + rev_messages
+        self.reset_gate_mlp = eqx.nn.MLP(
+            in_size=gate_input_size,
+            out_size=node_hidden_size,
+            width_size=node_hidden_size * 3,
+            depth=1,
+            key=keys.pop(),
+        )
+        self.update_gate_mlp = eqx.nn.MLP(
+            in_size=gate_input_size,
+            out_size=node_hidden_size,
+            width_size=node_hidden_size * 3,
+            depth=1,
+            key=keys.pop(),
+        )
+        self.candidate_mlp = eqx.nn.MLP(
+            in_size=gate_input_size,  # Takes reset state + messages
             out_size=node_hidden_size,
             width_size=node_hidden_size * 3,
             depth=1,
@@ -69,8 +88,7 @@ class DirectionalGAT(eqx.Module):
         edge_index: tuple[Array, Array],
         edge_features: Array,
         mlp: eqx.nn.MLP,
-        use_softmax : bool
-        
+        use_softmax: bool,
     ):
         """Helper to compute attention-weighted messages for a given direction."""
         num_nodes = x.shape[0]
@@ -113,31 +131,34 @@ class DirectionalGAT(eqx.Module):
         """
         # Compute aggregated messages from upstream neighbors (e.g., runoff)
         fwd_messages, fwd_w = self._compute_messages(
-            x,
-            x_s,
-            edge_index,
-            edge_features,
-            self.fwd_attention_mlp,
-            use_softmax = True
+            x, x_s, edge_index, edge_features, self.fwd_attention_mlp, use_softmax=True
         )
 
         # Compute messages for downstream neighbor. Note singular `neighbor` as all nodes in a (tributary) river network
         # only have 1 downstream neighbor. THese are in `out-degrees` in the networkx graph. So for the reverse pass, we
-        # use the MLP to estimate a gate value that allows or blocks info propagation.
+        # use the MLP to estimate a gate value that allows or blocks info propagation. Have to reverse the node
+        # source/dest columns
         rev_messages, rev_w = self._compute_messages(
-            x,
-            x_s,
-            edge_index[::-1], # Reverse the node source/dest columns
-            edge_features,
-            self.rev_gate_mlp,
-            use_softmax = False
+            x, x_s, edge_index[::-1], edge_features, self.rev_gate_mlp, use_softmax=False
         )
 
-        # Combine current state with messages from both directions and update
-        update_input = jnp.concatenate([x, fwd_messages, rev_messages], axis=-1)
-        update = jax.vmap(self.update_mlp)(update_input)
+        # --- GRU-style Gated Update ---
+        messages = jnp.concatenate([fwd_messages, rev_messages], axis=-1)
+        gate_input = jnp.concatenate([x, messages], axis=-1)
 
-        return update, fwd_w, rev_w
+        # Reset (r) and update (z) gates
+        r_gate = jax.nn.sigmoid(jax.vmap(self.reset_gate_mlp)(gate_input))
+        z_gate = jax.nn.sigmoid(jax.vmap(self.update_gate_mlp)(gate_input))
+
+        # Candidate state
+        candidate_input = jnp.concatenate([r_gate * x, messages], axis=-1)
+        candidate_state = jnp.tanh(jax.vmap(self.candidate_mlp)(candidate_input))
+
+        # Final update
+        # update_gate interpolates between old state (x) and new candidate state
+        update = (1 - z_gate) * x + z_gate * candidate_state
+
+        return update, fwd_w, rev_w, z_gate, r_gate
 
 
 class StackedGAT(eqx.Module):
@@ -180,31 +201,33 @@ class StackedGAT(eqx.Module):
         edge_index: Array,
         edge_features: Array,
     ) -> tuple[Array, Array, Array]:
-        fwd_ws = []
-        rev_ws = []
-
+        fwd_ws, rev_ws, z_gates, r_gates = [], [], [], []
         h = x
 
         for gat in self.gats:
             # Normalize input and apply GAT
             h_norm = jax.vmap(self.norm)(h)
-            gat_out, fwd_w, rev_w = gat(
+            gat_out, fwd_w, rev_w, z, r = gat(
                 h_norm,
                 x_s,
                 edge_index,
                 edge_features,
             )
-            h = h + gat_out # Residual
+            h = h + gat_out  # Residual
 
             fwd_ws.append(fwd_w)
             rev_ws.append(rev_w)
+            z_gates.append(z)
+            r_gates.append(r)
 
         # Stack and mean over hops
-        fwd_w_stack = jnp.stack(fwd_ws, axis=-1)
-        rev_w_stack = jnp.stack(rev_ws, axis=-1)
+        fwd_ws = jnp.stack(fwd_ws, axis=-1)
+        rev_ws = jnp.stack(rev_ws, axis=-1)
+        z_gates = jnp.stack(z_gates, axis=-1)
+        r_gates = jnp.stack(r_gates, axis=-1)
 
         # Return the output and weights
-        return h, fwd_w_stack, rev_w_stack
+        return h, fwd_ws, rev_ws, z_gates, r_gates
 
 
 class SpatioTemporalLSTMCell(eqx.Module):
@@ -213,6 +236,7 @@ class SpatioTemporalLSTMCell(eqx.Module):
     and then uses a StackedGAT to propagate that new state spatially.
     (Note: This implements the temporal-first, spatial-second logic).
     """
+
     gat: StackedGAT
     lstm_cell: eqx.nn.LSTMCell
     dropout: eqx.nn.Dropout
@@ -262,7 +286,7 @@ class SpatioTemporalLSTMCell(eqx.Module):
         h_candidate, c_new = jax.vmap(self.lstm_cell)(x_t, (h_prev, c_prev))
 
         # Propagate the freshly updated hidden states spatially.
-        gat_out, fwd_w, rev_w = self.gat(
+        gat_out, fwd_w, rev_w, z, r = self.gat(
             h_candidate,
             node_features,
             edge_index=edge_index,
@@ -270,6 +294,8 @@ class SpatioTemporalLSTMCell(eqx.Module):
         )
         h_new = self.dropout(gat_out, key=key)
 
-        # The new hidden state is the one processed by the GAT.
-        # The new cell state is the one from the LSTM update.
-        return (h_new, c_new), (fwd_w, rev_w)
+        # The new state and a tuple of all traceable weights/gates
+        new_state = (h_new, c_new)
+        trace_data = (fwd_w, rev_w, z, r)
+
+        return new_state, trace_data

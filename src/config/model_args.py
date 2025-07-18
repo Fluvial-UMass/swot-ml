@@ -63,6 +63,4 @@ class MSAttnArgs(BaseModelArgs):
     active_source: dict[str, bool] = Field(default_factory=dict)
 
 
-ModelArgs: TypeAlias = (
-    SeqAttnArgs | StackArgs | GraphLSTMArgs | MSAttnArgs | STGATArgs
-)
+ModelArgs: TypeAlias = SeqAttnArgs | StackArgs | GraphLSTMArgs | MSAttnArgs | STGATArgs

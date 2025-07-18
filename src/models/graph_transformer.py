@@ -66,7 +66,9 @@ class ST_GATransformer(BaseModel):
         # Create embedding MLPs for SPARSE sensors to generate update vectors
         sparse_keys = jrandom.split(keys.pop(0), len(self.sparse_sensors))
         self.sparse_embed = {
-            s_name: eqx.nn.MLP(in_size=s_size, out_size=hidden_size, width_size=hidden_size, depth=1, key=s_key)
+            s_name: eqx.nn.MLP(
+                in_size=s_size, out_size=hidden_size, width_size=hidden_size, depth=1, key=s_key
+            )
             for (s_name, s_size), s_key in zip(sparse_sizes.items(), sparse_keys)
         }
 
@@ -85,7 +87,6 @@ class ST_GATransformer(BaseModel):
             dropout_p=dropout,
             key=keys.pop(0),
         )
-
 
     def __call__(
         self, data: dict[str, Array | GraphData | dict[str, Array]], key: PRNGKeyArray
@@ -137,7 +138,7 @@ class ST_GATransformer(BaseModel):
             else:
                 input, step_key = scan_slice
 
-            (h_new, c_new), (fwd_w, rev_w) = self.dense_processor(
+            (h_new, c_new), (trace_data) = self.dense_processor(
                 input,
                 state_prev,
                 data["graph"].node_features,
@@ -147,7 +148,7 @@ class ST_GATransformer(BaseModel):
             )
 
             new_state = (h_new, c_new)
-            accumulated_outputs = (h_new, fwd_w, rev_w)
+            accumulated_outputs = (h_new, *trace_data)
             return new_state, accumulated_outputs
 
         # Initial states are zeros
@@ -166,14 +167,14 @@ class ST_GATransformer(BaseModel):
             process_one_timestep, initial_state, scan_inputs
         )
         final_h, final_c = final_state
-        all_h, fwd_w, rev_w = accumulated_outputs
+        all_h, fwd_w, rev_w, z, r = accumulated_outputs
 
         # --- 4. Aggregation and Prediction ---
         # The final hidden state at each location is used for prediction
         predictions = jax.vmap(self.head)(final_h)
 
         if self.return_weights:
-            weights = {'fwd': fwd_w, 'rev': rev_w}
+            weights = {"fwd": fwd_w, "rev": rev_w, "z": z, "r": r}
             return predictions, weights
         else:
             return predictions
