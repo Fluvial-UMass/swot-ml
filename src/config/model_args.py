@@ -15,6 +15,7 @@ class STGATArgs(BaseModelArgs):
     name: Literal["st_gat"]
     edge_feature_size: int = Field(..., gt=0)
     k_hops: int = Field(..., gt=0)
+    seq2seq: bool = False
     return_weights: bool = False
     target: list[str] = None
     seq_length: int = None

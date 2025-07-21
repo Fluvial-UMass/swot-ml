@@ -732,11 +732,12 @@ class HydroDataset(Dataset):
         # Get a boolean mask of dates that match our time splitting scheme
         # for the current data subset.
         if self.cfg.split_time:
+            split_time_np = np.datetime64(self.cfg.split_time)
             # Select before or after split time based on data subset.
             if self.data_subset in ["pre_train", "train"]:
-                date_mask = self.x_d["date"] <= self.cfg.split_time
+                date_mask = self.x_d["date"] <= split_time_np
             elif self.data_subset in ["test", "predict"]:
-                date_mask = self.x_d["date"] > self.cfg.split_time
+                date_mask = self.x_d["date"] > split_time_np
         else:
             # No time splitting between train and test.
             date_mask = True

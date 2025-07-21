@@ -3,6 +3,7 @@ from typing import Literal, Any
 from enum import Enum
 import yaml
 import functools
+import warnings
 
 import numpy as np
 import json
@@ -26,10 +27,19 @@ class Features(BaseModel):
 
 
 class StepKwargs(BaseModel):
-    loss: Literal["mse", "mae", "huber", "nse"] = "mse"
+    loss_name: Literal["mse", "mae", "huber", "nse"] = "mse"
     target_weights: list[float] | None = None
     max_grad_norm: float | None = None
     agreement_weight: float = 0.0
+
+    @model_validator(mode='before')
+    @classmethod
+    def check_deprecated_loss(cls, values):
+        if isinstance(values, dict) and 'loss' in values:
+            warnings.warn("'loss' is deprecated. Use 'loss_name' instead.", DeprecationWarning)
+            # Only override loss_name if it wasn't explicitly passed
+            values.setdefault('loss_name', values['loss'])
+        return values
 
 
 class EarlyStopKwargs(BaseModel):

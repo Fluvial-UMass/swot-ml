@@ -15,6 +15,7 @@ class ST_GATransformer(BaseModel):
     time_embedding: Array
     dense_sensors: list[str]
     sparse_sensors: list[str]
+    seq2seq: bool
     return_weights: bool
 
     # Embedders
@@ -39,6 +40,7 @@ class ST_GATransformer(BaseModel):
         seed: int,
         dropout: float,
         edge_feature_size: int,
+        seq2seq: bool,
         return_weights: bool,
     ):
         key = jrandom.PRNGKey(seed)
@@ -51,6 +53,7 @@ class ST_GATransformer(BaseModel):
         self.time_embedding = sinusoidal_encoding(hidden_size, seq_length)
         self.dense_sensors = list(dense_sizes.keys())
         self.sparse_sensors = list(sparse_sizes.keys())
+        self.seq2seq = seq2seq
         self.return_weights = return_weights
 
         # Create embedding layers for DENSE sensors
@@ -171,7 +174,10 @@ class ST_GATransformer(BaseModel):
 
         # --- 4. Aggregation and Prediction ---
         # The final hidden state at each location is used for prediction
-        predictions = jax.vmap(self.head)(final_h)
+        if self.seq2seq:
+            predictions = jax.vmap(jax.vmap(self.head))(all_h)
+        else:
+            predictions = jax.vmap(self.head)(final_h)
 
         if self.return_weights:
             weights = {"fwd": fwd_w, "rev": rev_w, "z": z, "r": r}

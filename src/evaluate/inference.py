@@ -6,6 +6,8 @@ from tqdm import tqdm
 from typing import Iterator
 from jaxtyping import Array, PRNGKeyArray
 
+from data import HydroDataLoader
+
 
 @eqx.filter_jit
 def _model_map(model, batch: dict[str:Array], keys: list[PRNGKeyArray]):
@@ -17,12 +19,10 @@ def _model_map(model, batch: dict[str:Array], keys: list[PRNGKeyArray]):
     y_pred = jax.vmap(model, in_axes=(in_axes_data, in_axes_keys))(batch, keys)
     return y_pred
 
-    # return jax.vmap(model)(batch, keys)
-
 
 def model_iterate(
     model: eqx.Module,
-    dataloader,
+    dataloader: HydroDataLoader,
     quiet: bool = False,
     denormalize: bool = True,
 ) -> Iterator[dict]:
@@ -60,13 +60,18 @@ def model_iterate(
         # batch = dataloader.shard_batch(batch)
         y_pred = _model_map(model, batch, keys)
 
+        # TODO bandaid for seq2seq models with 4 dimensions.
+        if len(y_pred.shape)==4:
+            # Grab the final prediction for now.
+            y_pred = y_pred[:,-1,...]
+
         if denormalize:
             y_pred = dataloader.dataset.denormalize_target(y_pred)
 
         out_dict = {"basin": basin, "date": date, "y_pred": y_pred}
 
         if not inference_mode:
-            y = batch["y"][:, -1, :]
+            y = batch["y"][:, -1, ...]
             if denormalize:
                 y = dataloader.dataset.denormalize_target(y)
             out_dict["y"] = y
