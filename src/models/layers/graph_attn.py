@@ -13,81 +13,158 @@ def segment_softmax(scores: Array, segment_ids: Array, num_segments: int) -> Arr
     return exp_scores / (sum_exp_scores[segment_ids] + 1e-9)
 
 
-class FwdAttentionLayer(eqx.Module):
-    """
-    Computes a single hop of forward (upstream-to-downstream) attention-weighted messages.
-    """
-    attention_mlp: eqx.nn.MLP
+class MultiHeadFwdAttentionLayer(eqx.Module):
+    """Computes forward attention using a fused MLP for all heads"""
 
-    def __init__(self, node_hidden_size: int, static_feature_size: int, edge_feature_size: int, *, key: PRNGKeyArray):
-        input_size = (node_hidden_size * 2) + (static_feature_size * 2) + edge_feature_size
+    num_heads: int
+    head_size: int
+    attention_mlp: eqx.nn.MLP
+    output_proj: eqx.nn.Linear
+
+    def __init__(
+        self,
+        num_heads: int,
+        node_hidden_size: int,
+        static_feature_size: int,
+        edge_feature_size: int,
+        *,
+        key: PRNGKeyArray,
+    ):
+        assert node_hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+        mlp_key, proj_key = jax.random.split(key)
+
+        self.num_heads = num_heads
+        self.head_size = node_hidden_size // num_heads
+
+        # MLP input is based on full hidden dimensions, not per-head dimensions.
+        mlp_input_size = (node_hidden_size * 2) + (static_feature_size * 2) + edge_feature_size
         self.attention_mlp = eqx.nn.MLP(
-            in_size=input_size,
-            out_size=1,
+            in_size=mlp_input_size,
+            out_size=self.num_heads,  # MLP directly outputs scores for all heads.
             width_size=node_hidden_size * 2,
             depth=1,
-            key=key,
+            use_bias=False,
+            key=mlp_key,
+        )
+        self.output_proj = eqx.nn.Linear(
+            node_hidden_size, node_hidden_size, use_bias=False, key=proj_key
         )
 
-    def __call__(self, h: Array, x_s: Array, edge_index: tuple[Array, Array], edge_features: Array) -> tuple[Array, Array]:
-        num_nodes = h.shape[0]
+    def __call__(
+        self, h: Array, x_s: Array, edge_index: tuple[Array, Array], edge_features: Array
+    ) -> tuple[Array, Array]:
+        num_nodes, hidden_size = h.shape
         src, dest = edge_index
 
-        mlp_input = jnp.concatenate([h[src], h[dest], x_s[src], x_s[dest], edge_features], axis=-1)
-        raw_scores = jax.vmap(self.attention_mlp)(mlp_input).squeeze(-1)
+        # 1. Prepare inputs for the fused MLP
+        h_src = h[src]
+        h_dest = h[dest]
+        mlp_input = jnp.concatenate([h_src, h_dest, x_s[src], x_s[dest], edge_features], axis=-1)
+
+        # 2. Compute scores for all heads in a single pass
+        # vmap is over the edge dimension. The MLP handles the heads.
+        # raw_scores has shape (num_edges, num_heads)
+        raw_scores = jax.vmap(self.attention_mlp)(mlp_input)
 
         raw_scores = jax.nn.leaky_relu(raw_scores)
-        temperature = jnp.sqrt(h.shape[-1])
+        temperature = jnp.sqrt(self.head_size)
         scaled_scores = raw_scores / temperature
-        weights = segment_softmax(scaled_scores, dest, num_nodes)
 
-        weighted_messages = h[src] * weights[:, None]
-        aggregated_messages = jax.ops.segment_sum(weighted_messages, dest, num_nodes)
-        return aggregated_messages, weights
-    
-
-class RevGatingLayer(eqx.Module):
-    """
-    Computes a single hop of reverse (downstream-to-upstream) gated messages.
-    """
-    gate_mlp: eqx.nn.MLP
-
-    def __init__(self, node_hidden_size: int, static_feature_size: int, edge_feature_size: int, *, key: PRNGKeyArray):
-        input_size = (node_hidden_size * 2) + (static_feature_size * 2) + edge_feature_size
-        self.gate_mlp = eqx.nn.MLP(
-            in_size=input_size,
-            out_size=1,
-            width_size=node_hidden_size * 2,
-            depth=1,
-            key=key,
+        # 3. Compute per-head softmax
+        # vmap is over the head dimension of the scores.
+        weights = jax.vmap(segment_softmax, in_axes=(1, None, None), out_axes=1)(
+            scaled_scores, dest, num_nodes
         )
 
-    def __call__(self, h: Array, x_s: Array, edge_index: tuple[Array, Array], edge_features: Array) -> tuple[Array, Array]:
-        num_nodes = h.shape[0]
-        # Note: edge_index is reversed for downstream-to-upstream flow
-        src, dest = edge_index[::-1]
+        # 4. Apply weights to per-head messages
+        # Now we reshape the hidden states to apply per-head weights.
+        h_reshaped = h.reshape(num_nodes, self.num_heads, self.head_size)
+        weighted_messages = h_reshaped[src] * weights[:, :, None]
 
-        mlp_input = jnp.concatenate([h[src], h[dest], x_s[src], x_s[dest], edge_features], axis=-1)
-        raw_scores = jax.vmap(self.gate_mlp)(mlp_input).squeeze(-1)
+        aggregated_messages = jax.vmap(
+            lambda msg: jax.ops.segment_sum(msg, dest, num_nodes), in_axes=1, out_axes=1
+        )(weighted_messages)
+
+        # 5. Combine heads and project
+        aggregated_messages = aggregated_messages.reshape(num_nodes, hidden_size)
+        projected_messages = jax.vmap(self.output_proj)(aggregated_messages)
+
+        return projected_messages, weights
+
+
+class MultiHeadRevGatingLayer(eqx.Module):
+    """Computes reverse gating using a fused MLP for all heads."""
+
+    num_heads: int
+    head_size: int
+    gate_mlp: eqx.nn.MLP
+    output_proj: eqx.nn.Linear
+
+    def __init__(
+        self,
+        num_heads: int,
+        node_hidden_size: int,
+        static_feature_size: int,
+        edge_feature_size: int,
+        *,
+        key: PRNGKeyArray,
+    ):
+        assert node_hidden_size % num_heads == 0, "node_hidden_size must be divisible by num_heads"
+        mlp_key, proj_key = jax.random.split(key)
+
+        self.num_heads = num_heads
+        self.head_size = node_hidden_size // num_heads
+
+        mlp_input_size = (node_hidden_size * 2) + (static_feature_size * 2) + edge_feature_size
+        self.gate_mlp = eqx.nn.MLP(
+            in_size=mlp_input_size,
+            out_size=self.num_heads,  # MLP directly outputs gates for all heads.
+            width_size=node_hidden_size * 2,
+            depth=1,
+            use_bias=False,
+            key=mlp_key,
+        )
+        self.output_proj = eqx.nn.Linear(
+            node_hidden_size, node_hidden_size, use_bias=False, key=proj_key
+        )
+
+    def __call__(
+        self, h: Array, x_s: Array, edge_index: tuple[Array, Array], edge_features: Array
+    ) -> tuple[Array, Array]:
+        num_nodes, hidden_size = h.shape
+        src, dest = edge_index[::-1]  # Reversed for downstream-to-upstream
+
+        h_src = h[src]
+        h_dest = h[dest]
+        mlp_input = jnp.concatenate([h_src, h_dest, x_s[src], x_s[dest], edge_features], axis=-1)
+
+        raw_scores = jax.vmap(self.gate_mlp)(mlp_input)
         gates = jax.nn.sigmoid(raw_scores)
 
-        gated_messages = h[src] * gates[:, None]
-        aggregated_messages = jax.ops.segment_sum(gated_messages, dest, num_nodes)
-        return aggregated_messages, gates
+        h_reshaped = h.reshape(num_nodes, self.num_heads, self.head_size)
+        gated_messages = h_reshaped[src] * gates[:, :, None]
+
+        aggregated_messages = jax.vmap(
+            lambda msg: jax.ops.segment_sum(msg, dest, num_nodes), in_axes=1, out_axes=1
+        )(gated_messages)
+
+        aggregated_messages = aggregated_messages.reshape(num_nodes, hidden_size)
+        projected_messages = jax.vmap(self.output_proj)(aggregated_messages)
+
+        return projected_messages, gates
 
 
-class StackedGAT(eqx.Module):
+class MultiHeadStackedGAT(eqx.Module):
     """
-    Applies k_hops of FwdAttention and RevGating independently, then integrates
-    the results with a GRU-style update. This prevents information from cycling
-    between forward and reverse passes at each hop.
+    Applies k_hops of optimized multi-head FwdAttention and RevGating, then
+    integrates the results with a GRU-style update.
     """
+
     k_hops: int
-    fwd_layers: list[FwdAttentionLayer]
-    rev_layers: list[RevGatingLayer]
+    fwd_layers: list[MultiHeadFwdAttentionLayer]
+    rev_layers: list[MultiHeadRevGatingLayer]
     norm: eqx.nn.LayerNorm
 
-    # GRU-style integration MLPs
     reset_gate_mlp: eqx.nn.MLP
     update_gate_mlp: eqx.nn.MLP
     candidate_mlp: eqx.nn.MLP
@@ -98,6 +175,7 @@ class StackedGAT(eqx.Module):
         static_feature_size: int,
         edge_feature_size: int,
         k_hops: int,
+        num_heads: int,
         *,
         key: PRNGKeyArray,
     ):
@@ -108,45 +186,53 @@ class StackedGAT(eqx.Module):
         r_key, z_key, c_key = jax.random.split(gate_keys, 3)
 
         self.fwd_layers = [
-            FwdAttentionLayer(node_hidden_size, static_feature_size, edge_feature_size, key=k)
+            MultiHeadFwdAttentionLayer(
+                num_heads, node_hidden_size, static_feature_size, edge_feature_size, key=k
+            )
             for k in fwd_keys
         ]
         self.rev_layers = [
-            RevGatingLayer(node_hidden_size, static_feature_size, edge_feature_size, key=k)
+            MultiHeadRevGatingLayer(
+                num_heads, node_hidden_size, static_feature_size, edge_feature_size, key=k
+            )
             for k in rev_keys
         ]
         self.norm = eqx.nn.LayerNorm(node_hidden_size)
 
-        # Integration MLPs are now here
-        gate_input_size = node_hidden_size * 3  # Initial state (x) + fwd_aggr + rev_aggr
-        self.reset_gate_mlp = eqx.nn.MLP(gate_input_size, node_hidden_size, node_hidden_size * 3, 1, key=r_key)
-        self.update_gate_mlp = eqx.nn.MLP(gate_input_size, node_hidden_size, node_hidden_size * 3, 1, key=z_key)
-        self.candidate_mlp = eqx.nn.MLP(gate_input_size, node_hidden_size, node_hidden_size * 3, 1, key=c_key)
+        gate_input_size = node_hidden_size * 3
+        self.reset_gate_mlp = eqx.nn.MLP(
+            gate_input_size, node_hidden_size, node_hidden_size * 3, 1, key=r_key
+        )
+        self.update_gate_mlp = eqx.nn.MLP(
+            gate_input_size, node_hidden_size, node_hidden_size * 3, 1, key=z_key
+        )
+        self.candidate_mlp = eqx.nn.MLP(
+            gate_input_size, node_hidden_size, node_hidden_size * 3, 1, key=c_key
+        )
 
-
-    def __call__(self, x: Array, x_s: Array, edge_index: Array, edge_features: Array) -> tuple[Array, Array, Array, Array, Array]:
+    def __call__(
+        self, x: Array, x_s: Array, edge_index: Array, edge_features: Array
+    ) -> tuple[Array, Array, Array, Array, Array]:
+        # This __call__ method remains unchanged, as the optimizations were
+        # encapsulated within the attention/gating layers.
         fwd_ws, rev_ws = [], []
 
-        # --- Forward Propagation ---
         h_fwd = x
         for layer in self.fwd_layers:
             h_norm = jax.vmap(self.norm)(h_fwd)
             fwd_messages, fwd_w = layer(h_norm, x_s, edge_index, edge_features)
-            h_fwd = h_fwd + fwd_messages  # Residual connection
+            h_fwd = h_fwd + fwd_messages
             fwd_ws.append(fwd_w)
         fwd_ws = jnp.stack(fwd_ws, axis=-1)
 
-        # --- Reverse Propagation ---
         h_rev = x
         for layer in self.rev_layers:
             h_norm = jax.vmap(self.norm)(h_rev)
             rev_messages, rev_w = layer(h_norm, x_s, edge_index, edge_features)
-            h_rev = h_rev + rev_messages  # Residual connection
+            h_rev = h_rev + rev_messages
             rev_ws.append(rev_w)
         rev_ws = jnp.stack(rev_ws, axis=-1)
 
-        # --- Final Gated Integration ---
-        # The "message" is the total change aggregated over k_hops for each path
         fwd_aggregated = h_fwd - x
         rev_aggregated = h_rev - x
 
@@ -159,11 +245,9 @@ class StackedGAT(eqx.Module):
         candidate_input = jnp.concatenate([r_gate * x, messages], axis=-1)
         candidate_state = jnp.tanh(jax.vmap(self.candidate_mlp)(candidate_input))
 
-        # final_h is interpolation of previous and candidate based on gate. 
         final_h = (1 - z_gate) * x + z_gate * candidate_state
 
         return final_h, fwd_ws, rev_ws, z_gate, r_gate
-
 
 
 class SpatioTemporalLSTMCell(eqx.Module):
@@ -173,7 +257,7 @@ class SpatioTemporalLSTMCell(eqx.Module):
     (Note: This implements the temporal-first, spatial-second logic).
     """
 
-    gat: StackedGAT
+    gat: MultiHeadStackedGAT
     lstm_cell: eqx.nn.LSTMCell
     dropout: eqx.nn.Dropout
 
@@ -184,16 +268,18 @@ class SpatioTemporalLSTMCell(eqx.Module):
         static_feature_size: int,
         edge_feature_size: int,
         k_hops: int,
+        num_heads: int,
         dropout_p: float,
         *,
         key: PRNGKeyArray,
     ):
         gat_key, lstm_key = jax.random.split(key)
-        self.gat = StackedGAT(
+        self.gat = MultiHeadStackedGAT(
             node_hidden_size=node_hidden_size,
             static_feature_size=static_feature_size,
             edge_feature_size=edge_feature_size,
             k_hops=k_hops,
+            num_heads=num_heads,
             key=gat_key,
         )
         self.lstm_cell = eqx.nn.LSTMCell(

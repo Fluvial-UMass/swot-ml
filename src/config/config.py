@@ -27,18 +27,18 @@ class Features(BaseModel):
 
 
 class StepKwargs(BaseModel):
-    loss_name: Literal["mse", "mae", "huber", "nse"] = "mse"
+    loss_name: Literal["mse", "mae", "huber", "nse", "spin_up_nse"] = "mse"
     target_weights: list[float] | None = None
     max_grad_norm: float | None = None
     agreement_weight: float = 0.0
 
-    @model_validator(mode='before')
+    @model_validator(mode="before")
     @classmethod
     def check_deprecated_loss(cls, values):
-        if isinstance(values, dict) and 'loss' in values:
+        if isinstance(values, dict) and "loss" in values:
             warnings.warn("'loss' is deprecated. Use 'loss_name' instead.", DeprecationWarning)
             # Only override loss_name if it wasn't explicitly passed
-            values.setdefault('loss_name', values['loss'])
+            values.setdefault("loss_name", values["loss"])
         return values
 
 
@@ -203,6 +203,25 @@ class Config(BaseModel):
             values["persistent_workers"] = values.get("persistent_workers", False)
         return values
 
+    # MODEL / AFTER
+    @model_validator(mode="after")
+    def validate_nse_requires_seq2seq(self):
+        """
+        Ensure that if loss_name == 'nse', then model_args.seq2seq == True.
+        Only checks models that actually have the seq2seq attribute.
+        """
+        if self.step_kwargs.loss_name in ["nse", "spin_up_nse"]:
+            if hasattr(self.model_args, "seq2seq"):
+                if not self.model_args.seq2seq:
+                    raise ValueError(
+                        "When using loss_name='nse', model_args.seq2seq must be set to True."
+                    )
+            else:
+                raise ValueError(
+                    "loss_name='nse' requires a model type with a 'seq2seq' attribute AND seq2seq=True."
+                )
+        return self
+
     # FIELD / BEFORE
     @field_validator("time_slice", mode="before")
     def parse_time_slice(cls, v):
@@ -264,6 +283,7 @@ class Config(BaseModel):
             v.target_weights = [1] * len(cfg["features"].target)
         return v
 
+    # CONFIG MANIPULATION
     def rgetattr(self, attr: str, *args):
         """
         Recursively get attribute from the instance using dot notation.

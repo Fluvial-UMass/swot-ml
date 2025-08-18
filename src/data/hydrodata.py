@@ -4,6 +4,9 @@ import pickle
 import warnings
 import json
 
+# from dataclasses import dataclass
+from typing import NamedTuple, Optional
+
 import yaml
 from tqdm import tqdm
 import pandas as pd
@@ -12,15 +15,30 @@ import networkx as nx
 import numpy as np
 import jax.numpy as jnp
 from torch.utils.data import Dataset
-from typing import NamedTuple
+from jaxtyping import Array
 
 from config import Config, DataSubset
 
 
 class GraphData(NamedTuple):
-    edge_index: jnp.ndarray
-    edge_features: jnp.ndarray
-    node_features: jnp.ndarray
+    edge_index: Array
+    edge_features: Array
+    node_features: Array
+
+
+# @dataclass
+# class GraphData:
+#     edge_index: np.ndarray
+#     edge_features: np.ndarray
+#     node_features: np.ndarray
+
+# @dataclass
+# class BatchData:
+#     dynamic: dict[str, np.ndarray]
+#     static: Optional[np.ndarray] = None
+#     graph: Optional[GraphData] = None
+#     y: Optional[np.ndarray] = None
+#     dynamic_dt: Optional[dict[str, np.ndarray]] = None  # only used in non-graph mode
 
 
 class HydroDataset(Dataset):
@@ -152,8 +170,8 @@ class HydroDataset(Dataset):
 
             # Filter to keep only the necessary features and the target variable if not in inference mode
             features_to_keep = list(itertools.chain(*self.features["dynamic"].values()))
-            if not self.inference_mode:
-                features_to_keep.extend(self.target)
+            # if not self.inference_mode:
+            features_to_keep.extend(self.target)
 
             missing_columns = set(features_to_keep) - set(ds.data_vars)
             if missing_columns:
@@ -390,12 +408,15 @@ class HydroDataset(Dataset):
                 static_ds = self.x_s.sel(basin=basins_da)
                 batch["static"] = np.moveaxis(static_ds.to_array().values, 0, -1)
 
-            # TODO: If we start training with mixes of different basins we will need to fix this.
+            """
+            TODO: If we start training with mixes of different basins we will need to update this. Each entry of the batch
+            will need a copy of graph and then we need to include it in the batch vmap'ing since they can be different.
+            """
             batch["graph"] = self.graph
-            # batch['graph'] = jnp.stack([self.graph] * len(ids))
 
             # Target data. Shape (batch, sequence, nodes, features)
-            if not self.inference_mode:
+            # if not self.inference_mode:
+            if len(self.target) > 0:
                 # Need to mask out data outside the current subset of basins. We need this data in place in the other
                 # input data to make the graphs work, but exclude it here to avoid influencing loss during
                 # training/validation and error etimates during testing.
@@ -491,80 +512,103 @@ class HydroDataset(Dataset):
 
         return ds, onehot_enc
 
-    def _bitmask_expansion(self, ds, feat_group, bitmask_enc: dict | None):
+    def _bitmask_expansion(self, ds: xr.Dataset, feat_group: str, bitmask_enc: dict | None):
         if not bitmask_enc:
-            # Use flattened bitmask_cols from config, filter for columns in ds
+            # Use flattened bitmask_cols from config, filter for columns present in the dataset
             bitmask_cols = [col for col in self.cfg.bitmask_cols if col in ds.data_vars]
             if not bitmask_cols:
                 return ds, None
+            # Initialize encoding. The value for each column will be the list of used bit indices.
             bitmask_enc = {k: None for k in bitmask_cols}
 
-        for col, num_bits in bitmask_enc.items():
-            used_bits = []
+        for col, bits_to_expand in bitmask_enc.items():
+            new_vars = {}
             if col in ds.data_vars:
                 # Get the bitmask integers
-                x = ds[col].values
+                original_da = ds[col]
+                x = original_da.values
                 finite_mask = np.isfinite(x)
+
                 if not np.any(finite_mask):
                     print(
                         f"Warning: No finite values found in column '{col}' for bitmask expansion. "
                         "Skipping bitmask encoding for this column."
                     )
+                    # During training, record that no bits were used for this column.
+                    if bits_to_expand is None:
+                        bitmask_enc[col] = []
                     continue
-                # Temporarily set NaN to 0 for bit ops
+
+                # Temporarily set NaN to 0 for bit operations
                 x_int = np.where(finite_mask, x, 0).astype(int)
-                if not num_bits:
-                    num_bits = int(np.ceil(np.log2(x_int.max())))
-                    bitmask_enc[col] = num_bits
-                # Determine which bits are actually used
-                for n in range(num_bits):
-                    bit_arr = (x_int // 2**n) % 2
-                    if bit_arr[finite_mask].sum() > 0:
-                        used_bits.append(n)
-                # Expand only used bits
-                new_vars = {}
-                for n in used_bits:
+
+                if bits_to_expand is None:  # Training mode: determine which bits to expand
+                    max_val = x_int.max()
+                    num_bits = int(np.ceil(np.log2(max_val + 1))) if max_val > 0 else 0
+
+                    # Determine which bits are actually used in this dataset
+                    used_bits = []
+                    for n in range(num_bits):
+                        bit_arr = (x_int // 2**n) % 2
+                        if bit_arr[finite_mask].sum() > 0:
+                            used_bits.append(n)
+
+                    bitmask_enc[col] = used_bits  # Save the list of used bits
+                    bits_to_expand = used_bits  # Use this list for the current expansion
+
+                # Expand only the determined/prescribed bits
+                for n in bits_to_expand:
                     bit_arr = (x_int // 2**n) % 2
                     bit_arr = bit_arr.astype(float)  # So we can assign np.nan
                     bit_arr[~finite_mask] = np.nan  # Restore NaNs
+
                     new_vars[f"{col}_bit_{n}"] = xr.DataArray(
                         data=bit_arr,
-                        dims=["basin", "date"],
-                        coords={"basin": ds.basin, "date": ds.date},
+                        dims=original_da.dims,
+                        coords=original_da.coords,
                     )
                 # Remove the original categorical column
                 ds = ds.drop_vars(col)
-            else:
-                # If missing, only create columns for used bits if specified, else skip
-                if num_bits is None:
-                    raise ValueError(f"Number of bits for {col} is not specified in the encoding.")
-                # If we don't know which bits are used, assume all bits could be used
-                used_bits = list(range(num_bits))
-                new_vars = {}
-                for n in used_bits:
+
+            else:  # Column is not in the current dataset
+                if bits_to_expand is None:  # Training mode, but column is missing from data.
+                    bitmask_enc[col] = []  # Record that no bits were used.
+                    continue
+
+                # Inference mode, column is missing. Create zero-filled columns for all prescribed bits.
+                for n in bits_to_expand:
+                    # Infer dims/coords from the dataset's coordinates
+                    if feat_group == "dynamic":
+                        dims = ("basin", "date")
+                        coords = {"basin": ds.coords["basin"], "date": ds.coords["date"]}
+                        shape = (len(ds.coords["basin"]), len(ds.coords["date"]))
+                    else:  # static
+                        dims = ("basin",)
+                        coords = {"basin": ds.coords["basin"]}
+                        shape = (len(ds.coords["basin"]),)
+
                     new_vars[f"{col}_bit_{n}"] = xr.DataArray(
-                        data=np.zeros(len(ds.basin), len(ds.date)),
-                        dims=["basin", "date"],
-                        coords={"basin": ds.basin, "date": ds.date},
+                        data=np.zeros(shape),
+                        dims=dims,
+                        coords=coords,
                     )
 
-            ds = xr.merge([ds, xr.Dataset(new_vars)])
+            if new_vars:
+                ds = xr.merge([ds, xr.Dataset(new_vars)])
 
-            # Update encoding to only include used bits
-            bitmask_enc[col] = len(used_bits)
-
-            # Locate the col inside the dynamic features dict, remove and replace.
-            # This is kind of ugly but deals with the 2 level feature dict.
+            # Update the features list with the new bit columns
             if feat_group == "dynamic":
                 for source, source_features in self.features["dynamic"].items():
                     if col in source_features:
                         self.features["dynamic"][source].remove(col)
                         self.features["dynamic"][source].extend(new_vars.keys())
-            else:
-                self.features[feat_group].extend(new_vars.keys())
+            else:  # static
                 if col in self.features[feat_group]:
                     self.features[feat_group].remove(col)
-                else:
+                    self.features[feat_group].extend(new_vars.keys())
+                elif (
+                    new_vars
+                ):  # Only print warning if we actually added columns for a missing feature
                     print(f"{col} not found in {feat_group} features. Encoded as 0s.")
 
         return ds, bitmask_enc

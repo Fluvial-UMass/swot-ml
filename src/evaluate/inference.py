@@ -55,22 +55,21 @@ def model_iterate(
     key = jax.random.PRNGKey(0)
     keys = jax.random.split(key, dataloader.batch_size)
 
-    inference_mode = dataloader.dataset.inference_mode
     for basin, date, batch in tqdm(dataloader, disable=quiet):
         # batch = dataloader.shard_batch(batch)
         y_pred = _model_map(model, batch, keys)
 
         # TODO bandaid for seq2seq models with 4 dimensions.
-        if len(y_pred.shape)==4:
+        if len(y_pred.shape) == 4:
             # Grab the final prediction for now.
-            y_pred = y_pred[:,-1,...]
+            y_pred = y_pred[:, -1, ...]
 
         if denormalize:
             y_pred = dataloader.dataset.denormalize_target(y_pred)
 
         out_dict = {"basin": basin, "date": date, "y_pred": y_pred}
 
-        if not inference_mode:
+        if "y" in batch.keys():
             y = batch["y"][:, -1, ...]
             if denormalize:
                 y = dataloader.dataset.denormalize_target(y)
@@ -124,8 +123,10 @@ def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: 
         basins.extend(result_dict["basin"])
         dates.extend(result_dict["date"])
         y_hat_list.append(result_dict["y_pred"])
+
         if "y" in result_dict.keys():
             y_list.append(result_dict.get("y"))
+
         if "dt" in result_dict.keys():
             dt_list.append(result_dict.get("dt"))
 

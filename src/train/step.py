@@ -33,13 +33,28 @@ def nse_loss(y: Array, y_pred: Array, mask: Array):
     Calculates the smooth-joint NSE from Kratzert et al., 2019
     https://doi.org/10.5194/hess-23-5089-2019
     """
-    # Arrays can be either [batch, basins, time] or [basins, time] depending on model config.
+    # Arrays can be either [batch, time, basins] or [basins, time] depending on model config.
     # Graph models use the former because they need to predict over multiple basins for each step.
     sq_error = jnp.square(y - y_pred) * mask
-    std_y = jnp.std(y, axis=-1, where=mask.astype(bool))  # Per-basin standard deviation
-    se_sum = jnp.sum(sq_error, axis=-1)  # Sum of squared errors per basin
-    denom = jnp.square(std_y + 0.1)  # Denominator with smoothing and epsilon for stability
-    return jnp.mean(se_sum / denom)
+    std_y = jnp.std(y, axis=1, where=mask.astype(bool))  # Per-basin standard deviation
+    mse = jnp.mean(sq_error, axis=1)  # mean squared errors per basin
+    denom = jnp.square(
+        jnp.nan_to_num(std_y) + 0.1
+    )  # Denominator with smoothing and epsilon for stability
+    return jnp.mean(mse / denom)
+
+
+def spin_up_nse_loss(y: Array, y_pred: Array, mask: Array):
+    seq_len = y.shape[1]
+    weights = jax.nn.sigmoid(jnp.linspace(-10, 10, seq_len))
+
+    sq_error = jnp.square(y - y_pred) * mask * weights[None, :, None]
+    std_y = jnp.std(y, axis=1, where=mask.astype(bool))  # Per-basin standard deviation
+    mse = jnp.mean(sq_error, axis=1)  # Sum of squared errors per basin
+    denom = jnp.square(
+        jnp.nan_to_num(std_y) + 0.1
+    )  # Denominator with smoothing and epsilon for stability
+    return jnp.mean(mse / denom)
 
 
 def flux_agreement(y_pred: Array, target_list: list):
@@ -51,7 +66,13 @@ def flux_agreement(y_pred: Array, target_list: list):
     return jnp.mean(jnp.square(rel_error))
 
 
-LOSS_FN_MAP = {"mse": mse_loss, "mae": mae_loss, "huber": huber_loss, "nse": nse_loss}
+LOSS_FN_MAP = {
+    "mse": mse_loss,
+    "mae": mae_loss,
+    "huber": huber_loss,
+    "nse": nse_loss,
+    "spin_up_nse": spin_up_nse_loss,
+}
 
 
 def compute_loss_fn(
@@ -105,9 +126,13 @@ def compute_loss_fn(
 
     # y_pred = jax.vmap(model)(data, keys)
 
-    # NSE calc requires the full time series, not just the final value.
-    if loss_name == "nse":
+    if loss_name in ["nse", "spin_up_nse"]:
+        # NSE calc requires the full time series, not just the final value.
         y = data["y"]
+
+        # Also denormalize the data for better NSE calcs
+        # y_pred = denormalize_fn(y_pred)
+        # y = denormalize_fn(data["y"])
     else:
         y = data["y"][:, -1, ...]  # End of time dimension
 

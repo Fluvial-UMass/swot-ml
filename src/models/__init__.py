@@ -70,10 +70,14 @@ def set_model_data_args(cfg: Config, dataset: HydroDataset):
         cfg.model_args.target = dataset.target
         cfg.model_args.seq_length = cfg.sequence_length
         cfg.model_args.dense_sizes = {
-            k: len(dataset.features["dynamic"][k]) for k, v in dataset.time_gaps.items() if not v
+            k: len(dataset.features["dynamic"][k])
+            for k, has_gaps in dataset.time_gaps.items()
+            if not has_gaps
         }
         cfg.model_args.sparse_sizes = {
-            k: len(dataset.features["dynamic"][k]) for k, v in dataset.time_gaps.items() if v
+            k: len(dataset.features["dynamic"][k])
+            for k, has_gaps in dataset.time_gaps.items()
+            if has_gaps
         }
         cfg.model_args.static_size = len(dataset.features["static"])
 
