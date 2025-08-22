@@ -67,7 +67,7 @@ class StaticMLP(eqx.Module):
             if x_s is None:
                 raise ValueError("Static features `x_s` must be provided when `static_in_size` > 0.")
 
-            # Reshape x_s to be broadcastable with x_d's batch dimensions.
+            # Reshape x_s to be broadcastable with x_d's leading dimensions.
             # E.g., if x_d is (T, N, D_dyn) and x_s is (N, D_stat),
             # this makes x_s compatible for broadcasting to (T, N, D_stat).
             num_extra_dims = x_d.ndim - x_s.ndim
@@ -85,14 +85,9 @@ class StaticMLP(eqx.Module):
         else:
             mlp_input = x_d
 
-        # Define a nested function to adapt the MLP's call signature for vmap.
-        # vmap does not allow the required named key arg. 
-        def mlp_apply(x, k):
-            return self.mlp(x, key=k)
-
         # Dynamically vmap the adapter over all batch dimensions of the input.
-        vmapped_apply = mlp_apply
+        vmapped_apply = self.mlp
         for _ in range(mlp_input.ndim - 1):
-            vmapped_apply = jax.vmap(vmapped_apply, in_axes=(0, None))
+            vmapped_apply = jax.vmap(vmapped_apply)
 
-        return vmapped_apply(mlp_input, key)
+        return vmapped_apply(mlp_input)

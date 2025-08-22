@@ -1,5 +1,4 @@
 import jax
-from jaxtyping import PyTree
 import equinox as eqx
 
 from config import Config
@@ -12,6 +11,7 @@ from config.model_args import (
 )
 from data import HydroDataLoader, HydroDataset
 
+from models.base_model import BaseModel
 from models.lstm_mlp_attn import LSTM_MLP_ATTN
 from models.stacked_lstm import STACKED_LSTM
 from models.ms_attention import MS_ATTN
@@ -101,7 +101,7 @@ def set_model_data_args(cfg: Config, dataset: HydroDataset):
     return cfg
 
 
-def count_parameters(model: PyTree):
+def count_parameters(model: BaseModel):
     """Counts the trainable parameters in a model and estimates its memory usage.
 
     Parameters
