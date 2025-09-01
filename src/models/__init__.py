@@ -5,7 +5,6 @@ from config import Config
 from config.model_args import (
     SeqAttnArgs,
     StackArgs,
-    GraphLSTMArgs,
     MSAttnArgs,
     STGATArgs,
 )
@@ -16,7 +15,6 @@ from models.lstm_mlp_attn import LSTM_MLP_ATTN
 from models.stacked_lstm import STACKED_LSTM
 from models.ms_attention import MS_ATTN
 from models.graph_transformer import ST_GATransformer
-# from models.rg_lstm import Graph_LSTM
 
 
 # Dictionary of valid model names and their constructors
@@ -25,7 +23,6 @@ MODEL_MAP = {
     "stacked_lstm": STACKED_LSTM,
     "ms_attn": MS_ATTN,
     "st_gat": ST_GATransformer,
-    # "graph_lstm": Graph_LSTM,
 }
 
 
@@ -91,11 +88,6 @@ def set_model_data_args(cfg: Config, dataset: HydroDataset):
         cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dyn_feat.items()}
         cfg.model_args.static_size = len(dataset.features["static"])
 
-    elif isinstance(cfg.model_args, GraphLSTMArgs):
-        cfg.model_args.target = dataset.target
-        cfg.model_args.dynamic_size = len(list(dyn_feat.values())[0])
-        cfg.model_args.static_size = len(dataset.features["static"])
-        cfg.model_args.graph_matrix = dataset.graph_matrix
     else:
         raise ValueError(f"Unknown model_args type: {type(cfg.model_args)}")
     return cfg

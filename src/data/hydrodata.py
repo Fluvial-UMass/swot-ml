@@ -342,7 +342,7 @@ class HydroDataset(Dataset):
         mean_dist = np.mean(distances)
         std_dist = np.std(distances)
         # std would be zero if we had a distance-regular graph, such as a fixed grid raster.
-        # We need to check this case and avoid division by zero for safety.
+        # We will check this case and avoid division by zero for safety.
         std_dist = 1 if std_dist == 0 else std_dist
         # TODO: Could implement a basis expansion here for more complex spatial functions
         edge_dist_norm = (distances - mean_dist) / std_dist

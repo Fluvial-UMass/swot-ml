@@ -7,6 +7,8 @@ import pickle
 from tqdm.auto import tqdm
 import warnings
 
+from config import Config
+
 
 def _calculate_ig_single(model, single_input_tree, baseline_tree, target_idx, m_steps):
     """Core Integrated Gradients calculation for one sequence."""
@@ -30,6 +32,8 @@ def _calculate_ig_single(model, single_input_tree, baseline_tree, target_idx, m_
 
     # Calculate gradients at each interpolated step
     # Pytree leaves become shape (m_steps+1, *original_shape)
+    # static_keys = ["graph"]
+    # data_axes_spec = {key: (None if key in static_keys else 0) for key in interpolated_inputs}
     interpolated_grads = jax.vmap(grad_target_output_fn)(interpolated_inputs)
 
     # Average grads using trapezoidal rule approximation
@@ -58,11 +62,19 @@ def _calculate_ig_single(model, single_input_tree, baseline_tree, target_idx, m_
 def _get_batch_ig(model, batch, target_idx, m_steps):
     """Calculate IG attributions for a batch, focusing on last time step of dynamic features."""
     baseline = jax.tree.map(jnp.zeros_like, batch)
+    if 'graph' in baseline.keys():
+        baseline['graph'] = batch['graph']
+
+    # Create an in_axes pytree that matches the batch structure.
+    # Use `None` for static keys and `0` for keys to be batched over.
+    # TODO: If we start training with mixes of different basins we will need to fix this.
+    static_keys = ["graph"]
+    data_axes_spec = {key: (None if key in static_keys else 0) for key in batch}
 
     # Vmap the single calculation over the batch
     batched_ig_fn = jax.vmap(
         _calculate_ig_single,
-        in_axes=(None, 0, 0, None, None),
+        in_axes=(None, data_axes_spec, data_axes_spec, None, None),
     )
     batch_ig_attribs_tree = batched_ig_fn(
         model,
@@ -100,16 +112,23 @@ def _get_batch_predictions(model, batch, target_idx):
     def predict_single(single_input):
         return model(single_input, key=key)[target_idx]
 
-    # Vmap the prediction function over the batch
-    return jax.vmap(predict_single)(batch)
+    
+
+    # Create an in_axes pytree that matches the batch structure.
+    # Use `None` for static keys and `0` for keys to be batched over.
+    # TODO: If we start training with mixes of different basins we will need to fix this.
+    static_keys = ["graph"]
+    axes_spec = {key: (None if key in static_keys else 0) for key in batch}
+    # Vmap the prediction function
+    return jax.vmap(predict_single, in_axes=(axes_spec,))(batch)
 
 
-def get_intgrads_df(cfg, model, dataloader, target, m_steps=50, max_iter=np.inf):
+def get_intgrads_df(cfg: Config, model, dataloader, target, m_steps=50, max_iter=np.inf):
     """
     Calculates feature importance using Integrated Gradients.
 
     Args:
-        cfg: Configuration dictionary.
+        cfg: Configuration object.
         model: The trained Equinox model.
         target: The target variable name.
         m_steps: Number of steps for the IG approximation.
@@ -121,7 +140,7 @@ def get_intgrads_df(cfg, model, dataloader, target, m_steps=50, max_iter=np.inf)
     # Set model to inference mode (no dropout)
     model = eqx.nn.inference_mode(model)
 
-    targets = cfg["features"]["target"]
+    targets = cfg.features.target
     target_idx = targets.index(target)
 
     results = {
@@ -139,7 +158,7 @@ def get_intgrads_df(cfg, model, dataloader, target, m_steps=50, max_iter=np.inf)
     pbar = tqdm(
         dataloader,
         total=n_iter,
-        disable=cfg["quiet"],
+        disable=cfg.quiet,
         desc=f"Calculating IG for {target}",
     )
 
@@ -194,8 +213,8 @@ def get_intgrads_df(cfg, model, dataloader, target, m_steps=50, max_iter=np.inf)
     return final_df
 
 
-def save_all_intgrads(cfg, model, dataloader, save_dir, m_steps=50):
-    for target in cfg["features"]["target"]:
+def save_all_intgrads(cfg: Config, model, dataloader, save_dir, m_steps=50):
+    for target in cfg.features.target:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             data = get_intgrads_df(cfg, model, dataloader, target, m_steps)
