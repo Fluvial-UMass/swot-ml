@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from jaxtyping import Array, PRNGKeyArray
 
+from data import Batch
 from .base_model import BaseModel
 from .layers.transformer import CrossAttnDecoder
 
@@ -32,7 +33,6 @@ class MS_ATTN(BaseModel):
     static_embedder: eqx.nn.Linear
     dynamic_embedders: dict[str : eqx.nn.Linear]
     cross_attn: dict[str:CrossAttnDecoder]
-    # pooler: CrossAttnDecoder
 
     def __init__(
         self,
@@ -140,7 +140,7 @@ class MS_ATTN(BaseModel):
                 raise ValueError(f"Source '{source}' not found in active_source.")
         print(self.active_source)
 
-    def __call__(self, data: dict[str, Array | dict[str, Array]], key: PRNGKeyArray):
+    def __call__(self, data: Batch, key: PRNGKeyArray):
         """The forward pass of the data through the model
 
         Parameters
@@ -158,13 +158,13 @@ class MS_ATTN(BaseModel):
         keys = jrandom.split(key)
 
         # Static embedding
-        static_bias = self.static_embedder(data["static"]) if self.static_embedder else None
+        static_bias = self.static_embedder(data.static) if self.static_embedder else None
 
         # Embed / project the input dimensions into
         data_emb = {}
         masks = {}
         for var_name, embedder in self.dynamic_embedders.items():
-            x = data["dynamic"][var_name]
+            x = data.dynamic[var_name]
             mask = ~jnp.any(jnp.isnan(x), axis=1)
             x_filled = jnp.where(jnp.expand_dims(mask, 1), x, 0.0)
 

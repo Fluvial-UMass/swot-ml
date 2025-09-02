@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from jaxtyping import Array, PRNGKeyArray
 
+from data import Batch
 from .base_model import BaseModel
 from .layers.static_mlp import StaticMLP
 from .layers.ealstm import EALSTM
@@ -165,12 +166,12 @@ class LSTM_MLP_ATTN(BaseModel):
                 raise ValueError(f"Source '{source}' not found in active_source.")
         print(self.active_source)
 
-    def __call__(self, data: dict[str, Array | dict[str, Array]], key: PRNGKeyArray):
+    def __call__(self, data: Batch, key: PRNGKeyArray):
         """The forward pass of the data through the model
 
         Parameters
         ----------
-        data: dict[str, Array | dict[str, Array]]
+        data: Batch
             The input data.
         key: PRNGKeyArray
             A PRNG key used to apply the model.
@@ -183,7 +184,7 @@ class LSTM_MLP_ATTN(BaseModel):
         keys = jrandom.split(key, 3)
 
         # Static embedding
-        static_bias = self.static_embedder(data["static"]) if self.static_embedder else None
+        static_bias = self.static_embedder(data.static) if self.static_embedder else None
 
         # Encoders
         encoder_keys = jrandom.split(keys[0], len(self.encoders))
@@ -194,8 +195,8 @@ class LSTM_MLP_ATTN(BaseModel):
                 encoded_data[var_name] = None
                 continue
 
-            masks[var_name] = ~jnp.any(jnp.isnan(data["dynamic"][var_name]), axis=1)
-            x_d = jnp.where(jnp.expand_dims(masks[var_name], 1), data["dynamic"][var_name], 0.0)
+            masks[var_name] = ~jnp.any(jnp.isnan(data.dynamic[var_name]), axis=1)
+            x_d = jnp.where(jnp.expand_dims(masks[var_name], 1), data.dynamic[var_name], 0.0)
             encoded_data[var_name] = encoder(x_d, static_bias, e_key)
 
         # Decoders
@@ -215,7 +216,6 @@ class LSTM_MLP_ATTN(BaseModel):
                 decoded_list.append(decoded)
 
             pooled_output = jnp.concat(decoded_list, axis=0)
-            # pooled_output = jnp.mean(decoded_list, axis=0)
 
         else:
             # Use self-attention for a single source

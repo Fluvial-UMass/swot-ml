@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import jax.sharding as jshard
+from jaxtyping import Array
 import torch
 from torch.utils.data import DataLoader
 
@@ -31,6 +32,7 @@ class HydroDataLoader(DataLoader):
     def collate_fn(sample):
         # I can't figure out how to just not collate. Can't even use lambdas because of multiprocessing.
         return sample
+    
 
     def set_jax_sharding(self, backend: str | None = None, num_devices: int | None = None):
         """
@@ -84,6 +86,16 @@ class HydroDataLoader(DataLoader):
         batch = jax.tree_util.tree_map_with_path(map_fn, batch)
 
         return batch
+    
+    # Expose these dataset methods for easier use.
+    def denormalize(self, x: Array, name: str):
+        return self.dataset.denormalize(x, name)
+
+    def denormalize_target(self, y_normalized: Array):
+        return self.dataset.denormalize_target(y_normalized)
+
+    def update_indices(self, data_subset: str, basin_subset: list[str] = None):
+        self.dataset.update_indices(data_subset, basin_subset)
 
 
 def _get_available_devices():

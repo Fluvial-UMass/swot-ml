@@ -49,7 +49,7 @@ class ST_GATransformer(BaseModel):
         key = jrandom.PRNGKey(seed)
         keys = list(jrandom.split(key, 10))
 
-        # The model's total output size depends on the hidden_size
+        # initializes linear head and target list
         super().__init__(hidden_size, target, key=keys.pop(0))
 
         self.hidden_size = hidden_size

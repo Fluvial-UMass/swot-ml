@@ -4,23 +4,16 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 from typing import Iterator
-from jaxtyping import Array, PRNGKeyArray
+from jaxtyping import PRNGKeyArray
 
 from data import HydroDataLoader, Batch
 
 
 @eqx.filter_jit
-def _model_map(model, batch: dict[str:Array], keys: list[PRNGKeyArray]):
+def _model_map(model, batch: Batch, keys: list[PRNGKeyArray]):
     """Applies the model to a batch of data using jax.vmap."""
-    # TODO: If we start training with mixes of different basins we will need to fix this.
-    in_axes_data = Batch(
-        dynamic=0,        # Batch over dynamic dict
-        static=0,         # Batch over static  
-        graph_edges=None, # No batching for graph_edges
-        y=0               # Batch over y
-    )
     in_axes_keys = 0
-    y_pred = jax.vmap(model, in_axes=(in_axes_data, in_axes_keys))(batch, keys)
+    y_pred = jax.vmap(model, in_axes=(Batch.in_axes(), in_axes_keys))(batch, keys)
     return y_pred
 
 
@@ -69,22 +62,15 @@ def model_iterate(
             y_pred = y_pred[:, -1, ...]
 
         if denormalize:
-            y_pred = dataloader.dataset.denormalize_target(y_pred)
+            y_pred = dataloader.denormalize_target(y_pred)
 
         out_dict = {"basin": basin, "date": date, "y_pred": y_pred}
 
-        if "y" in batch.keys():
-            y = batch["y"][:, -1, ...]
+        if batch.y is not None:
+            y = batch.y[:, -1, ...]
             if denormalize:
-                y = dataloader.dataset.denormalize_target(y)
+                y = dataloader.denormalize_target(y)
             out_dict["y"] = y
-
-        if "dynamic_dt" in batch.keys():
-            dt_arr = np.stack(
-                [v[:, -1] for v in batch["dynamic_dt"].values()],
-                axis=1,
-            )
-            out_dict["dt"] = dt_arr
 
         yield out_dict
 
@@ -120,7 +106,6 @@ def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: 
     dates = []
     y_hat_list = []
     y_list = []
-    dt_list = []
 
     # Iterate through the dataset, make predictions and collect data in lists.
     for result_dict in model_iterate(model, dataloader, quiet, denormalize):
@@ -130,9 +115,6 @@ def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: 
 
         if "y" in result_dict.keys():
             y_list.append(result_dict.get("y"))
-
-        if "dt" in result_dict.keys():
-            dt_list.append(result_dict.get("dt"))
 
     # Concatenate all the data lists into arrays.
     y_hat_arr = np.concatenate(y_hat_list)
@@ -167,13 +149,5 @@ def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: 
         index=datetime_index,
         columns=column_index,
     )
-
-    # Might break if dt is implemented for graph mode. Not planned.
-    if len(dt_list) > 0:
-        dt_index = pd.MultiIndex.from_product(
-            [["dt"], dataloader.dataset.features["dynamic"].keys()],
-            names=["Type", "Feature"],
-        )
-        results[dt_index] = np.concatenate(dt_list)
 
     return results

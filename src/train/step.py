@@ -47,6 +47,7 @@ def nse_loss(y: Array, y_pred: Array, mask: Array):
 
 
 def spin_up_nse_loss(y: Array, y_pred: Array, mask: Array):
+    "Equivalent to nse_loss but with weights that favor the final ~1/3 of the sequence"
     seq_len = y.shape[1]
     weights = jax.nn.sigmoid(jnp.linspace(-10, 10, seq_len))
 
@@ -120,17 +121,8 @@ def compute_loss_fn(
     """
     model = eqx.combine(diff_model, static_model)
 
-    # TODO: If we start training with mixes of different basins we will need to fix this.
-    in_axes_data = Batch(
-        dynamic=0,        # Batch over dynamic dict
-        static=0,         # Batch over static  
-        graph_edges=None, # No batching for graph_edges
-        y=0               # Batch over y
-    )
     in_axes_keys = 0
-    y_pred = jax.vmap(model, in_axes=(in_axes_data, in_axes_keys))(data, keys)
-
-    # y_pred = jax.vmap(model)(data, keys)
+    y_pred = jax.vmap(model, in_axes=(Batch.in_axes(), in_axes_keys))(data, keys)
 
     if loss_name in ["nse", "spin_up_nse"]:
         # NSE calc requires the full time series, not just the final value.

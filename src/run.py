@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 
-# Required to run multiple processes on Unity for some reason.
+# Required to run multiple processes alongside JAX
 from multiprocessing import set_start_method
-
 try:
     set_start_method("spawn")
 except RuntimeError as e:
-    if "context has already been set" not in str(e):
+    if "context has already been set" in str(e):
+        # Possibly set from environment variables. 
+        pass
+    else:
         raise
 
 import sys
@@ -215,10 +217,10 @@ def hyperparam_smac_optimize(config_path: Path, n_workers: int, n_runs: int):
     from train import update_smac_config, manual_smac_optimize
     from smac.utils.configspace import get_config_hash
 
-    cfg = Config.read_file(config_path)
+    cfg = Config.from_file(config_path)
 
     def target_fun(updates, seed):
-        local_cfg = Config.read_file(updates["cfg_path"])
+        local_cfg = Config.from_file(updates["cfg_path"])
         local_cfg = update_smac_config(local_cfg, updates, seed)
 
         trial_name = get_config_hash(updates)
@@ -296,7 +298,7 @@ def load_prediction_model(run_dir: Path, chunk_idx: int | None = None):
     cfg.data_subset = DataSubset.predict
     cfg.shuffle = False  # No need to shuffle for inference
     if chunk_idx:
-        cfg.basin_file = f"metadata/site_lists/predictions/chunk_{chunk_idx:02}.txt"
+        cfg.test_basin_file = f"metadata/site_lists/predictions/chunk_{chunk_idx:02}.txt"
 
     predict_dataset = HydroDataset(cfg, train_ds=train_dataset, use_cache=False)
 

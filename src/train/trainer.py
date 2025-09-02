@@ -83,10 +83,10 @@ class Trainer:
     model: eqx.Module
     losses: list
     epoch: int
-    optim: optax.GradientTransformation  # Store the optimizer object
+    optim: optax.GradientTransformation
     opt_state: optax.OptState
-    early_stopper: EarlyStopper | None  # Use the specific class
-    filter_spec: PyTree | None  # Can be None if no filter needed
+    early_stopper: EarlyStopper | None  
+    filter_spec: PyTree | None 
     train_key: jax.random.PRNGKey
 
     def __init__(
@@ -279,7 +279,7 @@ class Trainer:
                     self.opt_state,
                     self.optim,
                     self.filter_spec,
-                    self.dataloader.dataset.denormalize_target,
+                    self.dataloader.denormalize_target,
                     **self.cfg.step_kwargs.model_dump(),
                 )
                 if jnp.isnan(loss):
@@ -323,7 +323,7 @@ class Trainer:
     def get_validation_loss(self) -> float:
         # Set model and dataloader for inference
         self.model = eqx.nn.inference_mode(self.model, True)
-        self.dataloader.dataset.update_indices("test")
+        self.dataloader.update_indices("test")
         batch_keys = jax.random.split(self.train_key, self.cfg.batch_size)
         losses = []
         pbar = tqdm(
@@ -336,13 +336,13 @@ class Trainer:
                 static_model,
                 batch,
                 batch_keys,
-                self.dataloader.dataset.denormalize_target,
+                self.dataloader.denormalize_target,
                 **self.cfg.step_kwargs.model_dump(),
             )
             losses.append(loss)
         # Reset model and dataloader for training
         self.model = eqx.nn.inference_mode(self.model, False)
-        self.dataloader.dataset.update_indices("train")
+        self.dataloader.update_indices("train")
         return np.mean(losses)
 
     def freeze_components(self, component_names: list[str] | str = []):

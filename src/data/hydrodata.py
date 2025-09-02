@@ -31,7 +31,17 @@ class Batch(NamedTuple):
             stacklevel=2,
         )
         return getattr(self, key)
-
+    
+    @classmethod
+    def in_axes(cls):
+        # TODO: If we start training with mixes of different basins we will need assign graph_edges to 0 as well.
+        return cls(
+            dynamic=0,
+            static=0,
+            graph_edges=None,
+            y=0,
+        )
+    
 class HydroDataset(Dataset):
     """
     DataLoader class for loading and preprocessing hydrological time series data.
@@ -628,12 +638,12 @@ class HydroDataset(Dataset):
 
         return ds, scale
 
-    def denormalize(self, x: np.ndarray | jnp.ndarray, name: str):
+    def denormalize(self, x: Array, name: str) -> Array:
         """
         Denormalizes a feature or target by its name.
 
         Args:
-            x (np.ndarray or jnp.ndarray): Normalized data.
+            x (Array): Normalized data.
             name (str): Name of the variable to denormalize.
 
         Returns:
@@ -648,11 +658,11 @@ class HydroDataset(Dataset):
         else:
             return x * scale + offset
 
-    def denormalize_target(self, y_normalized: jnp.ndarray) -> jnp.ndarray:
+    def denormalize_target(self, y_normalized: Array) -> Array:
         """
         Denormalizes the target variable(s).
         Returns:
-            np.ndarray or jnp.ndarray: Denormalized target data.
+            Array: Denormalized target data.
         """
         y = jnp.empty_like(y_normalized)
 

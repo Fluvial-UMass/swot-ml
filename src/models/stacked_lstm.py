@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from jaxtyping import Array, PRNGKeyArray
 
+from data import Batch
 from .base_model import BaseModel
 from .layers.lstm import LSTM
 from .layers.bi_lstm import BiLSTM
@@ -68,15 +69,15 @@ class STACKED_LSTM(BaseModel):
         )
         self.head = eqx.nn.Linear(hidden_size, len(out_targets), key=keys[6])
 
-    def __call__(self, data: dict[str, Array | dict[str, Array]], key: PRNGKeyArray):
+    def __call__(self, data: Batch, key: PRNGKeyArray):
         keys = jrandom.split(key, 2)
 
         # Replace NaN values with 0s in the dynamic data
-        x_d = jnp.nan_to_num(data["dynamic"]["era5"], nan=0.0)
+        x_d = jnp.nan_to_num(data.dynamic["era5"], nan=0.0)
         x = jax.vmap(self.in_proj)(x_d)
 
         if self.static_proj:
-            x_s = self.static_proj(data["static"])
+            x_s = self.static_proj(data.static)
             x_s_tiled = jnp.tile(x_s, (x.shape[0], 1))
             x = jnp.concat([x, x_s_tiled], axis=1)
 

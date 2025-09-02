@@ -1,6 +1,7 @@
 import jax.random as jrandom
-from jaxtyping import Array, PRNGKeyArray
+from jaxtyping import PRNGKeyArray
 
+from data import Batch
 from .base_model import BaseModel
 from .layers.ealstm import EALSTM
 
@@ -53,7 +54,7 @@ class EA_LSTM(BaseModel):
             dynamic_sizes[self.dynamic_key], static_size, hidden_size, dropout=dropout, key=keys[1]
         )
 
-    def __call__(self, data: dict[str, Array | dict[str, Array]], key: PRNGKeyArray):
+    def __call__(self, data: Batch, key: PRNGKeyArray):
         """The forward pass of the data through the model
 
         Parameters
@@ -68,6 +69,6 @@ class EA_LSTM(BaseModel):
         Array
             The output of the model.
         """
-        final_state = self.ealstm(data["dynamic"][self.dynamic_key], data["static"], key)
+        final_state = self.ealstm(data.dynamic[self.dynamic_key], data.static, key)
 
         return self.head(final_state)
