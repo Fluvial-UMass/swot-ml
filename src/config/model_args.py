@@ -13,7 +13,6 @@ class BaseModelArgs(BaseModel):
 
 class STGATArgs(BaseModelArgs):
     name: Literal["st_gat"]
-    edge_feature_size: int = Field(..., gt=0)
     k_hops: int = Field(..., gt=0)
     num_heads: int = Field(..., gt=0)
     seq2seq: bool = False

@@ -3,9 +3,7 @@ import itertools
 import pickle
 import warnings
 import json
-
-# from dataclasses import dataclass
-from typing import NamedTuple, Optional
+from dataclasses import dataclass
 
 import yaml
 from tqdm import tqdm
@@ -20,25 +18,20 @@ from jaxtyping import Array
 from config import Config, DataSubset
 
 
-class GraphData(NamedTuple):
-    edge_index: Array
-    edge_features: Array
-    node_features: Array
+@dataclass
+class Batch:
+    dynamic: dict[str, Array]
+    static: Array = None
+    graph_edges: Array = None
+    y: Array = None
 
-
-# @dataclass
-# class GraphData:
-#     edge_index: np.ndarray
-#     edge_features: np.ndarray
-#     node_features: np.ndarray
-
-# @dataclass
-# class BatchData:
-#     dynamic: dict[str, np.ndarray]
-#     static: Optional[np.ndarray] = None
-#     graph: Optional[GraphData] = None
-#     y: Optional[np.ndarray] = None
-#     dynamic_dt: Optional[dict[str, np.ndarray]] = None  # only used in non-graph mode
+    def __getitem__(self, key):
+        warnings.warn(
+            f"Batch: dict-style access ('batch[\"{key}\"]') is deprecated. Use attribute access ('batch.{key}') instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return getattr(self, key)
 
 
 class HydroDataset(Dataset):
@@ -310,51 +303,22 @@ class HydroDataset(Dataset):
 
         return x_s
 
-    def _create_sparse_graph_from_nx(self) -> GraphData:
+    def _create_sparse_graph_from_nx(self) -> Array:
         """
         Converts a networkx graph into a sparse edge index and edge features.
         """
         G = self.nx_graph
-        # Create a mapping from each node's ID to its integer index
-        node_to_int_index = {node: data["original_index"] for node, data in G.nodes(data=True)}
 
-        source_nodes = []
-        dest_nodes = []
-        distances = []
-        for source_id, dest_id, data in G.edges(data=True):
-            if "distance" not in data:
-                raise ValueError(
-                    f"Edge from {source_id} to {dest_id} is missing 'distance' attribute."
-                )
+        # build edge index
+        node_to_int_index = {node: i for i, node in enumerate(G.nodes())}
+        source_nodes, dest_nodes = [], []
 
-            # Map node IDs to their integer indices
+        for source_id, dest_id in G.edges:
             source_nodes.append(node_to_int_index[source_id])
             dest_nodes.append(node_to_int_index[dest_id])
-            distances.append(data["distance"])
-
         edge_index = np.array([source_nodes, dest_nodes], dtype=np.int32)
-        distances = np.array(distances, dtype=np.float32)
 
-        # Normalize the distances to create edge features
-        if np.any(distances <= 0):
-            raise ValueError("Edge distance must be greater than 0.")
-
-        mean_dist = np.mean(distances)
-        std_dist = np.std(distances)
-        # std would be zero if we had a distance-regular graph, such as a fixed grid raster.
-        # We will check this case and avoid division by zero for safety.
-        std_dist = 1 if std_dist == 0 else std_dist
-        # TODO: Could implement a basis expansion here for more complex spatial functions
-        edge_dist_norm = (distances - mean_dist) / std_dist
-
-        node_features = self.x_s.to_array(dim="features").T.values
-
-        GD = GraphData(
-            edge_index=edge_index,
-            edge_features=edge_dist_norm[:, None],
-            node_features=node_features,
-        )
-        return GD
+        return edge_index
 
     def _precompute_date_ranges(self):
         unique_dates = self.x_d["date"].values
@@ -451,6 +415,8 @@ class HydroDataset(Dataset):
         return basins, dates, batch
 
     def _encode_data(self, ds: xr.Dataset, feat_group: str, encoding: dict):
+        assert feat_group in ["dynamic", "static"]
+
         columns_in = ds.data_vars
         one_hot_enc = encoding.get("one_hot") if encoding else None
         bitmask_enc = encoding.get("bitmask") if encoding else None
@@ -465,6 +431,8 @@ class HydroDataset(Dataset):
         return ds, encoding
 
     def _one_hot_encoding(self, ds: xr.Dataset, feat_group, onehot_enc: dict | None):
+        assert feat_group in ["dynamic", "static"]
+
         # Apply one-hot encoding to categorical columns
         if not onehot_enc:
             # Use flattened categorical_cols from config, filter for columns in ds
@@ -503,7 +471,7 @@ class HydroDataset(Dataset):
                     if col in source_features:
                         self.features[feat_group][source].remove(col)
                         self.features[feat_group][source].extend(encoded.columns)
-            else:
+            elif feat_group == "static":
                 self.features[feat_group].extend(encoded.columns)
                 if col in self.features[feat_group]:
                     self.features[feat_group].remove(col)
@@ -513,6 +481,8 @@ class HydroDataset(Dataset):
         return ds, onehot_enc
 
     def _bitmask_expansion(self, ds: xr.Dataset, feat_group: str, bitmask_enc: dict | None):
+        assert feat_group in ["dynamic", "static"]
+
         if not bitmask_enc:
             # Use flattened bitmask_cols from config, filter for columns present in the dataset
             bitmask_cols = [col for col in self.cfg.bitmask_cols if col in ds.data_vars]
@@ -582,7 +552,7 @@ class HydroDataset(Dataset):
                         dims = ("basin", "date")
                         coords = {"basin": ds.coords["basin"], "date": ds.coords["date"]}
                         shape = (len(ds.coords["basin"]), len(ds.coords["date"]))
-                    else:  # static
+                    elif feat_group == "static":
                         dims = ("basin",)
                         coords = {"basin": ds.coords["basin"]}
                         shape = (len(ds.coords["basin"]),)
@@ -602,13 +572,12 @@ class HydroDataset(Dataset):
                     if col in source_features:
                         self.features["dynamic"][source].remove(col)
                         self.features["dynamic"][source].extend(new_vars.keys())
-            else:  # static
+            elif feat_group == "static":
                 if col in self.features[feat_group]:
                     self.features[feat_group].remove(col)
                     self.features[feat_group].extend(new_vars.keys())
-                elif (
-                    new_vars
-                ):  # Only print warning if we actually added columns for a missing feature
+                elif new_vars:
+                    # Only print warning if we actually added columns for a missing feature
                     print(f"{col} not found in {feat_group} features. Encoded as 0s.")
 
         return ds, bitmask_enc
@@ -621,12 +590,14 @@ class HydroDataset(Dataset):
             ds: the input xarray dataset after normalization
             scale: A dictionary containing the 'offset', 'scale', and 'log_norm' for each variable.
         """
+        assert feat_group in ["dynamic", "static"]
+
         if scale is None:
             # Subset the dataset to the training time period
             if feat_group == "dynamic":
                 training_ds = ds.sel(date=slice(None, self.cfg.split_time), basin=self.train_basins)
-            else:
-                training_ds = ds
+            elif feat_group == "static":
+                training_ds = ds.sel(basin=self.train_basins)
 
             # Initialize
             scale = {

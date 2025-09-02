@@ -1,10 +1,12 @@
+from functools import partial
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jrandom
 from jaxtyping import Array, PRNGKeyArray
 
-from data import GraphData
+from data import Batch
 from .base_model import BaseModel
 
 # from .layers.sinusoidal_encoding import sinusoidal_encoding
@@ -41,7 +43,6 @@ class ST_GATransformer(BaseModel):
         num_heads: int,
         seed: int,
         dropout: float,
-        edge_feature_size: int,
         seq2seq: bool,
         return_weights: bool,
     ):
@@ -59,7 +60,7 @@ class ST_GATransformer(BaseModel):
         self.seq2seq = seq2seq
         self.return_weights = return_weights
 
-        # Create embedding MLPs for dynamic sources
+        # Create embedding networks for dynamic sources
         dense_keys = jrandom.split(keys.pop(0), len(self.dense_sources))
         self.dense_embedders = {}
         for (name, size), k in zip(dense_sizes.items(), dense_keys):
@@ -67,6 +68,7 @@ class ST_GATransformer(BaseModel):
                 in_size=size, out_size=hidden_size, width_size=hidden_size, depth=1, key=k
             )
 
+        # Create embedding and assimilation networks for the sparse sources
         sparse_keys = jrandom.split(keys.pop(0), len(self.sparse_sources))
         self.sparse_embedders = {}
         self.sparse_gain_nets = {}
@@ -79,7 +81,7 @@ class ST_GATransformer(BaseModel):
                 out_size=hidden_size,
                 width_size=hidden_size,
                 depth=1,
-                key=k1
+                key=k1,
             )
             self.sparse_gain_nets[name] = eqx.nn.MLP(
                 in_size=2 * hidden_size + 1,  # observation + innovation + staleness
@@ -95,24 +97,21 @@ class ST_GATransformer(BaseModel):
         # The combined GAT-LSTM cell
         self.spat_temp_lstm = SpatioTemporalLSTMCell(
             lstm_input_size=hidden_size,
-            node_hidden_size=hidden_size,
             static_feature_size=static_size,
-            edge_feature_size=edge_feature_size,
+            hidden_size=hidden_size,
             k_hops=k_hops,
             num_heads=num_heads,
             dropout_p=dropout,
             key=keys.pop(0),
         )
 
-    def __call__(
-        self, data: dict[str, Array | GraphData | dict[str, Array]], key: PRNGKeyArray
-    ) -> Array:
-        num_locations = data["graph"].node_features.shape[0]
+    def __call__(self, data: Batch, key: PRNGKeyArray) -> Array:
+        num_locations = data.static.shape[0]
 
         # --- 1. Data Embedding ---
         dense_emb_list = []
         for name in self.dense_sources:
-            features = data["dynamic"][name]
+            features = data.dynamic[name]
             # vmap over first two dimensions (time and location)
             emb_mlp = self.dense_embedders[name]
             dense_emb_list.append(jax.vmap(jax.vmap(emb_mlp))(features))
@@ -122,20 +121,23 @@ class ST_GATransformer(BaseModel):
         obs_emb = {}
         for name in self.sparse_sources:
             # Clean up nans in the dynamic data
-            features = data["dynamic"][name]
-            obs_mask = ~jnp.any(jnp.isnan(features), axis=-1, keepdims=True) 
+            features = data.dynamic[name]
+            obs_mask = ~jnp.any(jnp.isnan(features), axis=-1, keepdims=True)
             safe_features = jnp.nan_to_num(features)
 
             embedding_mlp = self.sparse_embedders[name]
-            emb_vectors = embedding_mlp(safe_features, data['static'])
+            emb_vectors = embedding_mlp(safe_features, data.static)
 
             # Mask the update: if data were NaN, the update vector becomes zero
             masked_obs_emb = jnp.where(obs_mask, emb_vectors, 0.0)
             obs_emb[name] = (masked_obs_emb, obs_mask)
 
         # --- 2. Preprocess the observational memory ---
-        if len(self.sparse_sources)>0:
-            def memory_step(prev_memory: dict[str, Array], updates_masks: dict[str, tuple[Array, Array]]):
+        if len(self.sparse_sources) > 0:
+
+            def memory_step(
+                prev_memory: dict[str, Array], updates_masks: dict[str, tuple[Array, Array]]
+            ):
                 """One step of obs memory tracking."""
                 new_memory = {}
                 for name, (update_emb_t, mask_t) in updates_masks.items():
@@ -153,9 +155,9 @@ class ST_GATransformer(BaseModel):
 
             initial_obs_memory = {
                 name: (
-                    jnp.zeros((num_locations, self.hidden_size)),   # last_obs
-                    jnp.ones((num_locations)) * 1e6,                # staleness
-                    jnp.zeros((num_locations), dtype=jnp.bool_)     # has_been_observed
+                    jnp.zeros((num_locations, self.hidden_size)),  # last_obs
+                    jnp.ones((num_locations)) * 1e6,  # staleness
+                    jnp.zeros((num_locations), dtype=jnp.bool_),  # has_been_observed
                 )
                 for name in self.sparse_sources
             }
@@ -177,21 +179,20 @@ class ST_GATransformer(BaseModel):
                 masked_gain = jnp.where(mask, gain, 0.0)
 
                 h = h + (masked_gain * nu)
-                tracing_weights[name] = {'gain': masked_gain, 'nu': nu}
+                tracing_weights[name] = {"gain": masked_gain, "nu": nu}
 
             return h, tracing_weights
 
         @jax.checkpoint
-        def process_one_timestep(state_prev, scan_slice):
+        def process_one_timestep(state_prev, scan_slice, static_data, graph_edges):
             dense_input, step_obs_memory, step_key = scan_slice
 
             # Recurrent update
-            (h_new, c_new), (trace_data) = self.spat_temp_lstm(
+            (h_new, c_new), (spatial_trace) = self.spat_temp_lstm(
                 dense_input,
                 state_prev,
-                data["graph"].node_features,
-                data["graph"].edge_index,
-                data["graph"].edge_features,
+                static_data,
+                graph_edges,
                 key=step_key,
             )
 
@@ -199,9 +200,9 @@ class ST_GATransformer(BaseModel):
                 h_new, assim_trace = assimilate(h_new, step_obs_memory)
             else:
                 assim_trace = {}
-           
+
             new_state = (h_new, c_new)
-            accumulated_outputs = (h_new, *trace_data, assim_trace)
+            accumulated_outputs = (h_new, *spatial_trace, assim_trace)
             return new_state, accumulated_outputs
 
         # Initial states
@@ -209,11 +210,16 @@ class ST_GATransformer(BaseModel):
         initial_c = jnp.zeros((num_locations, self.hidden_size))
         initial_state = (initial_h, initial_c)
 
+        # Closure of timestep fn with static data.
+        timestep_with_static = partial(
+            process_one_timestep, static_data=data.static, graph_edges=data.graph_edges
+        )
+
         # Scan over the time sequence
         scan_keys = jrandom.split(key, self.seq_length)
         scan_inputs = (dense_emb_norm, obs_memories, scan_keys)
         final_state, accumulated_outputs = jax.lax.scan(
-            process_one_timestep, initial_state, scan_inputs
+            timestep_with_static, initial_state, scan_inputs
         )
         final_h, final_c = final_state
         all_h, fwd_w, rev_w, z, r, assim = accumulated_outputs

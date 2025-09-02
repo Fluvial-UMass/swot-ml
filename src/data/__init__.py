@@ -1,4 +1,4 @@
-from .hydrodata import GraphData, HydroDataset
+from .hydrodata import Batch, HydroDataset
 from .hydroloader import HydroDataLoader
 
-__all__ = [GraphData, HydroDataset, HydroDataLoader]
+__all__ = [Batch, HydroDataset, HydroDataLoader]

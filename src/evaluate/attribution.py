@@ -62,8 +62,8 @@ def _calculate_ig_single(model, single_input_tree, baseline_tree, target_idx, m_
 def _get_batch_ig(model, batch, target_idx, m_steps):
     """Calculate IG attributions for a batch, focusing on last time step of dynamic features."""
     baseline = jax.tree.map(jnp.zeros_like, batch)
-    if 'graph' in baseline.keys():
-        baseline['graph'] = batch['graph']
+    if "graph" in baseline.keys():
+        baseline["graph"] = batch["graph"]
 
     # Create an in_axes pytree that matches the batch structure.
     # Use `None` for static keys and `0` for keys to be batched over.
@@ -111,8 +111,6 @@ def _get_batch_predictions(model, batch, target_idx):
 
     def predict_single(single_input):
         return model(single_input, key=key)[target_idx]
-
-    
 
     # Create an in_axes pytree that matches the batch structure.
     # Use `None` for static keys and `0` for keys to be batched over.

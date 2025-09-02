@@ -26,7 +26,6 @@ class MultiHeadFwdAttentionLayer(eqx.Module):
         num_heads: int,
         node_hidden_size: int,
         static_feature_size: int,
-        edge_feature_size: int,
         *,
         key: PRNGKeyArray,
     ):
@@ -37,7 +36,7 @@ class MultiHeadFwdAttentionLayer(eqx.Module):
         self.head_size = node_hidden_size // num_heads
 
         # MLP input is based on full hidden dimensions, not per-head dimensions.
-        mlp_input_size = (node_hidden_size * 2) + (static_feature_size * 2) + edge_feature_size
+        mlp_input_size = (node_hidden_size * 2) + (static_feature_size * 2)
         self.attention_mlp = eqx.nn.MLP(
             in_size=mlp_input_size,
             out_size=self.num_heads,  # MLP directly outputs scores for all heads.
@@ -51,15 +50,13 @@ class MultiHeadFwdAttentionLayer(eqx.Module):
         )
 
     def __call__(
-        self, h: Array, x_s: Array, edge_index: tuple[Array, Array], edge_features: Array
+        self, h: Array, x_s: Array, edge_index: tuple[Array, Array]
     ) -> tuple[Array, Array]:
         num_nodes, hidden_size = h.shape
         src, dest = edge_index
 
         # 1. Prepare inputs for the fused MLP
-        h_src = h[src]
-        h_dest = h[dest]
-        mlp_input = jnp.concatenate([h_src, h_dest, x_s[src], x_s[dest], edge_features], axis=-1)
+        mlp_input = jnp.concatenate([h[src], h[dest], x_s[src], x_s[dest]], axis=-1)
 
         # 2. Compute scores for all heads in a single pass
         # vmap is over the edge dimension. The MLP handles the heads.
@@ -105,17 +102,17 @@ class MultiHeadRevGatingLayer(eqx.Module):
         num_heads: int,
         node_hidden_size: int,
         static_feature_size: int,
-        edge_feature_size: int,
         *,
         key: PRNGKeyArray,
     ):
         assert node_hidden_size % num_heads == 0, "node_hidden_size must be divisible by num_heads"
+
         mlp_key, proj_key = jax.random.split(key)
 
         self.num_heads = num_heads
         self.head_size = node_hidden_size // num_heads
 
-        mlp_input_size = (node_hidden_size * 2) + (static_feature_size * 2) + edge_feature_size
+        mlp_input_size = (node_hidden_size * 2) + (static_feature_size * 2)
         self.gate_mlp = eqx.nn.MLP(
             in_size=mlp_input_size,
             out_size=self.num_heads,  # MLP directly outputs gates for all heads.
@@ -129,14 +126,12 @@ class MultiHeadRevGatingLayer(eqx.Module):
         )
 
     def __call__(
-        self, h: Array, x_s: Array, edge_index: tuple[Array, Array], edge_features: Array
+        self, h: Array, x_s: Array, edge_index: tuple[Array, Array]
     ) -> tuple[Array, Array]:
         num_nodes, hidden_size = h.shape
         src, dest = edge_index[::-1]  # Reversed for downstream-to-upstream
 
-        h_src = h[src]
-        h_dest = h[dest]
-        mlp_input = jnp.concatenate([h_src, h_dest, x_s[src], x_s[dest], edge_features], axis=-1)
+        mlp_input = jnp.concatenate([h[src], h[dest], x_s[src], x_s[dest]], axis=-1)
 
         raw_scores = jax.vmap(self.gate_mlp)(mlp_input)
         gates = jax.nn.sigmoid(raw_scores)
@@ -171,9 +166,8 @@ class MultiHeadStackedGAT(eqx.Module):
 
     def __init__(
         self,
-        node_hidden_size: int,
         static_feature_size: int,
-        edge_feature_size: int,
+        hidden_size: int,
         k_hops: int,
         num_heads: int,
         *,
@@ -186,32 +180,26 @@ class MultiHeadStackedGAT(eqx.Module):
         r_key, z_key, c_key = jax.random.split(gate_keys, 3)
 
         self.fwd_layers = [
-            MultiHeadFwdAttentionLayer(
-                num_heads, node_hidden_size, static_feature_size, edge_feature_size, key=k
-            )
+            MultiHeadFwdAttentionLayer(num_heads, hidden_size, static_feature_size, key=k)
             for k in fwd_keys
         ]
         self.rev_layers = [
-            MultiHeadRevGatingLayer(
-                num_heads, node_hidden_size, static_feature_size, edge_feature_size, key=k
-            )
+            MultiHeadRevGatingLayer(num_heads, hidden_size, static_feature_size, key=k)
             for k in rev_keys
         ]
-        self.norm = eqx.nn.LayerNorm(node_hidden_size)
+        self.norm = eqx.nn.LayerNorm(hidden_size)
 
-        gate_input_size = node_hidden_size * 3
+        gate_input_size = hidden_size * 3
         self.reset_gate_mlp = eqx.nn.MLP(
-            gate_input_size, node_hidden_size, node_hidden_size * 3, 1, key=r_key
+            gate_input_size, hidden_size, hidden_size * 3, 1, key=r_key
         )
         self.update_gate_mlp = eqx.nn.MLP(
-            gate_input_size, node_hidden_size, node_hidden_size * 3, 1, key=z_key
+            gate_input_size, hidden_size, hidden_size * 3, 1, key=z_key
         )
-        self.candidate_mlp = eqx.nn.MLP(
-            gate_input_size, node_hidden_size, node_hidden_size * 3, 1, key=c_key
-        )
+        self.candidate_mlp = eqx.nn.MLP(gate_input_size, hidden_size, hidden_size * 3, 1, key=c_key)
 
     def __call__(
-        self, x: Array, x_s: Array, edge_index: Array, edge_features: Array
+        self, x: Array, x_s: Array, edge_index: Array
     ) -> tuple[Array, Array, Array, Array, Array]:
         # This __call__ method remains unchanged, as the optimizations were
         # encapsulated within the attention/gating layers.
@@ -220,7 +208,7 @@ class MultiHeadStackedGAT(eqx.Module):
         h_fwd = x
         for layer in self.fwd_layers:
             h_norm = jax.vmap(self.norm)(h_fwd)
-            fwd_messages, fwd_w = layer(h_norm, x_s, edge_index, edge_features)
+            fwd_messages, fwd_w = layer(h_norm, x_s, edge_index)
             h_fwd = h_fwd + fwd_messages
             fwd_ws.append(fwd_w)
         fwd_ws = jnp.stack(fwd_ws, axis=-1)
@@ -228,7 +216,7 @@ class MultiHeadStackedGAT(eqx.Module):
         h_rev = x
         for layer in self.rev_layers:
             h_norm = jax.vmap(self.norm)(h_rev)
-            rev_messages, rev_w = layer(h_norm, x_s, edge_index, edge_features)
+            rev_messages, rev_w = layer(h_norm, x_s, edge_index)
             h_rev = h_rev + rev_messages
             rev_ws.append(rev_w)
         rev_ws = jnp.stack(rev_ws, axis=-1)
@@ -264,9 +252,8 @@ class SpatioTemporalLSTMCell(eqx.Module):
     def __init__(
         self,
         lstm_input_size: int,
-        node_hidden_size: int,
         static_feature_size: int,
-        edge_feature_size: int,
+        hidden_size: int,
         k_hops: int,
         num_heads: int,
         dropout_p: float,
@@ -275,16 +262,15 @@ class SpatioTemporalLSTMCell(eqx.Module):
     ):
         gat_key, lstm_key = jax.random.split(key)
         self.gat = MultiHeadStackedGAT(
-            node_hidden_size=node_hidden_size,
             static_feature_size=static_feature_size,
-            edge_feature_size=edge_feature_size,
+            hidden_size=hidden_size,
             k_hops=k_hops,
             num_heads=num_heads,
             key=gat_key,
         )
         self.lstm_cell = eqx.nn.LSTMCell(
             input_size=lstm_input_size,
-            hidden_size=node_hidden_size,
+            hidden_size=hidden_size,
             key=lstm_key,
         )
         self.dropout = eqx.nn.Dropout(dropout_p)
@@ -293,9 +279,8 @@ class SpatioTemporalLSTMCell(eqx.Module):
         self,
         x_t: Array,
         state: tuple[Array, Array],
-        node_features: Array,
+        node_features: Array,  # x_s
         edge_index: Array,
-        edge_features: Array,
         *,
         key: PRNGKeyArray,
     ) -> tuple[tuple[Array, Array], tuple[Array, Array]]:
@@ -312,7 +297,6 @@ class SpatioTemporalLSTMCell(eqx.Module):
             h_candidate,
             node_features,
             edge_index=edge_index,
-            edge_features=edge_features,
         )
         h_new = self.dropout(gat_out, key=key)
 

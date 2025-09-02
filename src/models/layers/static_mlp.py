@@ -48,7 +48,9 @@ class StaticMLP(eqx.Module):
             key=key,
         )
 
-    def __call__(self, x_d: Array, x_s: Array | None = None, *, key: PRNGKeyArray | None = None) -> Array:
+    def __call__(
+        self, x_d: Array, x_s: Array | None = None, *, key: PRNGKeyArray | None = None
+    ) -> Array:
         """
         Apply the MLP to inputs, optionally concatenating static features first.
 
@@ -65,14 +67,18 @@ class StaticMLP(eqx.Module):
         """
         if self.append_static:
             if x_s is None:
-                raise ValueError("Static features `x_s` must be provided when `static_in_size` > 0.")
+                raise ValueError(
+                    "Static features `x_s` must be provided when `static_in_size` > 0."
+                )
 
             # Reshape x_s to be broadcastable with x_d's leading dimensions.
             # E.g., if x_d is (T, N, D_dyn) and x_s is (N, D_stat),
             # this makes x_s compatible for broadcasting to (T, N, D_stat).
             num_extra_dims = x_d.ndim - x_s.ndim
             if num_extra_dims < 0:
-                raise ValueError("Static features `x_s` cannot have more dimensions than dynamic features `x_d`.")
+                raise ValueError(
+                    "Static features `x_s` cannot have more dimensions than dynamic features `x_d`."
+                )
 
             new_shape = (1,) * num_extra_dims + x_s.shape
             x_s_reshaped = jnp.reshape(x_s, new_shape)
