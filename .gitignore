@@ -1,6 +1,5 @@
 data/*
 runs/*
-notebooks/*
 src/models/needs_updated/
 
 !runs/_examples/

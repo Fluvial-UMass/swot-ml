@@ -5,6 +5,8 @@ import jax.tree_util as jtu
 from jaxtyping import Array, PRNGKeyArray, PyTree
 from typing import Callable
 
+from data import Batch
+
 
 def mse_loss(y: Array, y_pred: Array, mask: Array):
     """Calculates Mean Squared Error (MSE) loss."""
@@ -78,7 +80,7 @@ LOSS_FN_MAP = {
 def compute_loss_fn(
     diff_model: PyTree,
     static_model: PyTree,
-    data: dict[str : Array | dict[str:Array]],
+    data: Batch,
     keys: list[PRNGKeyArray],
     denormalize_fn: Callable,
     *,
@@ -97,7 +99,7 @@ def compute_loss_fn(
         Differential components of the model.
     static_model: PyTree
         Static components of the model.
-    data: dict[str: Array | dict[str: Array]]
+    data: Batch
         Batch of data to use for training.
     keys: list[PRNGKeyArray]
         Batch of keys to use for the random dropout in the model.
@@ -119,8 +121,12 @@ def compute_loss_fn(
     model = eqx.combine(diff_model, static_model)
 
     # TODO: If we start training with mixes of different basins we will need to fix this.
-    static_keys = ["graph"]
-    in_axes_data = {k: (None if k in static_keys and k in data else 0) for k in data}
+    in_axes_data = Batch(
+        dynamic=0,        # Batch over dynamic dict
+        static=0,         # Batch over static  
+        graph_edges=None, # No batching for graph_edges
+        y=0               # Batch over y
+    )
     in_axes_keys = 0
     y_pred = jax.vmap(model, in_axes=(in_axes_data, in_axes_keys))(data, keys)
 
@@ -128,13 +134,9 @@ def compute_loss_fn(
 
     if loss_name in ["nse", "spin_up_nse"]:
         # NSE calc requires the full time series, not just the final value.
-        y = data["y"]
-
-        # Also denormalize the data for better NSE calcs
-        # y_pred = denormalize_fn(y_pred)
-        # y = denormalize_fn(data["y"])
+        y = data.y
     else:
-        y = data["y"][:, -1, ...]  # End of time dimension
+        y = data.y[:, -1, ...]  # End of time dimension
 
     valid_mask = ~jnp.isnan(y)
     masked_y = jnp.where(valid_mask, y, 0)
@@ -183,7 +185,7 @@ def clip_gradients(grads: PyTree, max_norm: float) -> PyTree:
 @eqx.filter_jit
 def make_step(
     model: eqx.Module,
-    data: dict[str : Array | dict[str:Array]],
+    data: Batch,
     keys: list[PRNGKeyArray],
     opt_state: PyTree,
     optim: Callable,
@@ -197,7 +199,7 @@ def make_step(
     ----------
     model: eqx.Module
         Equinox model to train. Must take in a dict of data and PRNGKey.
-    data: dict[str: Array | dict[str: Array]]
+    data: Batch
         The batch of training data.
     keys: list[PRNGKeyArray]
         The PRNG keys for this batch, used by the model for dropout regularization.

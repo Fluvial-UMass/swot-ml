@@ -3,7 +3,7 @@ import itertools
 import pickle
 import warnings
 import json
-from dataclasses import dataclass
+from typing import NamedTuple
 
 import yaml
 from tqdm import tqdm
@@ -18,8 +18,7 @@ from jaxtyping import Array
 from config import Config, DataSubset
 
 
-@dataclass
-class Batch:
+class Batch(NamedTuple):
     dynamic: dict[str, Array]
     static: Array = None
     graph_edges: Array = None
@@ -32,7 +31,6 @@ class Batch:
             stacklevel=2,
         )
         return getattr(self, key)
-
 
 class HydroDataset(Dataset):
     """
@@ -358,59 +356,37 @@ class HydroDataset(Dataset):
         ds = self.x_d.sel(basin=basins_da, date=sequenced_dates_da)
 
         if self.graph_mode:
-            batch = {"dynamic": {}}
-            # Dynamic data. Shape (batch, sequence, nodes, features)
+            dynamic = {}
             for source, col_names in self.features["dynamic"].items():
-                batch["dynamic"][source] = np.moveaxis(
+                dynamic[source] = np.moveaxis(
                     ds[col_names].to_array().values, [0, 1, 3], [-1, 0, 1]
                 )
-                # dt calcs not yet implemented for new dimension. (also not yet needed)
-                # batch['dynamic_dt'][source] = self._calc_var_dt(batch['dynamic'][source])
-
-            # Static data. Shape (batch, nodes, features)
+            static = None
             if self.x_s is not None:
                 static_ds = self.x_s.sel(basin=basins_da)
-                batch["static"] = np.moveaxis(static_ds.to_array().values, 0, -1)
-
-            """
-            TODO: If we start training with mixes of different basins we will need to update this. Each entry of the batch
-            will need a copy of graph and then we need to include it in the batch vmap'ing since they can be different.
-            """
-            batch["graph"] = self.graph
-
-            # Target data. Shape (batch, sequence, nodes, features)
-            # if not self.inference_mode:
+                static = np.moveaxis(static_ds.to_array().values, 0, -1)
+            graph_edges = self.graph
+            y = None
             if len(self.target) > 0:
-                # Need to mask out data outside the current subset of basins. We need this data in place in the other
-                # input data to make the graphs work, but exclude it here to avoid influencing loss during
-                # training/validation and error etimates during testing.
-                y = np.moveaxis(ds[self.target].to_array().values, [0, 1, 3], [-1, 0, 1])
+                y_data = np.moveaxis(ds[self.target].to_array().values, [0, 1, 3], [-1, 0, 1])
                 mask = np.isin(self.all_basins, self.basin_subset)
-                mask = mask[None, None, :, None]  # shape: (1, 1, nodes, 1)
-                batch["y"] = np.where(mask, y, np.nan)
-
+                mask = mask[None, None, :, None]
+                y = np.where(mask, y_data, np.nan)
+            batch = Batch(dynamic=dynamic, static=static, graph_edges=graph_edges, y=y)
         else:
-            batch = {"dynamic": {}, "dynamic_dt": {}}
-            # Dynamic data. Shape (batch, sequence, features)
+            dynamic = {}
+            dynamic_dt = {}
             for source, col_names in self.features["dynamic"].items():
-                batch["dynamic"][source] = np.moveaxis(ds[col_names].to_array().values, 0, -1)
-                batch["dynamic_dt"][source] = self._calc_var_dt(batch["dynamic"][source])
-
-            # Static data. Shape (batch, features)
+                dynamic[source] = np.moveaxis(ds[col_names].to_array().values, 0, -1)
+                dynamic_dt[source] = self._calc_var_dt(dynamic[source])
+            static = None
             if self.x_s is not None:
                 static_ds = self.x_s.sel(basin=basins_da)
-                batch["static"] = np.moveaxis(static_ds.to_array().values, 0, 1)
-
-            # Target data. Shape (batch, sequence, features)
+                static = np.moveaxis(static_ds.to_array().values, 0, 1)
+            y = None
             if not self.inference_mode:
-                batch["y"] = np.moveaxis(ds[self.target].to_array().values, 0, 2)
-
-        # # Testing devices
-        # for source, col_names in self.features['dynamic'].items():
-        #     batch['dynamic'][source] = jnp.array(batch['dynamic'][source])
-        #     batch['dynamic_dt'][source] = jnp.array(batch['dynamic_dt'][source])
-        # batch['static'] = jnp.array(batch['static'])
-        # batch['y'] = jnp.array(batch['y'])
+                y = np.moveaxis(ds[self.target].to_array().values, 0, 2)
+            batch = Batch(dynamic=dynamic, static=static, graph_edges=None, y=y)
 
         return basins, dates, batch
 
