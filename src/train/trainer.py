@@ -85,8 +85,8 @@ class Trainer:
     epoch: int
     optim: optax.GradientTransformation
     opt_state: optax.OptState
-    early_stopper: EarlyStopper | None  
-    filter_spec: PyTree | None 
+    early_stopper: EarlyStopper | None
+    filter_spec: PyTree | None
     train_key: jax.random.PRNGKey
 
     def __init__(

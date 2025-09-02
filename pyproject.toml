@@ -32,7 +32,10 @@ dev = [
 ]
 
 [tool.ruff]
-exclude = ["src/models/needs_updated"]
+exclude = [
+    "src/models/needs_updated",
+    "notebooks"
+]
 line-length = 100
 indent-width = 4
 

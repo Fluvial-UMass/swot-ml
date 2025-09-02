@@ -10,6 +10,7 @@ import warnings
 from config import Config
 from data import Batch
 
+
 def _calculate_ig_single(model, single_input_tree, baseline_tree, target_idx, m_steps):
     """Core Integrated Gradients calculation for one sequence."""
     key = jax.random.PRNGKey(0)

@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field
 import yaml
 
+
 class FinetuneConfig(BaseModel):
     reset_lr: bool = False
     additional_epochs: int = Field(..., gt=0)

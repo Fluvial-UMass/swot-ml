@@ -2,11 +2,12 @@
 
 # Required to run multiple processes alongside JAX
 from multiprocessing import set_start_method
+
 try:
     set_start_method("spawn")
 except RuntimeError as e:
     if "context has already been set" in str(e):
-        # Possibly set from environment variables. 
+        # Possibly set from environment variables.
         pass
     else:
         raise

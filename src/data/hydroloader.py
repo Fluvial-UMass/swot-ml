@@ -32,7 +32,6 @@ class HydroDataLoader(DataLoader):
     def collate_fn(sample):
         # I can't figure out how to just not collate. Can't even use lambdas because of multiprocessing.
         return sample
-    
 
     def set_jax_sharding(self, backend: str | None = None, num_devices: int | None = None):
         """
@@ -86,7 +85,7 @@ class HydroDataLoader(DataLoader):
         batch = jax.tree_util.tree_map_with_path(map_fn, batch)
 
         return batch
-    
+
     # Expose these dataset methods for easier use.
     def denormalize(self, x: Array, name: str):
         return self.dataset.denormalize(x, name)

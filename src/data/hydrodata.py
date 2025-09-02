@@ -31,7 +31,7 @@ class Batch(NamedTuple):
             stacklevel=2,
         )
         return getattr(self, key)
-    
+
     @classmethod
     def in_axes(cls):
         # TODO: If we start training with mixes of different basins we will need assign graph_edges to 0 as well.
@@ -41,7 +41,8 @@ class Batch(NamedTuple):
             graph_edges=None,
             y=0,
         )
-    
+
+
 class HydroDataset(Dataset):
     """
     DataLoader class for loading and preprocessing hydrological time series data.
