@@ -33,6 +33,10 @@ python -c "import jax; print(jax.devices())"
 ```
 Which should show something like ```[CudaDevice(id=0)``` for a single GPU. If JAX can only find your a CPU, it will print ```[CpuDevice(id=0)]```.
 
+If you want to use the code with jupyter notebooks, create an ipython kernel:
+```sh
+ipython kernel install --user --env swot-ml $(pwd)/.venv --name=swot-ml
+```
 
 ### Configuration file
 All options for dataset creation, model hyperparameters, training progress, logging, etc. can be configured in a yaml file. These details are not exhaustively documented, but the [example config files](./runs/_examples/) provide some example uses. The full listing of potential options is only documented in the [the Config validation class](./src/config/config.py). 
