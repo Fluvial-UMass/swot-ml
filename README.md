@@ -11,7 +11,7 @@ which can be fully automated using configuration files and or arguments to the m
 
 ## Setup
 ### Environment
-To train and run these models on your machine, you can use [uv](https://docs.astral.sh/uv/getting-started/) to create a virtual environment and install dependencies from `pyproject.toml`.
+To train and run these models on your machine, you can use [uv](https://docs.astral.sh/uv/getting-started/) to create a virtual environment and install dependencies from `pyproject.toml`. Open a terminal and navigate to the project directory.
 
 Create a new virtual environment with default name
 ```sh
@@ -37,7 +37,7 @@ Which should show something like ```[CudaDevice(id=0)``` for a single GPU. If JA
 ### Configuration file
 All options for dataset creation, model hyperparameters, training progress, logging, etc. can be configured in a yaml file. These details are not exhaustively documented, but the [example config files](./runs/_examples/) provide some example uses. The full listing of potential options is only documented in the [the Config validation class](./src/config/config.py). 
 
-### Set up data files
+### Data files
 You will need at a minimum, two types of data to train the model, with another two types depending on model configuration:
 1. **time series data**: NetCDF (.nc) files representing time-varying but regular interval (even if the observation is NA/missing) with a seperate file for each site. Each dataset must contain a 'date' index. This does not specify any particular frequency. However, even if you are modeling hourly features, these datetimes needs to be named 'date' unless you edit the hard-coded index in [data/hydrodata.py](./src/data/hydrodata.py).
 1. **site lists**: Text (.txt) files indicating which sites (basins, gauges, reaches, etc.) will be used for training and testing. This file contains a new site on each line with no other delimeters.

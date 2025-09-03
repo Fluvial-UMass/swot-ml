@@ -131,9 +131,9 @@ def train_from_config_ensemble(config_path: Path, ensemble_seed: int):
 #
 #     # Read in the finetuning parameters
 #     finetune = read_yml(finetune_yml)
-#     cfg.num_epochs'] = trainer.epoch + finetune.get('additional_epochs', 0)
-#     cfg.transition_begin'] = trainer.epoch if finetune.get('reset_lr') else 0
-#     cfg.cfg_path'] = finetune_yml
+#     cfg.num_epochs = trainer.epoch + finetune.get('additional_epochs', 0)
+#     cfg.transition_begin = trainer.epoch if finetune.get('reset_lr') else 0
+#     cfg.cfg_path = finetune_yml
 #
 #     # Insert these params directly.
 #     cfg.update(finetune.get('config_update', {}))
