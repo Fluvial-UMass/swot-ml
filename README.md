@@ -11,17 +11,22 @@ which can be fully automated using configuration files and or arguments to the m
 
 ## Setup
 ### Environment
-To train and run these models on your machine, you can use [uv](https://github.com/astral-sh/uv) to create a virtual environment and install dependencies from `pyproject.toml`:
+To train and run these models on your machine, you can use [uv](https://docs.astral.sh/uv/getting-started/) to create a virtual environment and install dependencies from `pyproject.toml`.
+
+Create a new virtual environment with default name
 ```sh
-# Create a new virtual environment in .venv
-uv venv .venv
-# Activate the environment (for mac/linux)
+uv venv
+```
+Activate the environment (for mac/linux)
+```sh
 source .venv/bin/activate
-# Install the dependencies in editable mode with dev packages
+```
+Install the dependencies in editable mode with dev packages
+```
 uv pip install -e .[dev]
 ```
 
-JAX and CUDA support will be installed automatically from `pyproject.toml` but your system will still need the correct NVIDIA drivers.
+JAX with CUDA support will be installed automatically from `pyproject.toml` but your system will still need the correct CUDA drivers.
 You can check that JAX can locate your GPU using this command (while the virtual environment is activated):
 ```sh
 python -c "import jax; print(jax.devices())"
@@ -30,7 +35,7 @@ Which should show something like ```[CudaDevice(id=0)``` for a single GPU. If JA
 
 
 ### Configuration file
-All options for dataset creation, model hyperparameters, training progress, logging, etc. can be configured in a yaml file. These details are not exhaustively documented, but the [example config files](./runs/_examples/) provide an overview of what is possible. This structure was inspired by [NeuralHydrology](https://neuralhydrology.readthedocs.io/en/latest/usage/config.html) although the implementation is fairly different. 
+All options for dataset creation, model hyperparameters, training progress, logging, etc. can be configured in a yaml file. These details are not exhaustively documented, but the [example config files](./runs/_examples/) provide some example uses. The full listing of potential options is only documented in the [the Config validation class](./src/config/config.py). 
 
 ### Set up data files
 You will need at a minimum, two types of data to train the model, with another two types depending on model configuration:
@@ -39,7 +44,7 @@ You will need at a minimum, two types of data to train the model, with another t
 1. **attributes** (optional): a comma-separated value (.csv) file with static attributes for each site. Only required if you specify static attributes in your configuration.
 1. **graph network** (optional): A networkx directed graph in json format. The only data used from this graph are the edge definitions, although the node (and thus edge end points), need to be identical to the sites. Must contain all sites. Only required for certain models, and should only be specified in the configuration file if needed by the model. 
 
-The recommended structure of the data directory is as follows, with some allowance for differences defined in the [config validator](./src/config/config.py). 
+The recommended structure of the data directory is as follows, with some allowance for differences defined in the [Config validator](./src/config/config.py). 
 ```
 <data_dir>/
 ├── attributes/
