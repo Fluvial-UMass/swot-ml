@@ -23,7 +23,7 @@ source .venv/bin/activate
 ```
 Install the dependencies to your new venv in editable mode with dev packages
 ```
-pip install -e .[dev]
+uv pip install -e .[dev]
 ```
 
 JAX with CUDA support will be installed automatically from `pyproject.toml` but your system will still need the correct CUDA drivers.
@@ -39,7 +39,7 @@ python -m ipykernel install --user --name=swot-ml
 ```
 
 ### Configuration file
-All options for dataset creation, model hyperparameters, training progress, logging, etc. can be configured in a yaml file. These details are not exhaustively documented, but the [example config files](./runs/_examples/) provide some example uses. The full listing of potential options is only documented in the [the Config validation class](./src/config/config.py). 
+All options for dataset creation, model hyperparameters, training progress, logging, etc. can be configured in a yaml file. These details are not exhaustively documented, but the [example config files](./runs/_examples/) provide some example uses. The full listing of pouv tential options is only documented in the [the Config validation class](./src/config/config.py). 
 
 ### Data files
 You will need at a minimum, two types of data to train the model, with another two types depending on model configuration:

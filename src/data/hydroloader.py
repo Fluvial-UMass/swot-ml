@@ -86,7 +86,7 @@ class HydroDataLoader(DataLoader):
 
         return batch
 
-    # Expose these dataset methods for easier use.
+    # Expose these dataset methods for convenience.
     def denormalize(self, x: Array, name: str):
         return self.dataset.denormalize(x, name)
 

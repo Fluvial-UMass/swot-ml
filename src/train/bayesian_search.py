@@ -1,16 +1,13 @@
 from pathlib import Path
-
-import ConfigSpace as CS
-import ConfigSpace.hyperparameters as CSH
-from smac import BlackBoxFacade, Scenario
-from smac.main.config_selector import ConfigSelector
-from smac.runhistory.dataclasses import TrialValue
 from dask_jobqueue import SLURMCluster
 from distributed import as_completed
 
 
 def _create_configspace(cfg):
     """Creates a ConfigSpace object from a parameter dictionary."""
+    import ConfigSpace as CS
+    import ConfigSpace.hyperparameters as CSH
+
     cs = CS.ConfigurationSpace()
     cs.add(CSH.Constant("cfg_path", value=str(cfg["cfg_path"])))
     for param_name, param in cfg["param_search_dict"].items():
@@ -70,6 +67,9 @@ def get_dask_client(cfg, n_workers):
 
 
 def get_smac_facade(cfg, target_fun, n_runs):
+    from smac import BlackBoxFacade, Scenario
+    from smac.main.config_selector import ConfigSelector
+
     configspace = _create_configspace(cfg)
     path = Path(cfg["cfg_path"])
     scenario = Scenario(
@@ -87,8 +87,9 @@ def get_smac_facade(cfg, target_fun, n_runs):
     )
     return facade
 
-
 def manual_smac_optimize(cfg: dict, n_workers: int, n_runs: int, target_fun):
+    from smac.runhistory.dataclasses import TrialValue
+
     client = get_dask_client(cfg, n_workers)
     facade = get_smac_facade(cfg, target_fun, n_runs)
     initial_params = [facade.ask() for _ in range(n_workers)]

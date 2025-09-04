@@ -311,10 +311,8 @@ class Config(BaseModel):
                 full_key = f"{prefix}.{k}" if prefix else k
                 if isinstance(v, dict):
                     yield from flatten_param_dict(v, full_key)
-                elif isinstance(v, list):
-                    yield full_key, v
                 else:
-                    raise ValueError(f"Invalid type at {full_key}: {type(v).__name__}")
+                    yield full_key, v
 
         dotted_keys, value_set = zip(*flatten_param_dict(param_dict))
 
