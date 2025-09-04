@@ -13,7 +13,7 @@ which can be fully automated using configuration files and or arguments to the m
 ### Environment
 To train and run these models on your machine, you can use [uv](https://docs.astral.sh/uv/getting-started/) to create a virtual environment and install dependencies from `pyproject.toml`. Open a terminal and navigate to the project directory.
 
-Create a new virtual environment with default name
+Create a new virtual environment (venv) with default name
 ```sh
 uv venv
 ```
@@ -21,9 +21,9 @@ Activate the environment (for mac/linux)
 ```sh
 source .venv/bin/activate
 ```
-Install the dependencies in editable mode with dev packages
+Install the dependencies to your new venv in editable mode with dev packages
 ```
-uv pip install -e .[dev]
+pip install -e .[dev]
 ```
 
 JAX with CUDA support will be installed automatically from `pyproject.toml` but your system will still need the correct CUDA drivers.
@@ -33,9 +33,9 @@ python -c "import jax; print(jax.devices())"
 ```
 Which should show something like ```[CudaDevice(id=0)``` for a single GPU. If JAX can only find your a CPU, it will print ```[CpuDevice(id=0)]```.
 
-If you want to use the code with jupyter notebooks, create an ipython kernel:
+If you want to use the code with jupyter notebooks, install the new environment as an ipython kernel:
 ```sh
-ipython kernel install --user --env swot-ml $(pwd)/.venv --name=swot-ml
+python -m ipykernel install --user --name=swot-ml
 ```
 
 ### Configuration file
