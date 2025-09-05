@@ -23,6 +23,9 @@ dependencies = [
     "xarray>=2025.6.1",
 ]
 
+[tool.uv]
+package = true
+
 [tool.ruff]
 exclude = [
     "src/models/needs_updated",
