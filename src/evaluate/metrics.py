@@ -205,7 +205,7 @@ def calc_kge(y, y_hat):
 
 @mask_nan
 def calc_nse(y, y_hat):
-    denominator = ((y_hat - y_hat.mean()) ** 2).sum()
+    denominator = ((y - y.mean()) ** 2).sum()
     numerator = ((y - y_hat) ** 2).sum()
     if denominator == 0:
         return np.nan

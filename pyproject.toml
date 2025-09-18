@@ -5,8 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "dask>=2025.7.0",
+    "deltalake>=1.1.4",
     "equinox>=0.12.2",
     "geopandas>=1.1.0",
+    "h5netcdf>=1.6.4",
+    "h5py>=3.14.0",
     "jax[cuda12]<0.6.0",
     "matplotlib>=3.10.3",
     "netcdf4>=1.7.2",
@@ -17,10 +21,12 @@ dependencies = [
     "pyarrow>=20.0.0",
     "pydantic>=2.11.7",
     "scikit-learn>=1.7.0",
+    "tables>=3.10.2",
     "torch>=2.0.1",
     "tqdm>=4.67.1",
     "typer>=0.16.0",
     "xarray>=2025.6.1",
+    "zarr>=3.1.2",
 ]
 
 [tool.uv]

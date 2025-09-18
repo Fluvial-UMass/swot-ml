@@ -1,6 +1,4 @@
 from pathlib import Path
-from dask_jobqueue import SLURMCluster
-from distributed import as_completed
 
 
 def _create_configspace(cfg):
@@ -37,6 +35,8 @@ def update_smac_config(base_cfg, updates, seed):
 
 
 def get_dask_client(cfg, n_workers):
+    from dask_jobqueue import SLURMCluster
+
     path = Path(cfg["cfg_path"])
     cluster = SLURMCluster(
         job_name="dask-" + path.stem,
@@ -87,7 +87,9 @@ def get_smac_facade(cfg, target_fun, n_runs):
     )
     return facade
 
+
 def manual_smac_optimize(cfg: dict, n_workers: int, n_runs: int, target_fun):
+    from distributed import as_completed
     from smac.runhistory.dataclasses import TrialValue
 
     client = get_dask_client(cfg, n_workers)

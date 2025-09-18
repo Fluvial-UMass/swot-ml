@@ -143,7 +143,7 @@ class Config(BaseModel):
     timeout: int = Field(..., ge=0)
     persistent_workers: bool
     pin_memory: bool = False
-    drop_last: bool = False
+    drop_last: bool = True
     backend: Literal["cpu", "gpu", "tpu"] | None = None
     num_devices: int | None = Field(None, gt=0)
 
