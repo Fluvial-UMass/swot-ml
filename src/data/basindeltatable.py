@@ -1,5 +1,4 @@
 import os
-import shutil
 from pathlib import Path
 
 # Suppress 'warn' and 'info' messages from the Rust backend.
@@ -16,7 +15,7 @@ from deltalake.exceptions import TableNotFoundError
 
 
 class BasinDeltaTable:
-    def __init__(self, root_dir: str, overwrite: bool = False):
+    def __init__(self, root_dir: str):
         """
         Initialize or open a hydrological dataset using Delta Lake.
 
@@ -31,10 +30,6 @@ class BasinDeltaTable:
         self.table_uri = str(self.root / "dynamic_data")
         self.metadata_uri = str(self.root / "processing_metadata")
         self.static_file = self.root / "static.parquet"
-
-        if self.root.is_dir() and overwrite:
-            print(f"Overwriting. Deleting directory: {self.root}")
-            shutil.rmtree(self.root)
 
         self.root.mkdir(parents=True, exist_ok=True)
 
@@ -56,64 +51,108 @@ class BasinDeltaTable:
     # -------------------------------
     # Dynamic data (using DeltaTable)
     # -------------------------------
-    def upsert_dynamic(self, basin: str, subbasin: str, source: str, data: pd.DataFrame | None):
-        """
-        Updates/inserts dynamic time series data into the Delta table.
+    def _prepare_dynamic_df(
+        self, basin: str, source: str, data: dict[str, pd.DataFrame | None]
+    ) -> pd.DataFrame | None:
+        """Pre-processes input data dictionary into a single DataFrame for writing."""
+        if not isinstance(data, dict):
+            raise TypeError("'data' must be a dictionary mapping subbasin IDs to DataFrames.")
 
-        This method uses a merge operation to prevent duplicate records. It inserts
-        new rows and updates existing rows if a match is found based on the
-        unique combination of subbasin, date, and source.
-        """
-        if data is None or data.empty:
-            self._mark_processed(basin, subbasin, source, False)
-            return
+        dfs_to_concat = []
+        for subbasin_id, sub_df in data.items():
+            if sub_df is not None and not sub_df.empty:
+                df_copy = sub_df.copy()
+                df_copy["subbasin"] = subbasin_id
+                dfs_to_concat.append(df_copy)
 
-        if not isinstance(data.index, pd.DatetimeIndex):
+        if not dfs_to_concat:
+            return None
+
+        df = pd.concat(dfs_to_concat)
+
+        if not isinstance(df.index, pd.DatetimeIndex):
             raise ValueError("Data must be indexed by a pandas.DatetimeIndex.")
+        df.index = (
+            df.index.tz_localize("UTC") if df.index.tz is None else df.index.tz_convert("UTC")
+        )
 
-        # Prepare the source DataFrame with necessary columns
-        df = data.copy()
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        else:
-            df.index = df.index.tz_convert("UTC")
-
-        df["date"] = df.index
+        df.index.name = "date"
+        df.reset_index(inplace=True)
         df["year"] = df["date"].dt.year
         df["basin"] = basin
-        df["subbasin"] = subbasin
         df["source"] = source
+        return df
+
+    def write_dynamic(
+        self,
+        basin: str,
+        source: str,
+        data: dict[str, pd.DataFrame | None],
+        mode: str = "upsert",
+    ):
+        """
+        Writes dynamic time series data using either 'upsert' or 'append' mode.
+
+        Parameters
+        ----------
+        basin : str
+            The basin identifier.
+        source : str
+            The data source identifier.
+        data : dict[str, pd.DataFrame | None]
+            Dictionary mapping subbasin IDs to DataFrames.
+        mode : str, optional
+            Write mode: 'upsert' (default) performs a merge, 'append' performs a
+            fast append without checking for duplicates.
+        """
+        if mode not in ["upsert", "append"]:
+            raise ValueError("Mode must be either 'upsert' or 'append'.")
+
+        df = self._prepare_dynamic_df(basin, source, data)
+
+        # If df is None, only update metadata and exit.
+        if df is None:
+            if mode == "append":
+                self._append_processed_record(basin, source, data)
+            else:
+                self._upsert_processed_record(basin, source, data)
+            return
 
         partition_cols = ["basin", "year", "source"]
+
         try:
-            # 1. Attempt to load the table and merge
-            dt = DeltaTable(self.table_uri)
-            source_table = pa.Table.from_pandas(df.reset_index(drop=True))
-
-            predicate = "t.subbasin = s.subbasin AND t.date = s.date AND t.source = s.source"
-
-            (
-                dt.merge(
-                    source=source_table,
-                    predicate=predicate,
-                    source_alias="s",
-                    target_alias="t",
+            if mode == "append":
+                write_deltalake(
+                    self.table_uri,
+                    df,
+                    mode="append",
+                    partition_by=partition_cols,
+                    schema_mode="merge",
                 )
-                .when_matched_update_all()
-                .when_not_matched_insert_all()
-                .execute()
-            )
+                self._append_processed_record(basin, source, data)
 
-        except TableNotFoundError:
-            # 2. If the table doesn't exist, create it with the first write
-            print(f"Table not found at {self.table_uri}. Creating new Delta table.")
-            write_deltalake(
-                self.table_uri,
-                df.reset_index(drop=True),
-                mode="append",  # 'append' is fine here since the table is new
-                partition_by=partition_cols,
-            )
-        self._mark_processed(basin, subbasin, source, True)
+            else:  # mode == "upsert"
+                try:
+                    dt = DeltaTable(self.table_uri)
+                    for _, df_group in df.groupby(partition_cols):
+                        source_table = pa.Table.from_pandas(df_group)
+                        predicate = (
+                            "t.subbasin = s.subbasin AND t.date = s.date AND t.source = s.source"
+                        )
+                        dt.merge(
+                            source=source_table,
+                            predicate=predicate,
+                            source_alias="s",
+                            target_alias="t",
+                        ).when_matched_update_all().when_not_matched_insert_all().execute()
+                    self._upsert_processed_record(basin, source, data)
+                except TableNotFoundError:
+                    print(f"Table not found at {self.table_uri}. Creating new Delta table.")
+                    write_deltalake(self.table_uri, df, mode="append", partition_by=partition_cols)
+                    self._upsert_processed_record(basin, source, data)
+        except Exception as e:
+            print(f"Failed to {mode} data for basin {basin}, source {source}. Error: {e}")
+            raise
 
     def read_dynamic(
         self,
@@ -123,14 +162,13 @@ class BasinDeltaTable:
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> pd.DataFrame:
-        """Read dynamic data from the Delta table with filters."""
+        # This method remains unchanged
         try:
             dt = DeltaTable(self.table_uri)
-        except Exception:  # TableNotFoundError is not yet in the public API
+        except TableNotFoundError:
             print("Dynamic data table not found. Returning empty DataFrame.")
             return pd.DataFrame()
 
-        # Build filters for efficient predicate pushdown
         filters = []
         if basin:
             filters.append(("basin", "=", basin))
@@ -144,74 +182,62 @@ class BasinDeltaTable:
             filters.append(("date", "<=", pd.Timestamp(end_date, tz="UTC")))
 
         df = dt.to_pandas(filters=filters if filters else None)
-        if df.empty:
-            return df
-
-        return df.set_index("date").sort_index()
+        return df if df.empty else df.set_index("date").sort_index()
 
     # -------------------------------
     # Processing metadata table
     # -------------------------------
-    def _mark_processed(self, basin: str, subbasin: str, source: str, has_data: bool = True):
-        """
-        Mark a basin/subbasin/source combination as processed.
+    def _prepare_metadata_df(
+        self, basin: str, source: str, data: dict[str, pd.DataFrame | None]
+    ) -> pd.DataFrame | None:
+        """Creates a DataFrame of metadata records from the input data dict."""
+        subbasins = list(data.keys())
+        if not subbasins:
+            return None
 
-        Parameters
-        ----------
-        basin : str
-            Basin identifier
-        subbasin : str
-            Subbasin identifier
-        source : str
-            Data source identifier
-        has_data : bool
-            Whether this combination actually contains data
-        """
-        metadata_row = pd.DataFrame(
-            [
-                {
-                    "basin": basin,
-                    "subbasin": subbasin,
-                    "source": source,
-                    "processed_at": pd.Timestamp.now(tz="UTC"),
-                    "has_data": has_data,
-                }
-            ]
+        has_data_map = {sb: (df is not None and not df.empty) for sb, df in data.items()}
+        now = pd.Timestamp.now(tz="UTC")
+        metadata_rows = [
+            {
+                "basin": basin,
+                "subbasin": sb,
+                "source": source,
+                "processed_at": now,
+                "has_data": has_data_map.get(sb, False),
+            }
+            for sb in subbasins
+        ]
+        return pd.DataFrame(metadata_rows)
+
+    def _append_processed_record(self, basin: str, source: str, data: dict):
+        """Naively appends records to the processing metadata table."""
+        metadata_df = self._prepare_metadata_df(basin, source, data)
+        if metadata_df is None:
+            return
+
+        write_deltalake(
+            self.metadata_uri, metadata_df, mode="append", partition_by=["basin", "source"]
         )
 
+    def _upsert_processed_record(self, basin: str, source: str, data: dict):
+        """Merges records into the processing metadata table."""
+        metadata_df = self._prepare_metadata_df(basin, source, data)
+        if metadata_df is None:
+            return
+
         try:
-            # Try to upsert into existing metadata table
             dt = DeltaTable(self.metadata_uri)
-            source_table = pa.Table.from_pandas(metadata_row)
-
+            source_table = pa.Table.from_pandas(metadata_df)
             predicate = "t.basin = s.basin AND t.subbasin = s.subbasin AND t.source = s.source"
-
-            (
-                dt.merge(
-                    source=source_table,
-                    predicate=predicate,
-                    source_alias="s",
-                    target_alias="t",
-                )
-                .when_matched_update_all()
-                .when_not_matched_insert_all()
-                .execute()
-            )
+            dt.merge(
+                source=source_table, predicate=predicate, source_alias="s", target_alias="t"
+            ).when_matched_update_all().when_not_matched_insert_all().execute()
         except TableNotFoundError:
-            # Create new metadata table
             write_deltalake(
-                self.metadata_uri, metadata_row, mode="append", partition_by=["basin", "source"]
+                self.metadata_uri, metadata_df, mode="append", partition_by=["basin", "source"]
             )
 
     def is_processed(self, basin: str, subbasin: str, source: str) -> bool:
-        """
-        Check if a basin/subbasin/source combination has been processed.
-
-        Returns
-        -------
-        bool
-            True if already processed, False otherwise
-        """
         try:
             dt = DeltaTable(self.metadata_uri)
             df = dt.to_pandas(
@@ -221,26 +247,11 @@ class BasinDeltaTable:
                     ("source", "=", source),
                 ]
             )
-            return len(df) > 0
+            return not df.empty
         except TableNotFoundError:
             return False
 
     def get_processing_status(self, basin: str = None, source: str = None) -> pd.DataFrame:
-        """
-        Get processing status for basin/source combinations.
-
-        Parameters
-        ----------
-        basin : str, optional
-            Filter by basin
-        source : str, optional
-            Filter by source
-
-        Returns
-        -------
-        pd.DataFrame
-            Processing status information
-        """
         try:
             dt = DeltaTable(self.metadata_uri)
             filters = []
@@ -248,7 +259,6 @@ class BasinDeltaTable:
                 filters.append(("basin", "=", basin))
             if source:
                 filters.append(("source", "=", source))
-
             return dt.to_pandas(filters=filters if filters else None)
         except TableNotFoundError:
             return pd.DataFrame(columns=["basin", "subbasin", "source", "processed_at", "has_data"])
@@ -256,31 +266,29 @@ class BasinDeltaTable:
     # -------------------------------
     # Maintenance Operations
     # -------------------------------
-    def compact(self):
+    def optimize(self):
         """
         Compact small files within partitions into larger ones.
 
         This is the solution to the "small file problem" and should be run
         periodically to optimize read performance.
         """
+        def print_stats(stats):
+            n_added = stats["numFilesAdded"]
+            n_removed = stats["numFilesRemoved"]
+            print(f"\tReduced file count by: {n_removed - n_added} ({n_added=}, {n_removed=}).")
 
-        def _compact(uri, name):
-            dt = DeltaTable(uri)
-            print(f"Compacting {name}...")
-            stats = dt.optimize.compact()
+        dt = DeltaTable(self.metadata_uri)
+        print("Compacting processing metadata...")
+        stats = dt.optimize.compact()
+        print_stats(stats)
 
-            n_removed = stats["numFilesAdded"]
-            n_added = stats["numFilesRemoved"]
-            print(
-                f"\tReduced file count by: {n_added - n_removed} (files added: {n_added}, files removed: {n_removed})."
-            )
-            return dt
-
-        _compact(self.metadata_uri, "processing metadata")
-        dt = _compact(self.table_uri, "dynamic_data")
         # z_order optimization co-locates related data in the same files,
         # dramatically speeding up queries that filter by the specified columns.
-        dt.optimize.z_order(["subbasin", "date"])
+        dt = DeltaTable(self.table_uri)
+        print("Compacting and ordering dynamic data...")
+        stats = dt.optimize.z_order(["subbasin", "date"])
+        print_stats(stats)
 
         self.vacuum()
 
@@ -289,7 +297,7 @@ class BasinDeltaTable:
         Physically delete files that are no longer referenced by the table.
 
         This is a destructive action. It should be run after compaction to clean up
-        storage. By default, Delta Lake has a retention period (usually 7 days)
+        storage. By default, Delta Lake has a retention period of 7 days
         to prevent accidental deletion of data needed for time travel.
         """
 

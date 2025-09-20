@@ -16,25 +16,25 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 from dask.distributed import Client, as_completed
 from dask_jobqueue import SLURMCluster
 from sklearn.cluster import KMeans
+from data import BasinDeltaTable
 
 e5_dir = Path("/nas/cee-water/cjgleason/data/ERA5-Land/")
 
 
-def create_spatial_batches(gdf, index_name, n_batches):
+def create_spatial_batches(gdf, batch_size):
     """
     Groups subbasins into spatially coherent batches using K-Means clustering.
     
     Returns a list of batch dictionaries, each containing the IDs and
     a single bounding box for all geometries in that batch.
     """
-    print(f"Creating {n_batches} spatial batches...")
-    
-    # Ensure gdf is indexed correctly for easy lookups
-    if gdf.index.name != index_name:
-        gdf = gdf.set_index(index_name)
+    n_batches = int(np.ceil(len(gdf)/batch_size))
         
-    # Get centroids for clustering
-    centroids = np.array([list(p.coords)[0] for p in gdf.geometry.centroid])
+    # Get centroids for clustering. 
+    # Projecting mostly to avoid the geographic coordinate warnings, 
+    # as these centroids do not need to be very accurate.
+    gdf_proj = gdf.to_crs("EPSG:3857")
+    centroids = np.array([list(p.coords)[0] for p in gdf_proj.geometry.centroid])
     
     # Perform K-Means clustering
     kmeans = KMeans(n_clusters=n_batches, random_state=42, n_init=10)
@@ -61,11 +61,11 @@ def create_spatial_batches(gdf, index_name, n_batches):
         )
         
         batches.append({
-            "batch_ids": batch_ids,
-            "batch_bounds": batch_bounds
+            "ids": batch_ids,
+            "geoms": batch_gdf.geometry,
+            "bounds": batch_bounds
         })
         
-    print(f"Successfully created {len(batches)} non-empty spatial batches.")
     return batches
 
 
@@ -126,24 +126,22 @@ def get_results_df(ds_sub, weights):
     return pd.concat([mean_df, var_df], axis=1)
 
 
-def process_spatial_batch(spatial_batch, basin_file, index_name, save_dir, start_date, end_date):
+def process_spatial_batch(spatial_batch: dict, start_date, end_date):
     """
     Processes a spatially coherent batch of COMIDs.
     Loads regional data once per month and applies it to all COMIDs in the batch.
     """
-    batch_ids = spatial_batch['batch_ids']
-    batch_bounds = spatial_batch['batch_bounds']
-    
-    print(f"Worker starting on batch of {len(batch_ids)} reaches.")
-    
-    # Load all necessary geometries for this batch at once
-    subbasin_geoms = gpd.read_file(basin_file).set_index(index_name)
-    batch_geoms = subbasin_geoms.loc[batch_ids]
+    batch_ids = spatial_batch['ids']
+    batch_geoms = gpd.GeoDataFrame(spatial_batch['geoms'])
+    batch_bounds = spatial_batch['bounds']
+
+    start_date = pd.to_datetime(start_date)
+    end_date = pd.to_datetime(end_date)
     
     # Pre-calculate weight matrices for all watersheds in the batch
     # This requires a sample dataset to get the grid right
-    print(f"  Pre-calculating weight matrices for batch...")
-    sample_ds = open_monthly_files(int(start_date[:4]), int(start_date[5:7]))
+    print(f"Pre-calculating weight matrices for batch...")
+    sample_ds = open_monthly_files(start_date.year, start_date.month)
     sample_ds_sub = subset_ds_by_bounds(sample_ds, batch_bounds)
     
     weights_map = {}
@@ -151,7 +149,7 @@ def process_spatial_batch(spatial_batch, basin_file, index_name, save_dir, start
         watershed = gpd.GeoDataFrame([row], crs=batch_geoms.crs)
         weights_map[comid] = get_weight_matrix(sample_ds_sub, watershed)
     sample_ds.close()
-    print(f"  Weight matrices calculated.")
+    print(f"Weight matrices calculated.")
 
     # Generate date range
     date_range = pd.date_range(start=start_date, end=end_date, freq="MS")
@@ -178,21 +176,24 @@ def process_spatial_batch(spatial_batch, basin_file, index_name, save_dir, start
         ds_full.close()
         ds_region.close()
 
-    # After processing all dates, save results for each COMID
+    cat_dfs = {}
     for comid, df_list in comid_results.items():
-        df = pd.concat(df_list, axis=0)
-        
-        out_path = Path(save_dir) / f"{comid}.parquet"
-        if out_path.exists():
-            old = pd.read_parquet(out_path)
-            df = pd.concat([old, df]).drop_duplicates(subset=["time"]).sort_values("time")
-        
-        # The index name from to_dataframe() is 'time', not 'date'
-        df = df.rename_axis('date')
-        df.to_parquet(out_path)
-        print(f"  Completed and saved reach {comid}: {len(df)} time steps")
+        cat_dfs[comid] = pd.concat(df_list, axis=0)
+
+    return cat_dfs
+
+
+def process_and_write_batch(basin_id, batch_dict, start_date, end_date, save_dir):
+    # Process the batch to get the dataframes in memory (on the worker)
+    subbasin_df_dict = process_spatial_batch(batch_dict, start_date, end_date)
     
-    return len(batch_ids)
+    # Initialize the store connection
+    store = BasinDeltaTable(save_dir)
+    store.write_dynamic(basin_id, 'era5', subbasin_df_dict, mode='append')
+    
+    # Just return number of subbasins we finished
+    return len(subbasin_df_dict)
+
 
 
 if __name__ == "__main__":  
@@ -200,8 +201,7 @@ if __name__ == "__main__":
     parser.add_argument("--basin-file", required=True,
                         help="Path to subbasin geometries file")
     parser.add_argument("--save-dir", required=True,
-                        help="Directory to save per-COMID parquet outputs")
-    parser.add_argument("--index_name", default="comid")
+                        help="Location of the deltalake dataset")
     parser.add_argument("--n-workers", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--start-date", default="1980-01-01")
@@ -209,28 +209,36 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     basin_file = Path(args.basin_file)
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+    if basin_file.suffix == '.parquet':
+        subbasins = gpd.read_parquet(basin_file)
+    else:
+        subbasins = gpd.read_file(basin_file)
+    subbasins.set_index('comid', inplace=True)
 
-    subbasins = gpd.read_file(basin_file)
-    
-    # Create spatially coherent batches.
-    n_batches = len(subbasins)//args.batch_size
-    spatial_batches = create_spatial_batches(subbasins, args.index_name,n_batches)
+    # Query the store metadata and determine which still need processing
+    store = BasinDeltaTable(args.save_dir)
+    processed_basins = store.get_processing_status(source='era5')
+    to_process = subbasins[~subbasins.index.isin(processed_basins['subbasin'])]
+
+    # Precalculate all the batches we need to iterate over.
+    all_batches = []
+    for basin_name, basin_gdf in to_process.groupby('outlet_id'):
+        batches = create_spatial_batches(basin_gdf, args.batch_size)
+        for b in batches:
+            all_batches.append((basin_name, b))
     
     cluster = SLURMCluster(
         job_name="era5-dask-worker",
         queue="cpu",
         cores=1,
         processes=1,
-        memory="16GB",
-        walltime="4-00:00:00",
+        memory="32GB",
+        walltime="7-00:00:00",
         log_directory=Path.cwd() / "_dask_workers",
-        job_extra_directives=["-q long"],
+        job_extra_directives=["-q long","-A pi_cjgleason_umass_edu"],
         job_script_prologue=[
-            "module load conda/latest",
-            "conda activate tss-ml",
-            "export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH",
+            "cd /nas/cee-water/cjgleason/ted/swot-ml",
+            "source .venv/bin/activate",
         ],
     )
     
@@ -239,32 +247,30 @@ if __name__ == "__main__":
         client = Client(cluster)
         client.wait_for_workers(args.n_workers)
 
-        # Submit one job per spatial batch
-        futures = []
-        for batch in spatial_batches:
+        # submission loop
+        futures_dict = {}
+        for basin_id, batch_dict in all_batches:
             future = client.submit(
-                process_spatial_batch,
-                batch,
-                str(basin_file),
-                args.index_name,
-                str(save_dir),
+                process_and_write_batch,
+                basin_id,
+                batch_dict,
                 args.start_date,
                 args.end_date,
+                args.save_dir
             )
-            futures.append(future)
+            futures_dict[future] = basin_id
 
-        with tqdm(total=len(spatial_batches), desc="Processing spatial batches") as pbar:
-            for future in as_completed(futures):
+        # results loop
+        with tqdm(total=len(futures_dict), desc="Processing spatial batches") as pbar:
+            for future in as_completed(futures_dict):
+                basin_id = futures_dict[future]
                 try:
                     num_processed = future.result()
-                    print(f"Batch completed processing {num_processed} reaches.")
-                    pbar.update(1)
+                    print(f"Batch for {basin_id} completed, processed {num_processed} subbasins.")
                 except Exception as e:
-                    print(f"A batch failed: {e}")
-                    # You might want to log which future failed
+                    print(f"batch for {basin_id} failed: {e}")
+                finally:
                     pbar.update(1)
-
-        print(f"Processing complete. Individual COMID files saved to {save_dir}")
 
     finally:
         if 'client' in locals() and client.status != 'closed':

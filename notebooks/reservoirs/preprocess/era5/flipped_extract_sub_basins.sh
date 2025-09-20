@@ -1,21 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=flipped_extract_sub_basins
 #SBATCH --output=%j.out
-#SBATCH -t 1-00:00:00
+#SBATCH -t 7-00:00:00
 #SBATCH -p ceewater_cjgleason-cpu
 #SBATCH -q long
 #SBATCH -A pi_cjgleason_umass_edu
 #SBATCH -c 1
 #SBATCH --mem=32G
 
-# Load required modules
-module load conda/latest
-
-# Activate your conda environment
-conda activate tss-ml
-
-# Set library path for shared libraries
-# export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+cd /nas/cee-water/cjgleason/ted/swot-ml\
+source .venv/bin/activate
 
 
 #######################################
@@ -27,7 +21,6 @@ usage() {
 }
 
 # Defaults
-SAVE_DIR="/nas/cee-water/cjgleason/data/ERA5-Land/sub_basin_timeseries"
 START_DATE="1980-01-01"
 END_DATE="2024-12-31"
 N_WORKERS=8
@@ -73,7 +66,7 @@ fi
 #######################################
 # Job parameters
 #######################################
-BATCH_SIZE=8
+BATCH_SIZE=32
 
 echo "ERA5 batch processing subbasins"
 echo "Start time: $(date)"
@@ -85,7 +78,7 @@ echo "Running on node: $SLURM_NODELIST"
 # Run Python
 #######################################
 echo "=== Starting Python processing ==="
-python flipped_extract_sub_basins.py \
+python /nas/cee-water/cjgleason/ted/swot-ml/notebooks/reservoirs/preprocess/era5/flipped_extract_sub_basins.py \
     --basin-file "$BASIN_FILE" \
     --save-dir "$SAVE_DIR" \
     --n-workers $N_WORKERS \
