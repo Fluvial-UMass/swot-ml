@@ -22,11 +22,11 @@ import pandas as pd
 
 # import config, data, train, evaluate
 from config import Config, DataSubset
-from data import HydroDataset, HydroDataLoader
+from data import BasinGraphDataset, BasinGraphDataLoader
 from train import Trainer
 
 
-def cleanup_dl(dl: HydroDataLoader):
+def cleanup_dl(dl: BasinGraphDataLoader):
     if dl is None:
         return
     if dl._iterator:
@@ -51,12 +51,12 @@ def train_from_config(cfg: Config, log_dir: Path | None = None):
         The updated configuration object.
     trainer : Trainer
         The Trainer object after training. Contains the model and other useful attributes.
-    dataset : HydroDataset
-        The HydroDataset loaded for training.
+    dataset : BasinGraphDataset
+        The BasinGraphDataset loaded for training.
     """
     trainer = None
-    dataset = HydroDataset(cfg)
-    dataloader = HydroDataLoader(cfg, dataset)
+    dataset = BasinGraphDataset(cfg)
+    dataloader = BasinGraphDataLoader(cfg, dataset)
 
     if log_dir and log_dir.is_dir():
         trainer = Trainer.load_last_checkpoint(log_dir)
@@ -91,8 +91,8 @@ def train_from_config_ensemble(config_path: Path, ensemble_seed: int):
         The trained model.
     log_dir : Path
         The directory where training logs and checkpoints were saved.
-    dataset : HydroDataset
-        The HydroDataset loaded for training.
+    dataset : BasinGraphDataset
+        The BasinGraphDataset loaded for training.
     """
     cfg = Config.from_file(config_path)
     cfg.model_args.seed += ensemble_seed
@@ -121,8 +121,8 @@ def train_from_config_ensemble(config_path: Path, ensemble_seed: int):
 #         The fine-tuned model.
 #     log_dir : Path
 #         The directory where training logs and checkpoints were saved.
-#     dataset : HydroDataset
-#         The HydroDataset loaded for training.
+#     dataset : BasinGraphDataset
+#         The BasinGraphDataset loaded for training.
 #     """
 #     # Load the config and manipulate it a bit
 #     run_dir = finetune_yml.parent
@@ -181,8 +181,8 @@ def hyperparam_grid_search(config_path: Path, idx: int):
 
         cfg.test_basin_file = f"metadata/site_lists/k_folds/test_{i}_{k}.txt"
         cfg.train_basin_file = f"metadata/site_lists/k_folds/train_{i}_{k}.txt"
-        dataset = HydroDataset(cfg)
-        dataloader = HydroDataLoader(cfg, dataset)
+        dataset = BasinGraphDataset(cfg)
+        dataloader = BasinGraphDataLoader(cfg, dataset)
 
         if log_dir.is_dir():
             trainer = Trainer.load_last_checkpoint(log_dir)
@@ -260,8 +260,8 @@ def calc_attributions(run_dir: Path):
     cfg.batch_size = cfg.batch_size // 10
     cfg.data_subset = DataSubset.test
 
-    dataset = HydroDataset(cfg)
-    dataloader = HydroDataLoader(cfg, dataset)
+    dataset = BasinGraphDataset(cfg)
+    dataloader = BasinGraphDataLoader(cfg, dataset)
 
     save_dir = run_dir / "figures" / "attribution"
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -286,7 +286,7 @@ def load_prediction_model(run_dir: Path, chunk_idx: int | None = None):
         The model training configuration dictionary.
     model : eqx.Module
         The pre-trained model weights and structure.
-    predict_dataset : HydroDataset
+    predict_dataset : BasinGraphDataset
         A dataset containing a subset of the prediction domain.
     eval_dir : Path
         A directory for saving the results of this subset.
@@ -295,13 +295,13 @@ def load_prediction_model(run_dir: Path, chunk_idx: int | None = None):
     trainer = Trainer.load_last_checkpoint(run_dir)
     cfg = trainer.cfg
 
-    train_dataset = HydroDataset(cfg)
+    train_dataset = BasinGraphDataset(cfg)
     cfg.data_subset = DataSubset.predict
     cfg.shuffle = False  # No need to shuffle for inference
     if chunk_idx:
         cfg.test_basin_file = f"metadata/site_lists/predictions/chunk_{chunk_idx:02}.txt"
 
-    predict_dataset = HydroDataset(cfg, train_ds=train_dataset, use_cache=False)
+    predict_dataset = BasinGraphDataset(cfg, train_ds=train_dataset, use_cache=False)
 
     eval_dir = run_dir / "inference"
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -354,7 +354,7 @@ def make_all_plots(
 def eval_model(
     cfg: Config,
     model,
-    dataset: HydroDataset,
+    dataset: BasinGraphDataset,
     log_dir: Path,
     run_test: bool | str = True,
     run_predict: bool | str = True,
@@ -369,7 +369,7 @@ def eval_model(
         The model training configuration object.
     model : eqx.Module
         The pre-trained model weights and structure.
-    dataset : HydroDataset
+    dataset : BasinGraphDataset
         A dataset for estimating and evaluating.
     log_dir : Path
         The directory to save results in.
@@ -404,7 +404,7 @@ def eval_model(
 
         dataset.cfg.exclude_target_from_index = None
         dataset.update_indices(data_subset)
-        dataloader = HydroDataLoader(cfg, dataset)
+        dataloader = BasinGraphDataLoader(cfg, dataset)
 
         results = predict(model, dataloader, quiet=cfg.quiet, denormalize=True)
         cleanup_dl(dataloader)
@@ -467,7 +467,7 @@ def smac_optimize(config_path: Path, smac_runs: int, smac_workers: int):
 def test(training_dir: Path):
     trainer = Trainer.load_last_checkpoint(training_dir.resolve())
     cfg = trainer.cfg
-    dataset = HydroDataset(cfg)
+    dataset = BasinGraphDataset(cfg)
     eval_model(cfg, trainer.model, dataset, training_dir, True, True, True)
 
 

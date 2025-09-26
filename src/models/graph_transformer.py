@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from jaxtyping import Array, PRNGKeyArray
 
-from data import Batch
+from data import GraphBatch
 from .base_model import BaseModel
 
 # from .layers.sinusoidal_encoding import sinusoidal_encoding
@@ -105,7 +105,7 @@ class ST_GATransformer(BaseModel):
             key=keys.pop(0),
         )
 
-    def __call__(self, data: Batch, key: PRNGKeyArray) -> Array:
+    def __call__(self, data: GraphBatch, key: PRNGKeyArray) -> Array:
         num_locations = data.static.shape[0]
 
         # --- 1. Data Embedding ---

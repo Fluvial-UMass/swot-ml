@@ -1,7 +1,7 @@
 import jax.random as jrandom
 from jaxtyping import PRNGKeyArray
 
-from data import Batch
+from data import GraphBatch
 from .base_model import BaseModel
 from .layers.ealstm import EALSTM
 
@@ -54,7 +54,7 @@ class EA_LSTM(BaseModel):
             dynamic_sizes[self.dynamic_key], static_size, hidden_size, dropout=dropout, key=keys[1]
         )
 
-    def __call__(self, data: Batch, key: PRNGKeyArray):
+    def __call__(self, data: GraphBatch, key: PRNGKeyArray):
         """The forward pass of the data through the model
 
         Parameters

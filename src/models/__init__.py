@@ -8,7 +8,7 @@ from config.model_args import (
     MSAttnArgs,
     STGATArgs,
 )
-from data import HydroDataLoader, HydroDataset
+from data import BasinGraphDataset, BasinGraphDataLoader
 
 from models.base_model import BaseModel
 from models.lstm_mlp_attn import LSTM_MLP_ATTN
@@ -26,7 +26,7 @@ MODEL_MAP = {
 }
 
 
-def make(cfg: Config, dl: HydroDataLoader = None):
+def make(cfg: Config, dl: BasinGraphDataLoader = None):
     """Creates a model based on the provided configuration.
 
     Parameters
@@ -52,7 +52,7 @@ def make(cfg: Config, dl: HydroDataLoader = None):
     return cfg, model
 
 
-def set_model_data_args(cfg: Config, dataset: HydroDataset):
+def set_model_data_args(cfg: Config, dataset: BasinGraphDataset):
     """Set model arguments based on configuration and dataset."""
     dyn_feat = dict(dataset.features["dynamic"])
 

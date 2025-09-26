@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from jaxtyping import PRNGKeyArray
 
-from data import Batch
+from data import GraphBatch
 from .base_model import BaseModel
 from .layers.lstm import LSTM
 from .layers.bi_lstm import BiLSTM
@@ -69,7 +69,7 @@ class STACKED_LSTM(BaseModel):
         )
         self.head = eqx.nn.Linear(hidden_size, len(out_targets), key=keys[6])
 
-    def __call__(self, data: Batch, key: PRNGKeyArray):
+    def __call__(self, data: GraphBatch, key: PRNGKeyArray):
         keys = jrandom.split(key, 2)
 
         # Replace NaN values with 0s in the dynamic data

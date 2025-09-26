@@ -19,40 +19,13 @@ from tqdm import tqdm
 
 import models
 from config import Config
-from data import HydroDataLoader
+from data import BasinGraphDataLoader
 from .step import make_step, compute_loss_fn
 from .early_stop import EarlyStopper
 
 
 class Trainer:
     """Trainer class for training hydrological models.
-
-    Attributes
-    ----------
-    cfg : dict
-        Configuration dictionary.
-    dataloader : HydroDataLoader
-        DataLoader object.
-    log_dir : Path
-        Directory for logging.
-    num_epochs : int
-        Number of epochs for training.
-    early_stopper: EarlyStopper
-        Object for detecting early stopping conditions.
-    lr_schedule : optax.Schedule
-        Learning rate scheduler.
-    model : eqx.Module
-        Model to be trained.
-    losses : list
-        List to store loss values.
-    epoch : int
-        Current epoch.
-    optim : optax.GradientTransformation
-        Optimizer.
-    opt_state : optax.OptState
-        Optimizer state.
-    filter_spec : PyTree
-        Specification for freezing components.
 
     Methods
     -------
@@ -76,7 +49,8 @@ class Trainer:
 
     cfg: Config
     logger: logging.Logger
-    dataloader: HydroDataLoader
+    training_dl: BasinGraphDataLoader
+    validation_dl: BasinGraphDataLoader
     log_dir: Path
     num_epochs: int
     lr_schedule: optax.Schedule
@@ -92,7 +66,8 @@ class Trainer:
     def __init__(
         self,
         cfg: Config,
-        dataloader: HydroDataLoader = None,
+        training_dl: BasinGraphDataLoader = None,
+        validation_dl: BasinGraphDataLoader = None,
         *,
         log_dir: Path | None = None,
         checkpoint: dict | None = None,
@@ -105,7 +80,7 @@ class Trainer:
         ----------
         cfg : dict
             Configuration dictionary.
-        dataloader : data.HydroDataLoader
+        training_dl : data.HydroDataLoader
             DataLoader object.
         log_dir : Path, optional
             Specific directory for logging.
@@ -116,15 +91,20 @@ class Trainer:
             Defaults to none.
         """
         self.cfg = cfg
-        self.dataloader = dataloader
-        self.log_dir = self._setup_logging(log_dir)
+        self.training_dl = training_dl
+        self.validation_dl = validation_dl
+
         self.num_epochs = cfg.num_epochs
         self.log_interval = cfg.log_interval
         self.validate_interval = cfg.validate_interval
+
         self.lr_schedule = _create_lr_schedule(cfg)
-        seed = cfg.model_args.seed + 1
-        self.train_key = jax.random.PRNGKey(seed)
+        self.log_dir = self._setup_logging(log_dir)
+        self.train_key = jax.random.PRNGKey(cfg.model_args.seed)
+
+
         if checkpoint:
+            # This is only really used from the class method load_checkpoint()
             self.epoch = checkpoint["epoch"]
             self.losses = checkpoint["losses"]
             self.model = checkpoint["model"]
@@ -134,14 +114,15 @@ class Trainer:
         else:
             self.epoch = 0
             self.losses = []
-            self.cfg, self.model = models.make(cfg, dataloader)
+            self.cfg, self.model = models.make(cfg, training_dl)
             self.optim = optax.adam(self.lr_schedule(self.epoch))
             self.opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
             if cfg.early_stop_kwargs is not None:
                 self.early_stopper = EarlyStopper(**cfg.early_stop_kwargs.model_dump())
             else:
                 self.early_stopper = None
-        # Initialize the filterspec. Defaults to training all components.
+
+        # Initialize the filterspec. Defaults to training all components of the model.
         self.freeze_components([])
 
     def _setup_logging(self, log_dir=None):
@@ -214,11 +195,13 @@ class Trainer:
         model : eqx.Module
             The trained model.
         """
+        if self.training_dl is None:
+            raise ValueError("Trainer was created without training dataloader.")
+        
         while (self.epoch < self.num_epochs) and (self.epoch < stop_at):
             self.epoch += 1
-            loss, bad_grads = self._train_epoch()
-            self.losses.append(float(loss))
-            self.logger.info(f"Epoch: {self.epoch}, Loss: {loss:.4f}")
+            bad_grads = self._train_epoch()
+
             # Log the counts of any bad gradients.
             for type_key, tree_counts in bad_grads.items():
                 if tree_counts:
@@ -226,25 +209,27 @@ class Trainer:
                     for tree_key, count in tree_counts.items():
                         warning_str += f"\n\t{tree_key}: {count}"
                     self.logger.info(warning_str)
+
+            # Validate and check early stopping
+            v_loss = None
             if self.validate_interval and (self.epoch % self.validate_interval == 0):
                 v_loss = self.get_validation_loss()
-                self.logger.info(f"Epoch: {self.epoch}, Validation Loss: {v_loss:.4f}")
-            else:
-                v_loss = None
             if v_loss and self.early_stopper:
                 if self.early_stopper(v_loss):
                     self.logger.info("Training stopped by EarlyStopper.")
                     self.cfg.num_epochs = self.epoch
                     self.save_state()
                     break  # exit training loop
+
             if self.epoch % self.log_interval == 0:
                 self.save_state()
         if self.epoch % self.log_interval != 0:
             self.save_state()
+
         self.logger.info("~~~ training done ~~~")
         self._cleanup_logger()
 
-    def _train_epoch(self) -> tuple[float, dict[str, dict]]:
+    def _train_epoch(self) -> dict[str, dict]:
         """Trains the model for one epoch.
 
         Iterates over the dataloader batches, updates the model using the optimization step, and handles any exceptions that occur during the training. Logs errors and saves error data if issues are encountered.
@@ -258,15 +243,14 @@ class Trainer:
         """
         lr = self.lr_schedule(self.epoch)
         self.optim = optax.adam(lr)
-        exceptions = 0
         batch_count = 0
         losses = []
         bad_grads = {"vanishing": {}, "exploding": {}}
-        pbar = tqdm(self.dataloader, disable=self.cfg.quiet, desc=f"Epoch:{self.epoch:03.0f}")
-        for data_tuple in pbar:
-            basins, dates, batch = data_tuple
-            # batch = self.dataloader.shard_batch(batch)
+        pbar = tqdm(self.training_dl, disable=self.cfg.quiet, desc=f"Epoch:{self.epoch:03.0f}")
+        for basins, dates, batch in pbar:
+            # batch = self.training_dl.shard_batch(batch)
             batch_count += 1
+            
             # Split and update training key for dropout
             keys = jax.random.split(self.train_key, self.cfg.batch_size + 1)
             self.train_key = keys[0]
@@ -279,14 +263,14 @@ class Trainer:
                     self.opt_state,
                     self.optim,
                     self.filter_spec,
-                    self.dataloader.denormalize_target,
                     **self.cfg.step_kwargs.model_dump(),
                 )
                 if jnp.isnan(loss):
                     raise RuntimeError("NaN loss encountered")
+                
                 pbar.set_postfix_str(f"Loss:{loss:0.04f}")
                 losses.append(loss)
-                exceptions = 0
+
                 # Monitor gradients
                 grad_norms = jtu.tree_map(jnp.linalg.norm, grads)
                 grad_norms = jtu.tree_leaves_with_path(grad_norms)
@@ -300,50 +284,56 @@ class Trainer:
                         else:
                             bad_grads[type_key][tree_key] += 1
             except Exception as e:
-                exceptions += 1
                 if self.cfg.log:
                     error_dir = (
                         self.log_dir / "exceptions" / f"epoch{self.epoch}_batch{batch_count}"
                     )
                     self.save_state(error_dir)
                     with open(error_dir / "data.pkl", "wb") as f:
-                        pickle.dump(data_tuple, f)
+                        pickle.dump((basins, dates, batch), f)
                     with open(error_dir / "exception.txt", "w") as f:
                         f.write(f"{str(e)}\n{traceback.format_exc()}")
                     error_str = f"{type(e).__name__} exception caught. See {error_dir} for data, model state, and trace."
                 else:
                     error_str = f"{str(e)}\n{traceback.format_exc()}"
                 self.logger.error(error_str)
-            if exceptions >= 3:
-                raise RuntimeError(f"Too many consecutive exceptions ({exceptions})")
-        pbar.set_postfix_str(f"Avg Loss:{np.mean(losses):0.04f}")
-        pbar.refresh()
-        return np.mean(losses), bad_grads
+                raise (e)
+
+        loss = np.mean(losses)
+        pbar.set_postfix_str(f"Avg Loss:{loss:0.04f}")
+        pbar.refresh() # Force final update
+
+        self.losses.append(float(loss))
+        self.logger.info(f"Epoch: {self.epoch}, Loss: {loss:.4f}")
+        
+        return bad_grads
 
     def get_validation_loss(self) -> float:
         # Set model and dataloader for inference
         self.model = eqx.nn.inference_mode(self.model, True)
-        self.dataloader.update_indices("test")
         batch_keys = jax.random.split(self.train_key, self.cfg.batch_size)
         losses = []
         pbar = tqdm(
-            self.dataloader, disable=self.cfg.quiet, desc=f"Validating Epoch:{self.epoch:03.0f}"
+            self.validation_dl, 
+            disable = self.cfg.quiet, 
+            desc = f"Validating Epoch:{self.epoch:03.0f}"
         )
         for _, _, batch in pbar:
-            diff_model, static_model = eqx.partition(self.model, self.filter_spec)
             loss = compute_loss_fn(
-                diff_model,
-                static_model,
+                self.model,
                 batch,
                 batch_keys,
-                self.dataloader.denormalize_target,
                 **self.cfg.step_kwargs.model_dump(),
             )
             losses.append(loss)
-        # Reset model and dataloader for training
+            
+        v_loss = np.mean(losses)
+        self.logger.info(f"Epoch: {self.epoch}, Validation Loss: {v_loss:.4f}")
+
+        # Reset model inference mode (dropout) after validation
         self.model = eqx.nn.inference_mode(self.model, False)
-        self.dataloader.update_indices("train")
-        return np.mean(losses)
+
+        return v_loss
 
     def freeze_components(self, component_names: list[str] | str = []):
         """Freezes or unfreezes specified components of the model.

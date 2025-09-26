@@ -15,6 +15,6 @@ source .venv/bin/activate
 
 python /nas/cee-water/cjgleason/ted/swot-ml/notebooks/reservoirs/preprocess/era5/flipped_extract_sub_basins.py \
     --basin-file /nas/cee-water/cjgleason/ted/swot-ml/data/reservoirs/metadata/All_MERIT_matchups.gpkg \
-    --save-dir /nas/cee-water/cjgleason/ted/swot-ml/data/reservoirs/deltalakes/training \
+    --save-dir /nas/cee-water/cjgleason/ted/swot-ml/data/reservoirs/datalakes/training \
     --n-workers 32 \
     --batch-size 32 

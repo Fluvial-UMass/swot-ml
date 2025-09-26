@@ -16,7 +16,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 from dask.distributed import Client, as_completed
 from dask_jobqueue import SLURMCluster
 from sklearn.cluster import KMeans
-from data import BasinDeltaTable
+from data import BasinDataLake
 
 e5_dir = Path("/nas/cee-water/cjgleason/data/ERA5-Land/")
 
@@ -188,7 +188,7 @@ def process_and_write_batch(basin_id, batch_dict, start_date, end_date, save_dir
     subbasin_df_dict = process_spatial_batch(batch_dict, start_date, end_date)
     
     # Initialize the store connection
-    store = BasinDeltaTable(save_dir)
+    store = BasinDataLake(save_dir)
     store.write_dynamic(basin_id, 'era5', subbasin_df_dict, mode='append')
     
     # Just return number of subbasins we finished
@@ -216,7 +216,7 @@ if __name__ == "__main__":
     subbasins.set_index('comid', inplace=True)
 
     # Query the store metadata and determine which still need processing
-    store = BasinDeltaTable(args.save_dir)
+    store = BasinDataLake(args.save_dir)
     processed_basins = store.get_processing_status(source='era5')
     to_process = subbasins[~subbasins.index.isin(processed_basins['subbasin'])]
 

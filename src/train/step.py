@@ -5,7 +5,7 @@ import jax.tree_util as jtu
 from jaxtyping import Array, PRNGKeyArray, PyTree
 from typing import Callable
 
-from data import Batch
+from data import GraphBatch
 
 
 def mse_loss(y: Array, y_pred: Array, mask: Array):
@@ -60,15 +60,6 @@ def spin_up_nse_loss(y: Array, y_pred: Array, mask: Array):
     return jnp.mean(mse / denom)
 
 
-def flux_agreement(y_pred: Array, target_list: list):
-    """Calculates the normalized difference between direct SSF and SSC*Q flux estimates"""
-    ssc = y_pred[:, target_list.index("ssc")] / 1e6  # mg/l -> kg/l
-    flux = y_pred[:, target_list.index("flux")] / 1.102 / 1e3  # short ton/day -> kg/d
-    q = y_pred[:, target_list.index("usgs_q")] * 24 * 3600 * 1000  # m^3/s -> l/d
-    rel_error = ((ssc * q) - flux) / ((ssc * q + flux) / 2)
-    return jnp.mean(jnp.square(rel_error))
-
-
 LOSS_FN_MAP = {
     "mse": mse_loss,
     "mae": mae_loss,
@@ -81,13 +72,11 @@ LOSS_FN_MAP = {
 def compute_loss_fn(
     diff_model: PyTree,
     static_model: PyTree,
-    data: Batch,
+    data: GraphBatch,
     keys: list[PRNGKeyArray],
-    denormalize_fn: Callable,
     *,
     loss_name: str = "mse",
     target_weights: float | list[float] = 1,
-    agreement_weight: float = 0,
     **kwargs,
 ) -> float:
     """Compute the loss between the predicted and true values.
@@ -100,12 +89,10 @@ def compute_loss_fn(
         Differential components of the model.
     static_model: PyTree
         Static components of the model.
-    data: Batch
-        Batch of data to use for training.
+    data: GraphBatch
+        GraphBatch of data to use for training.
     keys: list[PRNGKeyArray]
         Batch of keys to use for the random dropout in the model.
-    denormalize_fn: Callable
-        Function to use to denormalize the predictions. This is useful for some types of regularization.
     loss_name: str, optional
         Name of the loss function to use.
     target_weights: float | list[float], optional
@@ -122,7 +109,7 @@ def compute_loss_fn(
     model = eqx.combine(diff_model, static_model)
 
     in_axes_keys = 0
-    y_pred = jax.vmap(model, in_axes=(Batch.in_axes(), in_axes_keys))(data, keys)
+    y_pred = jax.vmap(model, in_axes=(GraphBatch.in_axes(), in_axes_keys))(data, keys)
 
     if loss_name in ["nse", "spin_up_nse"]:
         # NSE calc requires the full time series, not just the final value.
@@ -146,9 +133,7 @@ def compute_loss_fn(
     target_losses = jnp.where(valid_loss, raw_losses, 0)
     target_weights = valid_loss * jnp.array(target_weights)
     loss = jnp.average(target_losses, weights=target_weights)
-    if agreement_weight > 0:
-        y_pred_denorm = denormalize_fn(y_pred)
-        loss += agreement_weight * flux_agreement(y_pred_denorm, model.target)
+
     return loss
 
 
@@ -177,12 +162,11 @@ def clip_gradients(grads: PyTree, max_norm: float) -> PyTree:
 @eqx.filter_jit
 def make_step(
     model: eqx.Module,
-    data: Batch,
+    data: GraphBatch,
     keys: list[PRNGKeyArray],
     opt_state: PyTree,
     optim: Callable,
     filter_spec: PyTree,
-    denormalize_fn: Callable,
     **kwargs,
 ) -> tuple[float, PyTree, eqx.Module, PyTree]:
     """Performs a single optimization step, updating the model parameters.
@@ -191,7 +175,7 @@ def make_step(
     ----------
     model: eqx.Module
         Equinox model to train. Must take in a dict of data and PRNGKey.
-    data: Batch
+    data: GraphBatch
         The batch of training data.
     keys: list[PRNGKeyArray]
         The PRNG keys for this batch, used by the model for dropout regularization.
@@ -199,8 +183,6 @@ def make_step(
     optim: Callable
     filter_spec: PyTree
         The filter specification. True values indicate which parameters will be updated.
-    denormalize_fn: Callable
-        The denormalization function. Useful for physical regularization, when we can enforce some relationship between the real quantites, rather than their normalized or encoded values.
     max_grad_norm: float, optional
         The maximum gradient norm.
 
@@ -217,7 +199,7 @@ def make_step(
     """
     diff_model, static_model = eqx.partition(model, filter_spec)
     loss_fn_with_grad = eqx.filter_value_and_grad(compute_loss_fn)
-    loss, grads = loss_fn_with_grad(diff_model, static_model, data, keys, denormalize_fn, **kwargs)
+    loss, grads = loss_fn_with_grad(diff_model, static_model, data, keys, **kwargs)
     if kwargs.get("max_grad_norm"):
         grads = clip_gradients(grads, kwargs.get("max_grad_norm"))
     updates, opt_state = optim.update(grads, opt_state)

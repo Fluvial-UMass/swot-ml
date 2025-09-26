@@ -23,7 +23,7 @@ from .model_args import ModelArgs
 class Features(BaseModel):
     dynamic: dict[str, list[str]]
     static: list[str] | None = None
-    target: list[str]
+    target: dict[str, list[str]]
 
 
 class StepKwargs(BaseModel):
@@ -67,11 +67,10 @@ class ValueFilter(BaseModel):
 
 
 class DataSubset(str, Enum):
-    pre_train = "pre_train"
-    train = "train"
-    test = "test"
-    predict = "predict"
-    predict_all = "predict_all"
+    train = "train"  # Loss, gradients, and back propagation
+    validate = "validate"  # Loss only
+    test = "test"  # Error statistics only
+    predict = "predict"  # Same as test but for sequences without test data
 
 
 class Config(BaseModel):
@@ -113,17 +112,20 @@ class Config(BaseModel):
         return self.model_dump_json(indent=4)
 
     # Data paths
-    data_dir: DirectoryPath
-    time_series_dir: DirectoryPath
+    data_root: DirectoryPath
+    zarr_dir: DirectoryPath
     attributes_file: FilePath
     train_basin_file: FilePath
     test_basin_file: FilePath
-    graph_network_file: FilePath | None
+    graph_network_file: FilePath
 
     # Data processing
     features: Features
-    time_slice: list[datetime] = Field(..., min_length=2, max_length=2)
-    split_time: datetime | None = None
+    in_memory: bool = False
+    train_date_range: list[datetime] = Field(..., min_length=2, max_length=2)
+    validate_date_range: list[datetime] = Field(..., min_length=2, max_length=2)
+    test_date_range: list[datetime] = Field(..., min_length=2, max_length=2)
+    predict_date_range: list[datetime] = Field(..., min_length=2, max_length=2)
     add_rolling_means: list[int] | None = None
     clip_feature_range: dict[str, list[float | None]] = Field(default_factory=dict)
     value_filters: list[ValueFilter] = Field(default_factory=list)
@@ -175,19 +177,28 @@ class Config(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def validate_paths(cls, values: dict):
-        # Get the base data directory
-        base_dir = Path(values.get("data_dir")).resolve()
-        values["data_dir"] = base_dir
+        def resolve_path(attr_str):
+            str_path = values.get(attr_str)
+            if str_path:
+                return Path(str_path).resolve()
+            else:
+                return None
 
-        values["time_series_dir"] = base_dir / values.get("time_series_dir", "time_series")
-        values["attributes_file"] = (
-            base_dir / "attributes" / values.get("attributes_file", "attributes.csv")
-        )
-        values["train_basin_file"] = base_dir / values.get("train_basin_file")
-        values["test_basin_file"] = base_dir / values.get("test_basin_file")
+        abs_paths = [
+            "data_root",
+            "zarr_dir",
+        ]
+        for attr in abs_paths:
+            values[attr] = resolve_path(attr)
 
-        graph_file = values.get("graph_network_file")
-        values["graph_network_file"] = base_dir / graph_file if graph_file else None
+        rel_paths = [
+            "attributes_file",
+            "train_basin_file",
+            "test_basin_file",
+            "graph_network_file",
+        ]
+        for attr in rel_paths:
+            values[attr] = values["data_root"] / values[attr]
 
         return values
 
@@ -200,7 +211,7 @@ class Config(BaseModel):
             values["persistent_workers"] = False
         else:
             values["timeout"] = values.get("timeout", 900)
-            values["persistent_workers"] = values.get("persistent_workers", False)
+            values["persistent_workers"] = values.get("persistent_workers", True)
         return values
 
     # MODEL / AFTER
@@ -223,21 +234,20 @@ class Config(BaseModel):
         return self
 
     # FIELD / BEFORE
-    @field_validator("time_slice", mode="before")
+    @field_validator(
+        "train_date_range",
+        "validate_date_range",
+        "test_date_range",
+        "predict_date_range",
+        mode="before",
+    )
     def parse_time_slice(cls, v):
         if (not isinstance(v, list)) or (len(v) != 2):
-            raise ValueError("time_slice must be a list of two elements (start, end).")
+            raise ValueError("date ranges must be a list of two elements (start, end).")
         # Convert to datetime objects
         t_start = datetime.fromisoformat(v[0])
         t_end = datetime.fromisoformat(v[1])
         return [t_start, t_end]
-
-    @field_validator("split_time", mode="before")
-    def parse_split_time(cls, v):
-        if v is not None:
-            # Convert to datetime object
-            return datetime.fromisoformat(v)
-        return v
 
     @field_validator("clip_feature_range", mode="before")
     def process_clip_feature_range(cls, v):

@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from jaxtyping import PRNGKeyArray
 
-from data import Batch
+from data import GraphBatch
 from .base_model import BaseModel
 from .layers.static_mlp import StaticMLP
 from .layers.ealstm import EALSTM
@@ -166,12 +166,12 @@ class LSTM_MLP_ATTN(BaseModel):
                 raise ValueError(f"Source '{source}' not found in active_source.")
         print(self.active_source)
 
-    def __call__(self, data: Batch, key: PRNGKeyArray):
+    def __call__(self, data: GraphBatch, key: PRNGKeyArray):
         """The forward pass of the data through the model
 
         Parameters
         ----------
-        data: Batch
+        data: GraphBatch
             The input data.
         key: PRNGKeyArray
             A PRNG key used to apply the model.

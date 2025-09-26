@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from jaxtyping import PRNGKeyArray
 
-from data import Batch
+from data import GraphBatch
 from .base_model import BaseModel
 from .layers.transformer import CrossAttnDecoder
 
@@ -140,7 +140,7 @@ class MS_ATTN(BaseModel):
                 raise ValueError(f"Source '{source}' not found in active_source.")
         print(self.active_source)
 
-    def __call__(self, data: Batch, key: PRNGKeyArray):
+    def __call__(self, data: GraphBatch, key: PRNGKeyArray):
         """The forward pass of the data through the model
 
         Parameters
