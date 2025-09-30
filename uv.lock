@@ -662,8 +662,28 @@ wheels = [
 ]
 
 [package.optional-dependencies]
+dataframe = [
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+]
 distributed = [
     { name = "distributed" },
+]
+
+[[package]]
+name = "dask-deltatable"
+version = "0.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "dask", extra = ["dataframe"] },
+    { name = "deltalake" },
+    { name = "fsspec" },
+    { name = "pyarrow" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f3/5d/151216c49cb2978f3da65dd3867f580757a77e1f21bc6b9e359f3be33441/dask_deltatable-0.4.0.tar.gz", hash = "sha256:d75af862b5d89d435bf425b5ee9c46ef557a8993fcaba6090013c3b139153d29", size = 26374, upload_time = "2025-07-29T09:54:32.568Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a3/19/1143ef5e88855cd4d4e45d1cb530ebdfbe40081f2f1cfd9596fc72bfd011/dask_deltatable-0.4.0-py3-none-any.whl", hash = "sha256:63da540706ac0d7eb3bf066e99d46b6891bd04fd34a35e43d0a13fc4ec5ee5e1", size = 21308, upload_time = "2025-07-29T09:54:31.485Z" },
 ]
 
 [[package]]
@@ -3526,6 +3546,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "dask", extra = ["distributed"] },
+    { name = "dask-deltatable" },
     { name = "dask-jobqueue" },
     { name = "deltalake" },
     { name = "equinox" },
@@ -3565,6 +3586,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "dask", extras = ["distributed"], specifier = ">=2025.7.0" },
+    { name = "dask-deltatable", specifier = ">=0.4.0" },
     { name = "dask-jobqueue", specifier = ">=0.9.0" },
     { name = "deltalake", specifier = ">=1.1.4" },
     { name = "equinox", specifier = ">=0.12.2" },

@@ -102,7 +102,6 @@ class Trainer:
         self.log_dir = self._setup_logging(log_dir)
         self.train_key = jax.random.PRNGKey(cfg.model_args.seed)
 
-
         if checkpoint:
             # This is only really used from the class method load_checkpoint()
             self.epoch = checkpoint["epoch"]
@@ -197,7 +196,7 @@ class Trainer:
         """
         if self.training_dl is None:
             raise ValueError("Trainer was created without training dataloader.")
-        
+
         while (self.epoch < self.num_epochs) and (self.epoch < stop_at):
             self.epoch += 1
             bad_grads = self._train_epoch()
@@ -250,7 +249,7 @@ class Trainer:
         for basins, dates, batch in pbar:
             # batch = self.training_dl.shard_batch(batch)
             batch_count += 1
-            
+
             # Split and update training key for dropout
             keys = jax.random.split(self.train_key, self.cfg.batch_size + 1)
             self.train_key = keys[0]
@@ -267,7 +266,7 @@ class Trainer:
                 )
                 if jnp.isnan(loss):
                     raise RuntimeError("NaN loss encountered")
-                
+
                 pbar.set_postfix_str(f"Loss:{loss:0.04f}")
                 losses.append(loss)
 
@@ -301,11 +300,11 @@ class Trainer:
 
         loss = np.mean(losses)
         pbar.set_postfix_str(f"Avg Loss:{loss:0.04f}")
-        pbar.refresh() # Force final update
+        pbar.refresh()  # Force final update
 
         self.losses.append(float(loss))
         self.logger.info(f"Epoch: {self.epoch}, Loss: {loss:.4f}")
-        
+
         return bad_grads
 
     def get_validation_loss(self) -> float:
@@ -314,9 +313,7 @@ class Trainer:
         batch_keys = jax.random.split(self.train_key, self.cfg.batch_size)
         losses = []
         pbar = tqdm(
-            self.validation_dl, 
-            disable = self.cfg.quiet, 
-            desc = f"Validating Epoch:{self.epoch:03.0f}"
+            self.validation_dl, disable=self.cfg.quiet, desc=f"Validating Epoch:{self.epoch:03.0f}"
         )
         for _, _, batch in pbar:
             loss = compute_loss_fn(
@@ -326,7 +323,7 @@ class Trainer:
                 **self.cfg.step_kwargs.model_dump(),
             )
             losses.append(loss)
-            
+
         v_loss = np.mean(losses)
         self.logger.info(f"Epoch: {self.epoch}, Validation Loss: {v_loss:.4f}")
 

@@ -1,6 +1,8 @@
 import os
 import warnings
+import json
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Suppress 'warn' and 'info' messages from the Rust backend.
 # deltalake is receiving a deprecation warning about future updates to DataFusion.
@@ -10,13 +12,17 @@ from pathlib import Path
 os.environ["RUST_LOG"] = "warn,datafusion_datasource_parquet=error"
 
 from tqdm import tqdm
+import numpy as np
 import pandas as pd
 import pyarrow as pa
-import pyarrow.dataset as ds
 import xarray as xr
+import zarr
+from dask.distributed import Client
 from zarr.errors import ZarrUserWarning
 from deltalake import DeltaTable, write_deltalake
 from deltalake.exceptions import TableNotFoundError
+
+LOG_PAD = 1e-6  # IMPORTANT: This must match the log_pad value the dataloader class
 
 
 class BasinDataLake:
@@ -184,8 +190,8 @@ class BasinDataLake:
         basin: str,
         subbasin: list[str] | str = None,
         source: list[str] | str = None,
-        start_date: str = None,
-        end_date: str = None,
+        start_date: str | pd.Timestamp = None,
+        end_date: str | pd.Timestamp = None,
         concat_sources: bool = True,
     ) -> pd.DataFrame | dict[str, pd.DataFrame]:
         """
@@ -233,6 +239,11 @@ class BasinDataLake:
         if not sources_to_read:
             return pd.DataFrame() if concat_sources else {}
 
+        if isinstance(start_date, str):
+            start_date = pd.Timestamp(start_date, tz="UTC")
+        if isinstance(end_date, str):
+            end_date = pd.Timestamp(end_date, tz="UTC")
+
         def read_source(source: str) -> pd.DataFrame:
             """Read data from a single source table."""
             table_uri = self._get_source_table_uri(source)
@@ -247,9 +258,9 @@ class BasinDataLake:
                     elif isinstance(subbasin, list):
                         filters.append(("subbasin", "in", subbasin))
                 if start_date:
-                    filters.append(("date", ">=", pd.Timestamp(start_date, tz="UTC")))
+                    filters.append(("date", ">=", start_date))
                 if end_date:
-                    filters.append(("date", "<=", pd.Timestamp(end_date, tz="UTC")))
+                    filters.append(("date", "<=", end_date))
 
                 df = dt.to_pandas(filters=filters if filters else None)
                 df.drop(columns=["basin", "year"], inplace=True)
@@ -386,7 +397,7 @@ class BasinDataLake:
 
     def list_source_basin_data(self) -> pd.DataFrame:
         def grp_is_true(grp):
-            return (grp["has_data"] == 1).all(axis=0)
+            return (grp["has_data"] == 1).any(axis=0)
 
         status = self.get_processing_status()
         has_data = status.groupby("basin").apply(grp_is_true)
@@ -473,6 +484,7 @@ class BasinDataLake:
     def export_to_zarr(
         self,
         zarr_path: Path | str,
+        workers: int = 1,
         basins: list[str] | None = None,
         sources: list[str] | None = None,
         start_date: str | None = None,
@@ -491,6 +503,9 @@ class BasinDataLake:
         start_date = pd.Timestamp(start_date, tz="UTC") if start_date else None
         end_date = pd.Timestamp(end_date, tz="UTC") if end_date else None
 
+        status = self.get_processing_status()
+        subbasin_map = status.groupby("basin").apply(len).to_dict()
+
         for source in sources:
             basins_w_data = basin_data_flags[basin_data_flags[source]].index
             source_path = zarr_path / source
@@ -499,7 +514,7 @@ class BasinDataLake:
                 basins_to_export = basins
             elif overwrite or not source_path.exists():
                 # Get all basins with data
-                basins_to_export = basins_w_data
+                basins_to_export = set(basins_w_data)
             else:
                 # Filter the basins based on what has already been exported.
                 exported = [d.stem for d in source_path.iterdir() if d.is_dir()]
@@ -508,50 +523,57 @@ class BasinDataLake:
             if not basins_to_export:
                 print(f"No new basins to process for source: {source}.")
                 continue
+            print(f"Processing {len(basins_to_export)} basins for source: {source}.")
 
-            # # Prepare a function with the constant arguments already applied
-            # export_func = partial(
-            #     self.export_basin_group_to_zarr,
-            #     source=source,
-            #     zarr_path=zarr_path,
-            #     start_date=start_date,
-            #     end_date=end_date,
-            #     chunk_days=chunk_days,
-            # )
-
-            # results = []
-            # with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            #     # executor.map applies the function to each item in the iterable
-            #     # We wrap the map object with tqdm for a progress bar
-            #     future_results = executor.map(export_func, basins_to_export)
-            #     results = list(
-            #         tqdm(
-            #             future_results,
-            #             total=len(basins_to_export),
-            #             desc=f"Writing basins for {source}",
-            #         )
-            #     )
-
-            # count = sum(results) # sum of booleans
-            # print(f"Wrote data for {count} basins.")
-
-            # Loop through basins to append to this source's group.
             count = 0
-            print(f"Processing source: {source}.")
-            for basin in tqdm(basins_to_export, desc="Iterating through basins"):
-                try:
-                    written = self.export_basin_group_to_zarr(
-                        basin=basin,
-                        source=source,
-                        zarr_path=zarr_path,
-                        start_date=start_date,
-                        end_date=end_date,
-                        chunk_days=chunk_days,
-                    )
-                    count += 1 if written else 0
-                except Exception as e:
-                    print(f"{basin=}, {source=}")
-                    raise e
+            if workers > 1:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = {
+                        executor.submit(
+                            self.export_basin_group_to_zarr,
+                            basin=basin,
+                            subbasin_count=subbasin_map[basin],
+                            source=source,
+                            zarr_path=zarr_path,
+                            start_date=start_date,
+                            end_date=end_date,
+                            chunk_days=chunk_days,
+                        ): basin
+                        for basin in basins_to_export
+                    }
+
+                    with tqdm(
+                        total=len(basins_to_export), desc=f"Processing {source} basins"
+                    ) as pbar:
+                        for future in as_completed(futures):
+                            basin = futures[future]
+                            try:
+                                written = future.result()
+                                if written:
+                                    count += 1
+                                pbar.set_postfix({"completed": count, "basin": basin})
+                            except Exception as e:
+                                print(f"\nError in basin {basin}, source {source}: {e}")
+                            finally:
+                                pbar.update(1)
+
+            else:
+                for basin in tqdm(basins_to_export, desc="Iterating through basins"):
+                    try:
+                        written = self.export_basin_group_to_zarr(
+                            basin=basin,
+                            subbasin_count=subbasin_map[basin],
+                            source=source,
+                            zarr_path=zarr_path,
+                            start_date=start_date,
+                            end_date=end_date,
+                            chunk_days=chunk_days,
+                        )
+                        count += 1 if written else 0
+                    except Exception as e:
+                        print(f"{basin=}, {source=}")
+                        raise e
+
             print(f"Wrote data for {count} basins.")
 
         warnings.resetwarnings()
@@ -559,8 +581,9 @@ class BasinDataLake:
     def export_basin_group_to_zarr(
         self,
         basin: str,
-        zarr_path: Path | str,
+        subbasin_count: int,
         source: str,
+        zarr_path: Path | str,
         start_date: pd.Timestamp | None,
         end_date: pd.Timestamp | None,
         chunk_days: int,
@@ -585,34 +608,132 @@ class BasinDataLake:
         dtype : numpy dtype
             Storage type for Zarr.
         """
-        # Build one Dataset per source
-        table_uri = self._get_source_table_uri(source)
-        dataset = ds.dataset(table_uri, format="parquet", partitioning="hive")
+        if subbasin_count <= 1000:
+            year_step = 50
+        elif subbasin_count <= 2000:
+            year_step = 10
+        else:
+            year_step = 1
+        date_range = pd.date_range(start_date, end_date, freq=f"{year_step}YE", inclusive="both")
 
-        expr = ds.field("basin") == basin
-        if start_date:
-            expr = expr & (ds.field("date") >= start_date)
-        if end_date:
-            expr = expr & (ds.field("date") <= end_date)
+        # Ensure the last date is exactly end_date
+        if date_range[-1] != pd.Timestamp(end_date):
+            date_range = date_range.append(pd.DatetimeIndex([end_date]))
 
-        # Read into Arrow Table -> Pandas
-        tbl = dataset.to_table(filter=expr)
-        if tbl.num_rows == 0:
-            return False  # Skip this basin/source if no data is found
-        df = tbl.to_pandas()
-
-        if source == "gauge":
-            df = df.drop(columns=["quality_flag", "provider"])
-        df = df.drop(columns=["basin", "year"])
-        df["date"] = df["date"].dt.tz_localize(None).astype("datetime64[ns]")
-        df = df.set_index(["date", "subbasin"]).sort_index()
-
-        # Convert to xarray
-        ds_xr = xr.Dataset.from_dataframe(df)
-        ds_xr = ds_xr.transpose("date", "subbasin", ...)  # ensure index ordering
-        ds_xr = ds_xr.chunk({"date": chunk_days, "subbasin": -1})
-        # Write this dataset to its own unique group. Use mode="w" to overwrite.
+        written = False
         group_path = f"{source}/{basin}"
-        ds_xr.to_zarr(str(zarr_path), group=group_path, mode="w")
+        for chunk_start, chunk_end in zip(date_range[:-1], date_range[1:]):
+            df = self.read_dynamic(
+                basin=basin, source=source, start_date=chunk_start, end_date=chunk_end
+            )
 
-        return True
+            df = df[source]
+            if df.empty:
+                continue
+
+            df = df.reset_index()
+            df["date"] = df["date"].dt.tz_localize(None).astype("datetime64[ns]")
+            df = df.set_index(["date", "subbasin"]).sort_index()
+
+            if source == "gauge":
+                df = df.drop(columns=["quality_flag", "provider"])
+
+            # Convert to xarray
+            ds_xr = xr.Dataset.from_dataframe(df)
+            ds_xr = ds_xr.transpose("date", "subbasin", ...)  # ensure index ordering
+            ds_xr = ds_xr.chunk({"date": chunk_days, "subbasin": -1})
+
+            # Write this dataset to its own unique group. Use mode="w" to overwrite.
+            if not written:
+                ds_xr.to_zarr(str(zarr_path), group=group_path, mode="w")
+                written = True
+            else:
+                ds_xr.to_zarr(
+                    str(zarr_path), group=group_path, mode="a", append_dim="date", align_chunks=True
+                )
+
+        return written
+
+    def consolidate_zarr(self, zarr_root: Path | str):
+        zarr_root = Path(zarr_root)
+        sources = [p for p in zarr_root.iterdir() if p.is_dir()]
+
+        for source_path in sources:
+            basin_paths = [p for p in source_path.iterdir() if p.is_dir()]
+            print(f"Consolidating source: {source_path.name}...")
+
+            for basin_path in tqdm(basin_paths, desc=f"Basins in {source_path.name}"):
+                zarr.consolidate_metadata(basin_path)
+
+    def compute_and_store_stats(self, zarr_root: Path, overwrite: bool = False):
+        """
+        Iterates through all basin Zarr groups to compute and store normalization statistics.
+        This is a standalone script to be run once after data is exported to Zarr.
+        """
+        with Client() as client:
+            print(f"Dask client started. Dashboard at: {client.dashboard_link}")
+
+            zarr_root = Path(zarr_root)
+            sources = [p for p in zarr_root.iterdir() if p.is_dir()]
+
+            for source_path in sources:
+                basin_paths = [p for p in source_path.iterdir() if p.is_dir()]
+                print(f"Processing source: {source_path.name}...")
+
+                for basin_path in tqdm(basin_paths, desc=f"Basins in {source_path.name}"):
+                    try:
+                        # Check for existing stats before opening with Dask
+                        z_group = zarr.open(str(basin_path), mode="r")
+                        if "normalization_stats" in z_group.attrs and not overwrite:
+                            continue
+
+                        ds = xr.open_zarr(basin_path, consolidated=True)
+                        stats_dict = {}
+                        vars_to_scale = [v for v in ds.data_vars if ds[v].dtype.kind in "fi"]
+
+                        # Prepare all Dask computations
+                        computations = {}
+                        for var_name in vars_to_scale:
+                            variable = ds[var_name].astype(np.float64)
+                            valid_values = variable.where(variable.notnull())
+                            positive_values = valid_values.where(valid_values > 0)
+
+                            # Store the delayed computation objects
+                            computations[var_name] = {
+                                "count": valid_values.count(),
+                                "sum": valid_values.sum(),
+                                "sum_sq": (valid_values**2).sum(),
+                                "min": valid_values.min(),
+                                "max": valid_values.max(),
+                                "log_sum": np.log(positive_values + LOG_PAD).sum(),
+                                "positive_count": positive_values.count(),
+                            }
+
+                        # 2. Trigger all computations in parallel with a single Dask call
+                        results = client.compute(computations)
+                        processed_results = client.gather(results)
+
+                        # 3. Process the results after they are computed
+                        for var_name, stats in processed_results.items():
+                            count = stats["count"].item()
+                            if count == 0:
+                                continue
+
+                            stats_dict[var_name] = {
+                                "count": count,
+                                "sum": stats["sum"].item(),
+                                "sum_sq": stats["sum_sq"].item(),
+                                "min": stats["min"].item(),
+                                "max": stats["max"].item(),
+                                "log_sum": stats["log_sum"].item()
+                                if stats["positive_count"].item() > 0
+                                else 0.0,
+                            }
+
+                        if stats_dict:
+                            # Re-open with zarr library to write attributes
+                            z_group_write = zarr.open(str(basin_path), mode="r+")
+                            z_group_write.attrs["normalization_stats"] = stats_dict
+
+                    except Exception as e:
+                        print(f"\nFailed to process {basin_path}: {e}")

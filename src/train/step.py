@@ -158,6 +158,7 @@ def clip_gradients(grads: PyTree, max_norm: float) -> PyTree:
     scale = jnp.minimum(max_norm / total_norm, 1.0)
     return jtu.tree_map(lambda g: scale * g, grads)
 
+compile_count = {"n": 0}
 
 @eqx.filter_jit
 def make_step(
@@ -197,6 +198,9 @@ def make_step(
     opt_state: PyTree
         The updated optimizer state.
     """
+    compile_count["n"] += 1
+    print(f"JIT compile #{compile_count['n']} for shapes {data.y.shape}")
+
     diff_model, static_model = eqx.partition(model, filter_spec)
     loss_fn_with_grad = eqx.filter_value_and_grad(compute_loss_fn)
     loss, grads = loss_fn_with_grad(diff_model, static_model, data, keys, **kwargs)

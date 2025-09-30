@@ -26,6 +26,11 @@ class Features(BaseModel):
     target: dict[str, list[str]]
 
 
+class Encoding(BaseModel):
+    categorical: dict[str, list[str]] = Field(default_factory=dict)
+    bitmask: dict[str, list[int]] = Field(default_factory=dict)
+
+
 class StepKwargs(BaseModel):
     loss_name: Literal["mse", "mae", "huber", "nse", "spin_up_nse"] = "mse"
     target_weights: list[float] | None = None
@@ -121,7 +126,13 @@ class Config(BaseModel):
 
     # Data processing
     features: Features
+    dynamic_encoding: Encoding = Field(default_factory=Encoding)
+    static_encoding: Encoding = Field(default_factory=Encoding)
+    log_norm_cols: list[str] = Field(default_factory=list)
+    range_norm_cols: list[str] = Field(default_factory=list)
     in_memory: bool = False
+
+    # Data slicing
     train_date_range: list[datetime] = Field(..., min_length=2, max_length=2)
     validate_date_range: list[datetime] = Field(..., min_length=2, max_length=2)
     test_date_range: list[datetime] = Field(..., min_length=2, max_length=2)
@@ -130,12 +141,6 @@ class Config(BaseModel):
     clip_feature_range: dict[str, list[float | None]] = Field(default_factory=dict)
     value_filters: list[ValueFilter] = Field(default_factory=list)
     exclude_target_from_index: list[str] = Field(default_factory=list)
-
-    # Feature scaling / encoding
-    log_norm_cols: list[str] = Field(default_factory=list)
-    range_norm_cols: list[str] = Field(default_factory=list)
-    categorical_cols: list[str] = Field(default_factory=list)
-    bitmask_cols: list[str] = Field(default_factory=list)
 
     # DataLoader
     data_subset: DataSubset = DataSubset.train

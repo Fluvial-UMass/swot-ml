@@ -1,3 +1,3 @@
-from .config import Config, DataSubset
+from .config import Config, DataSubset, Encoding
 
-__all__ = [Config, DataSubset]
+__all__ = [Config, DataSubset, Encoding]

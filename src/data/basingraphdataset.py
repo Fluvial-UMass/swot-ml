@@ -1,14 +1,15 @@
 import hashlib
 import warnings
 import json
-import pickle
 from typing import NamedTuple
+from collections import defaultdict
 
 import yaml
 from tqdm import tqdm
 import pandas as pd
 import xarray as xr
 import zarr
+from zarr.errors import ZarrUserWarning
 import networkx as nx
 import numpy as np
 import jax.numpy as jnp
@@ -34,7 +35,7 @@ class GraphBatch(NamedTuple):
 
     @classmethod
     def in_axes(cls):
-        # TODO: If we start training with mixes of different basins we will need assign graph_edges to 0 as well.
+        # Identifies the batch dimensions for jax.vmap
         return cls(
             dynamic=0,
             static=0,
@@ -54,7 +55,6 @@ class BasinGraphDataset(Dataset):
         subset: DataSubset,
         *,
         train_ds: "BasinGraphDataset" = None,
-        use_cache=True,
     ):
         self.cfg = cfg
         self.log_pad = 0.001
@@ -67,7 +67,9 @@ class BasinGraphDataset(Dataset):
             self.d_encoding = train_ds.d_encoding
             self.d_scale = train_ds.d_scale
         else:
-            self.s_encoding = self.s_scale = self.d_encoding = self.d_scale = None
+            self.s_encoding = self.cfg.static_encoding.model_dump()
+            self.d_encoding = self.cfg.dynamic_encoding.model_dump()
+            self.s_scale = self.d_scale = None
 
         self.features = self.cfg.features.model_dump()  # dump to dict
         self.target = [v for v_lists in self.features["target"].values() for v in v_lists]
@@ -76,7 +78,7 @@ class BasinGraphDataset(Dataset):
         self.basins = self._read_basin_files()
         self.graphs = self._load_basin_graphs()
         self.x_s = self._load_attributes()
-        self.x_d = self._open_zarr_store(use_cache)
+        self.basin_x_ds = self._open_zarr_store()
         self.update_indices()
 
     def __len__(self):
@@ -121,90 +123,63 @@ class BasinGraphDataset(Dataset):
 
         return basins
 
-    def _open_zarr_store(self, use_cache) -> xr.Dataset:
+    def _open_zarr_store(self) -> xr.Dataset:
         """Opens all basin-specific Zarr groups and stores them as lazy datasets."""
-        print("Opening dyanmic zarr store (lazy)...")
+        print("Opening dynamic data...")
+        warnings.filterwarnings("ignore", category=ZarrUserWarning)
 
         dynamic_sources = set(self.features["dynamic"].keys())
         target_sources = set(self.features["target"].keys())
-        sources = dynamic_sources.union(target_sources)
+        self.sources = dynamic_sources.union(target_sources)
 
-        # Unpack dict of lists into sets
         dynamic_columns = set([vv for v in self.features["dynamic"].values() for vv in v])
         target_columns = set([vv for v in self.features["target"].values() for vv in v])
         columns = dynamic_columns.union(target_columns)
 
-        basin_datasets = []
-        self.basin_subbasin_map = {}
-        for basin_id in self.basins:
-            basin_paths = []
+        if self.cfg.in_memory:
+            print(f"Loading full dynamic dataset into memory ({self.cfg.in_memory=}).")
+        else:
+            print("Lazily loading each basin's dynamic data.")
 
-            for source in sources:
+        basin_datasets = {}
+        self.basin_subbasin_map = {}
+        for basin_id in tqdm(self.basins, desc="Basins"):
+            basin_paths = []
+            for source in self.sources:
                 path = self.cfg.zarr_dir / source / basin_id
                 if path.exists():
-                    self._ensure_consolidated_metadata(path)
                     basin_paths.append(str(path))
-
-            if not basin_paths:
-                continue  # Skip if this basin has no data files
-
-            # Open all sources for this single basin
+            
             ds = xr.open_mfdataset(
                 basin_paths,
                 engine="zarr",
                 combine="by_coords",
                 data_vars=list(columns),
                 join="outer",
+                chunks={"date": 365},
             )
-            ds = ds.assign_coords(basin=("subbasin", [basin_id] * len(ds.subbasin)))
-            basin_datasets.append(ds)
-            self.basin_subbasin_map[basin_id] = list(ds.subbasin.values)
+            if self.cfg.in_memory:
+                ds = ds.compute()
 
-        # Build full dataset and rechunk
-        ds = xr.concat(basin_datasets, dim="subbasin", join="outer")
-        basin_chunks = self.create_basin_aware_chunks(ds)
-        ds = ds.chunk(basin_chunks)
-        ds = ds.sel(date=self.time_slice)
+            # Encoding is fully prescribed in the config or from the 
+            ds, updated_enc = self._encode_data(ds, 'dynamic', self.d_encoding)
+            self.d_encoding = updated_enc
+            # During training, this will calculate the global training normalization stats based
+            # on the metadata in the training basin zarr files the first time it is called, 
+            # then reuse the scaling in the repeated basins. 
+            ds, self.d_scale = self._normalize_data(ds, 'dynamic', self.d_encoding, self.d_scale)
+            basin_datasets[basin_id] = ds
 
-        self.time_gaps = {
-            source: ds[columns].to_array().isnull().any().compute().item()
-            for source, columns in self.features["dynamic"].items()
-        }
+            subbasin_ids = ds.subbasin.values.tolist()  # This is small, OK to compute
+            self.basin_subbasin_map[basin_id] = subbasin_ids
+        
+        warnings.resetwarnings()
+        return basin_datasets
 
-        x_d = self._cached_encode_dynamic(ds, use_cache)
-
-        if self.cfg.in_memory:
-            x_d = x_d.compute()
-
-        return x_d
-
-    def _cached_encode_dynamic(self, ds, use_cache):
-        from_cache = False
-        norm_config_hash = self._get_normalization_hash()
-        cache_dir = self.cfg.data_root / "cache"
-        cache_dir.mkdir(exist_ok=True)
-        cache_file = cache_dir / (norm_config_hash + ".pkl")
-        if use_cache and cache_file.is_file():
-            with open(cache_file, "rb") as f:
-                cache_dict = pickle.load(f)
-            self.d_encoding = cache_dict.get("d_encoding")
-            self.d_scale = cache_dict.get("d_scale")
-            from_cache = True
-
-        # Encode and scale the data.
-        ds, self.d_encoding = self._encode_data(ds, "dynamic", self.d_encoding)
-        x_d, self.d_scale = self._normalize_data(ds, "dynamic", self.d_encoding, self.d_scale)
-
-        # Save encoding and scale dicts to pickle file, unless we just read it in above...
-        if use_cache and not from_cache:
-            with open(cache_file, "wb") as f:
-                pickle.dump({"d_encoding": self.d_encoding, "d_scale": self.d_scale}, f)
-
-        return x_d
 
     def _load_basin_graphs(self) -> dict[str, np.ndarray]:
         """Loads all basin-specific graphs."""
-        print("Loading basin graphs...")
+        print("Loading basin graphs...", end="")
 
         with open(self.cfg.graph_network_file) as f:
             graph_json = json.load(f)
@@ -236,6 +211,7 @@ class BasinGraphDataset(Dataset):
         if missing_basins:
             raise ValueError(f"Not all basins were found in graph file. {missing_basins=}")
 
+        print("Done!")
         return graphs
 
     def _load_attributes(self) -> xr.Dataset:
@@ -245,11 +221,18 @@ class BasinGraphDataset(Dataset):
         Returns:
             xr.Dataset: An xarray dataset of attribute data with basin coordinates.
         """
-        print("Loading static attributes")
+        print("Loading static attributes...", end="")
         df = pd.read_parquet(self.cfg.attributes_file)
 
         basin_mask = df.index.get_level_values("basin").isin(self.basins)
-        df = df[basin_mask].droplevel("basin")
+        df = df[basin_mask]
+
+        # 2. Extract the basin-to-subbasin mapping into a separate Series
+        # This Series will have 'subbasin' as its index and 'basin' as its values
+        subbasin_to_basin_map = df.index.to_frame(index=False).set_index("subbasin")["basin"]
+
+        # 3. Drop the 'basin' level to proceed with data-only processing
+        df = df.droplevel("basin")
 
         if self.inference_mode:
             unencoded_cols = [k for k, v in self.s_scale.items() if not v["encoded"]]
@@ -266,9 +249,10 @@ class BasinGraphDataset(Dataset):
                 return None
             df = df[feat] if feat else df
 
-            # Remove columns with zero variance or NaN values
+            # Remove numerical columns with zero variance or NaN values
             nan_cols = list(df.columns[df.isna().any()])
-            zero_var_cols = list(df.columns[df.std(ddof=0) == 0])
+            numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+            zero_var_cols = list(df[numeric_cols].columns[df[numeric_cols].std(ddof=0) == 0])
             cols_to_drop = list(set(zero_var_cols + nan_cols))
             if cols_to_drop:
                 print(
@@ -276,14 +260,20 @@ class BasinGraphDataset(Dataset):
                 )
                 df.drop(columns=cols_to_drop, inplace=True)
 
-        # Update or set the static feature list.
-        self.features["static"] = list(df.columns)
+        # Update the static feature list, excluding 'basin' which becomes a coordinate.
+        self.features["static"] = [col for col in df.columns if col != "basin"]
 
         # Encode and scale the data.
         ds = df.to_xarray()
         ds, self.s_encoding = self._encode_data(ds, "static", self.s_encoding)
         x_s, self.s_scale = self._normalize_data(ds, "static", self.s_encoding, self.s_scale)
 
+        # Reindex the map ensure alignment with the subbasins in the final dataset.
+        if "subbasin" in x_s.coords:
+            aligned_basins = subbasin_to_basin_map.reindex(x_s.subbasin.values)
+            x_s = x_s.assign_coords(basin=("subbasin", aligned_basins.values))
+
+        print("Done!")
         return x_s
 
     def _create_sparse_graph_from_nx(self) -> Array:
@@ -308,10 +298,9 @@ class BasinGraphDataset(Dataset):
         basin, end_date = self.sample_list[idx]
         start_date = end_date - pd.Timedelta(days=self.cfg.sequence_length - 1)
 
-        # Slice into the dynamic xarray dataset
-        subbasins = self.basin_subbasin_map[basin]
+        # get the basin xarray and slice by time
         date_slice = slice(start_date, end_date)
-        ds = self.x_d.sel(subbasin=subbasins, date=date_slice)
+        ds = self.basin_x_ds[basin].sel(date=date_slice)
 
         dynamic = {}
         # select the dynamic, static, and target arrays
@@ -327,7 +316,7 @@ class BasinGraphDataset(Dataset):
 
         static = None
         if self.x_s is not None and self.features["static"]:
-            static_ds = self.x_s.sel(subbasin=subbasins)
+            static_ds = self.x_s.where(self.x_s.basin == basin, drop=True)
             static_arr = (
                 static_ds[self.features["static"]]
                 .to_array(dim="variable")
@@ -373,171 +362,223 @@ class BasinGraphDataset(Dataset):
         assert feat_group in ["dynamic", "static"]
 
         columns_in = ds.data_vars
-        one_hot_enc = encoding.get("one_hot") if encoding else None
-        bitmask_enc = encoding.get("bitmask") if encoding else None
-
-        ds, one_hot = self._one_hot_encoding(ds, feat_group, one_hot_enc)
-        ds, bitmask = self._bitmask_expansion(ds, feat_group, bitmask_enc)
+        ds, categorical_enc = self._one_hot_encoding(ds, feat_group, encoding['categorical'])
+        ds, bitmask_enc = self._bitmask_expansion(ds, feat_group, encoding['bitmask'])
 
         new_columns = set(ds.data_vars) - set(columns_in)
 
-        encoding = {"one_hot": one_hot, "bitmask": bitmask, "encoded_columns": list(new_columns)}
+        updated_encoding = {
+            "categorical": categorical_enc,
+            "bitmask": bitmask_enc,
+            "encoded_columns": list(new_columns)
+        }
 
-        return ds, encoding
+        return ds, updated_encoding
 
-    def _one_hot_encoding(self, ds: xr.Dataset, feat_group, onehot_enc: dict | None):
-        assert feat_group in ["dynamic", "static"]
+    def _one_hot_encoding(self, ds: xr.Dataset, feat_group: str, cat_enc: dict[str, list[str]]):
+        is_train = self.data_subset == "train"
 
-        # Apply one-hot encoding to categorical columns
-        if not onehot_enc:
-            # Use flattened categorical_cols from config, filter for columns in ds
-            categorical_cols = [col for col in self.cfg.categorical_cols if col in ds.data_vars]
-            if not categorical_cols:
-                return ds, None
-            onehot_enc = {col: None for col in categorical_cols}
+        for col, prescribed in cat_enc.items():
+            if col not in ds.data_vars:
+                # During inference we add zero-filled columns even if the column is missing. 
+                if not is_train and prescribed:
+                    zero_df = pd.DataFrame(
+                        0, index=ds.indexes["subbasin"], columns=[f"{col}_{c}" for c in prescribed]
+                    )
+                    ds = xr.merge([ds, zero_df.to_xarray()])
+                continue
 
-        for col, prescribed_cols in onehot_enc.items():
-            if col in ds.data_vars:
-                df = ds[col].to_dataframe()
-                encoded = pd.get_dummies(df[col].astype(str), prefix=col)
-                # Remove the original categorical column
-                ds = ds.drop_vars(col)
+            df = ds[col].to_dataframe()
+            encoded = pd.get_dummies(df[col].astype(str), prefix=col)
+
+            ds = ds.drop_vars(col)
+
+            if is_train and not prescribed:
+                # discover categories
+                cat_enc[col] = encoded.columns.tolist()
             else:
-                # Create an empty DataFrame with the same index as ds
-                encoded = pd.DataFrame(index=ds.basin)
-
-            if prescribed_cols is not None and len(prescribed_cols) > 0:
-                # Add missing categories as columns filled with zeros
-                for c in prescribed_cols:
+                # enforce prescribed ordering
+                for c in prescribed:
                     if c not in encoded.columns:
                         encoded[c] = 0
-                # Filter out columns not in the prescribed encoding
-                encoded = encoded[prescribed_cols]
-            else:
-                onehot_enc[col] = encoded.columns
+                encoded = encoded[prescribed]
 
-            # Add encoded data
             ds = xr.merge([ds, encoded.to_xarray()])
 
-            # Locate the col inside the features dict, remove and replace.
-            # This is kind of ugly but deals with the 2 level feature dict.
+            # update features dict
             if feat_group == "dynamic":
-                for source, source_features in self.features[feat_group].items():
-                    if col in source_features:
-                        self.features[feat_group][source].remove(col)
-                        self.features[feat_group][source].extend(encoded.columns)
-            elif feat_group == "static":
-                self.features[feat_group].extend(encoded.columns)
-                if col in self.features[feat_group]:
-                    self.features[feat_group].remove(col)
-                else:
-                    print(f"{col} not found in {feat_group} features. Encoded as 0s.")
+                for source, feats in self.features["dynamic"].items():
+                    if col in feats:
+                        feats.remove(col)
+                        feats.extend(encoded.columns)
+            else:
+                if col in self.features["static"]:
+                    self.features["static"].remove(col)
+                self.features["static"].extend(encoded.columns)
 
-        return ds, onehot_enc
+        return ds, cat_enc
 
-    def _bitmask_expansion(self, ds: xr.Dataset, feat_group: str, bitmask_enc: dict | None):
-        assert feat_group in ["dynamic", "static"]
+    def _bitmask_expansion(
+        self, ds: xr.Dataset, feat_group: str, bitmask_enc: dict[str, list[int]]
+    ):
+        is_train = self.data_subset == "train"
 
-        if not bitmask_enc:
-            # Use flattened bitmask_cols from config, filter for columns present in the dataset
-            bitmask_cols = [col for col in self.cfg.bitmask_cols if col in ds.data_vars]
-            if not bitmask_cols:
-                return ds, None
-            # Initialize encoding. The value for each column will be the list of used bit indices.
-            bitmask_enc = {k: None for k in bitmask_cols}
-
-        for col, bits_to_expand in bitmask_enc.items():
+        for col, prescribed_bits in bitmask_enc.items():
             new_vars = {}
+
             if col in ds.data_vars:
-                # Get the bitmask integers
-                original_da = ds[col]
-                x = original_da.values
+                x = ds[col].values
                 finite_mask = np.isfinite(x)
-
-                if not np.any(finite_mask):
-                    print(
-                        f"Warning: No finite values found in column '{col}' for bitmask expansion. "
-                        "Skipping bitmask encoding for this column."
-                    )
-                    # During training, record that no bits were used for this column.
-                    if bits_to_expand is None:
-                        bitmask_enc[col] = []
-                    continue
-
-                # Temporarily set NaN to 0 for bit operations
                 x_int = np.where(finite_mask, x, 0).astype(int)
 
-                if bits_to_expand is None:  # Training mode: determine which bits to expand
+                if is_train and not prescribed_bits:
+                    # infer used bits
                     max_val = x_int.max()
-                    num_bits = int(np.ceil(np.log2(max_val + 1))) if max_val > 0 else 0
+                    nbits = int(np.ceil(np.log2(max_val + 1))) if max_val > 0 else 0
+                    prescribed_bits = [
+                        n for n in range(nbits) if ((x_int // 2**n) % 2)[finite_mask].sum() > 0
+                    ]
+                    bitmask_enc[col] = prescribed_bits
 
-                    # Determine which bits are actually used in this dataset
-                    used_bits = []
-                    for n in range(num_bits):
-                        bit_arr = (x_int // 2**n) % 2
-                        if bit_arr[finite_mask].sum() > 0:
-                            used_bits.append(n)
-
-                    bitmask_enc[col] = used_bits  # Save the list of used bits
-                    bits_to_expand = used_bits  # Use this list for the current expansion
-
-                # Expand only the determined/prescribed bits
-                for n in bits_to_expand:
-                    bit_arr = (x_int // 2**n) % 2
-                    bit_arr = bit_arr.astype(float)  # So we can assign np.nan
-                    bit_arr[~finite_mask] = np.nan  # Restore NaNs
-
+                for n in prescribed_bits:
+                    bit_arr = ((x_int // 2**n) % 2).astype(float)
+                    bit_arr[~finite_mask] = np.nan
                     new_vars[f"{col}_bit_{n}"] = xr.DataArray(
-                        data=bit_arr,
-                        dims=original_da.dims,
-                        coords=original_da.coords,
+                        bit_arr, dims=ds[col].dims, coords=ds[col].coords
                     )
-                # Remove the original categorical column
+
                 ds = ds.drop_vars(col)
 
-            else:  # Column is not in the current dataset
-                if bits_to_expand is None:  # Training mode, but column is missing from data.
-                    bitmask_enc[col] = []  # Record that no bits were used.
-                    continue
-
-                # Inference mode, column is missing. Create zero-filled columns for all prescribed bits.
-                for n in bits_to_expand:
-                    # Infer dims/coords from the dataset's coordinates
+            else:
+                # col missing
+                if not is_train and prescribed_bits:
                     if feat_group == "dynamic":
                         dims = ("subbasin", "date")
-                        coords = {"subbasin": ds.coords["subbasin"], "date": ds.coords["date"]}
-                        shape = (len(ds.coords["subbasin"]), len(ds.coords["date"]))
-                    elif feat_group == "static":
+                        coords = {"subbasin": ds.subbasin, "date": ds.date}
+                        shape = (len(ds.subbasin), len(ds.date))
+                    else:
                         dims = ("subbasin",)
-                        coords = {"subbasin": ds.coords["subbasin"]}
-                        shape = (len(ds.coords["subbasin"]),)
-
-                    new_vars[f"{col}_bit_{n}"] = xr.DataArray(
-                        data=np.zeros(shape),
-                        dims=dims,
-                        coords=coords,
-                    )
+                        coords = {"subbasin": ds.subbasin}
+                        shape = (len(ds.subbasin),)
+                    for n in prescribed_bits:
+                        new_vars[f"{col}_bit_{n}"] = xr.DataArray(
+                            np.zeros(shape), dims=dims, coords=coords
+                        )
 
             if new_vars:
                 ds = xr.merge([ds, xr.Dataset(new_vars)], compat="no_conflicts")
 
-            # Update the features list with the new bit columns
-            if feat_group == "dynamic":
-                for source, source_features in self.features["dynamic"].items():
-                    if col in source_features:
-                        self.features["dynamic"][source].remove(col)
-                        self.features["dynamic"][source].extend(new_vars.keys())
-            elif feat_group == "static":
-                if col in self.features[feat_group]:
-                    self.features[feat_group].remove(col)
-                    self.features[feat_group].extend(new_vars.keys())
-                elif new_vars:
-                    # Only print warning if we actually added columns for a missing feature
-                    print(f"{col} not found in {feat_group} features. Encoded as 0s.")
+                # update features
+                if feat_group == "dynamic":
+                    for source, feats in self.features["dynamic"].items():
+                        if col in feats:
+                            feats.remove(col)
+                            feats.extend(new_vars.keys())
+                else:
+                    if col in self.features["static"]:
+                        self.features["static"].remove(col)
+                    self.features["static"].extend(new_vars.keys())
 
         return ds, bitmask_enc
 
-    def _normalize_data(self, ds: xr.Dataset, feat_group, encoding, scale=None):
+    def _get_scale_from_precomp_stats(self, encoding: dict):
+        """
+        Calculates mean and std for a subset of basins by aggregating pre-computed stats.
+        Uses pre-stored attributes in each basin's Zarr group.
+        """
+        aggregated_stats = defaultdict(
+            lambda: {
+                "count": 0,
+                "sum": 0.0,
+                "sum_sq": 0.0,
+                "min": np.inf,
+                "max": -np.inf,
+                "log_sum": 0.0,
+            }
+        )
+
+        for basin_id in self.basins:
+            for source in self.sources:
+                basin_path = self.cfg.zarr_dir / source / str(basin_id)
+                try:
+                    z_group = zarr.open(str(basin_path), mode="r")
+                    basin_stats = z_group.attrs["normalization_stats"]
+                    for var, stats in basin_stats.items():
+                        agg = aggregated_stats[var]
+                        agg["count"] += stats["count"]
+                        agg["sum"] += stats["sum"]
+                        agg["sum_sq"] += stats["sum_sq"]
+                        agg["min"] = min(agg["min"], stats["min"])
+                        agg["max"] = max(agg["max"], stats["max"])
+                        agg["log_sum"] += stats["log_sum"]
+                except Exception:
+                    raise KeyError(f"Failed to load normalization stats for {basin_path}")
+
+        scale = {}
+        all_vars = set(aggregated_stats.keys()).union(set(encoding["encoded_columns"]))
+
+        for var in all_vars:
+            scale[var] = {"encoded": False, "log_norm": False, "offset": 0.0, "scale": 1.0}
+
+            if var in encoding["encoded_columns"]:
+                scale[var]["encoded"] = True
+                continue
+
+            stats = aggregated_stats[var]
+            total_count = stats["count"]
+
+            if var in self.cfg.log_norm_cols:
+                scale[var]["log_norm"] = True
+                scale[var]["offset"] = stats["log_sum"] / total_count
+
+            elif var in self.cfg.range_norm_cols:
+                min_val, max_val = stats["min"], stats["max"]
+                scale[var]["offset"] = min_val
+                scale[var]["scale"] = max_val - min_val if max_val > min_val else 1.0
+
+            else:  # z-score
+                mean = stats["sum"] / total_count
+                variance = (stats["sum_sq"] / total_count) - (mean**2)
+                std = np.sqrt(max(variance, 0))
+                scale[var]["offset"] = mean
+                scale[var]["scale"] = std if std > 1e-9 else 1.0
+
+        return scale
+
+    def _calculate_scale_from_data(self, ds: xr.Dataset, encoding: dict):
+        """
+        Calculate normalization directly from dataset values.
+        """
+        scale = {
+            k: {"encoded": False, "log_norm": False, "offset": 0.0, "scale": 1.0}
+            for k in ds.data_vars
+        }
+
+        for var in ds.data_vars:
+            if var in encoding["encoded_columns"]:
+                scale[var]["encoded"] = True
+                continue
+
+            if var in self.cfg.log_norm_cols:
+                scale[var]["log_norm"] = True
+                x = ds[var] + self.log_pad
+                scale[var]["offset"] = np.nanmean(np.log(x))
+
+            elif var in self.cfg.range_norm_cols:
+                min_val = float(ds[var].min())
+                max_val = float(ds[var].max())
+                scale[var]["offset"] = min_val
+                scale[var]["scale"] = max_val - min_val if max_val > min_val else 1.0
+
+            else:  # z-score
+                mean = float(ds[var].mean())
+                std = float(ds[var].std())
+                scale[var]["offset"] = mean
+                scale[var]["scale"] = std if std > 1e-9 else 1.0
+
+        return scale
+
+    def _normalize_data(self, ds: xr.Dataset, feat_group: str, encoding: dict, scale=None):
         """
         Normalize the input data using log normalization for specified variables and standard normalization for others.
 
@@ -548,43 +589,10 @@ class BasinGraphDataset(Dataset):
         assert feat_group in ["dynamic", "static"]
 
         if scale is None:
-            # Initialize
-            scale = {
-                k: {
-                    "encoded": False,
-                    "log_norm": False,
-                    "offset": 0,
-                    "scale": 1,
-                }
-                for k in ds.data_vars
-            }
-
-            # Iterate over each variable in the dataset and calculate scaler
-            for var in ds.data_vars:
-                log_norm_cols = self.cfg.log_norm_cols
-                range_norm_cols = self.cfg.range_norm_cols
-
-                if var in encoding["encoded_columns"]:
-                    # One-hot encoded columns don't need normalization
-                    scale[var]["encoded"] = True
-
-                elif log_norm_cols is not None and var in log_norm_cols:
-                    # Log normalization
-                    scale[var]["log_norm"] = True
-                    x = ds[var] + self.log_pad
-                    scale[var]["offset"] = np.nanmean(np.log(x))
-
-                elif range_norm_cols is not None and var in range_norm_cols:
-                    # Min-max scaling
-                    min_val = ds[var].min().values.item()
-                    max_val = ds[var].max().values.item()
-                    scale[var]["offset"] = min_val
-                    scale[var]["scale"] = max_val - min_val
-
-                else:
-                    # Standard normalization
-                    scale[var]["offset"] = ds[var].mean().values.item()
-                    scale[var]["scale"] = ds[var].std().values.item()
+            if feat_group == "dynamic":
+                scale = self._get_scale_from_precomp_stats(encoding)
+            else:
+                scale = self._calculate_scale_from_data(ds, encoding)
 
         for var in set(ds.data_vars).intersection(scale.keys()):
             scl = scale[var]
@@ -593,7 +601,6 @@ class BasinGraphDataset(Dataset):
             elif scl["log_norm"]:
                 ds[var] = np.log(ds[var] + self.log_pad) - scl["offset"]
             else:
-                # Handle 0 variance here
                 if scl["scale"] == 0:
                     ds[var] = ds[var] - scl["offset"]
                 else:
@@ -640,8 +647,6 @@ class BasinGraphDataset(Dataset):
         # First get the dates that can build a complete sequence
         seq_len = np.timedelta64(self.cfg.sequence_length, "D")
         min_train_date = np.datetime64(self.time_slice.start) + seq_len
-        valid_seq_mask = self.x_d["date"] >= min_train_date
-        valid_dates = self.x_d["date"][valid_seq_mask].values
 
         # For each basin, we will need to identify valid dates based on valid observations.
         def valid_target(ds):
@@ -650,17 +655,19 @@ class BasinGraphDataset(Dataset):
 
         # Loop through the basins and get a list of dates
         basin_date_map = {}
-        ds_valid_dates = self.x_d.sel(date=valid_dates)
         for basin in tqdm(self.basins_to_index, disable=self.cfg.quiet, desc="Updating Indices"):
-            ds_basin = ds_valid_dates.where(ds_valid_dates["basin"] == basin)
+            basin_ds = self.basin_x_ds[basin]
 
+            valid_seq_mask = basin_ds["date"] >= min_train_date
+            basin_ds = basin_ds.sel(date=valid_seq_mask)
+            
             # Mask out dates without valid data if we need it.
             if self.data_subset in ["train", "test"]:
-                target_mask = valid_target(ds_basin)
+                target_mask = valid_target(basin_ds)
             else:
                 target_mask = True
 
-            basin_date_map[basin] = ds_basin["date"][target_mask].values
+            basin_date_map[basin] = basin_ds["date"][target_mask].values
 
         # Now build unique indices for each pairing...
         # Master list of (basin, date) tuples that we use during __getitem__
@@ -699,28 +706,6 @@ class BasinGraphDataset(Dataset):
 
         self._basin_date_batching()
 
-    def _get_normalization_hash(self):
-        """Generates a hash based on config parameters that affect normalization."""
-        cfg_keys = [
-            "train_date_range",
-            "log_norm_cols",
-            "range_norm_cols",
-        ]
-        data_config = {k: getattr(self.cfg, k) for k in cfg_keys}
-        data_config["dynamic_feat"] = self.features["dynamic"]
-        data_config["train_basins"] = sorted(self.basins)
-        dict_str = yaml.dump(data_config, sort_keys=True)
-        return hashlib.sha256(dict_str.encode("utf-8")).hexdigest()
-
-    def _ensure_consolidated_metadata(self, zarr_path):
-        """Consolidate metadata if not already consolidated."""
-        try:
-            # Try to open with consolidated metadata
-            zarr.open_consolidated(str(zarr_path))
-        except ValueError:
-            # Not consolidated, so consolidate it
-            print(f"Consolidating metadata for {zarr_path}")
-            zarr.consolidate_metadata(str(zarr_path))
 
     def create_basin_aware_chunks(self, ds):
         basin_coord = ds.coords["basin"].values
