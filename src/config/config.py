@@ -126,6 +126,7 @@ class Config(BaseModel):
 
     # Data processing
     features: Features
+    time_gaps: dict
     dynamic_encoding: Encoding = Field(default_factory=Encoding)
     static_encoding: Encoding = Field(default_factory=Encoding)
     log_norm_cols: list[str] = Field(default_factory=list)
@@ -144,11 +145,10 @@ class Config(BaseModel):
 
     # DataLoader
     data_subset: DataSubset = DataSubset.train
+    target_nodes_per_batch: int
+    candidate_pool_size: int
     shuffle: bool = True
-    batch_size: int = Field(..., gt=0)
     num_workers: int = Field(..., ge=0)
-    timeout: int = Field(..., ge=0)
-    persistent_workers: bool
     pin_memory: bool = False
     drop_last: bool = True
     backend: Literal["cpu", "gpu", "tpu"] | None = None
@@ -159,8 +159,12 @@ class Config(BaseModel):
     model_args: ModelArgs = Field(discriminator="name")
 
     # Trainer
-    num_epochs: int = Field(..., gt=0)
-    validate_interval: int = Field(0, gt=0)  # 0 disables by falsiness
+    max_training_steps: int = Field(..., gt=0) # Required
+    max_training_hours: int = Field(np.inf, gt=0)
+    log_every_n_steps: int  = Field(np.inf, gt=0)
+    log_every_n_minutes: int = Field(np.inf, gt=0)
+
+    validate_every_n_steps: int = Field(np.inf, gt=0) 
     initial_lr: float = Field(..., gt=0, lt=1.0)
     decay_rate: float = Field(..., gt=0, lt=1.0)
     transition_begin: int = Field(0, ge=0)
@@ -173,7 +177,6 @@ class Config(BaseModel):
     # Outputs
     quiet: bool = True
     log: bool = True
-    log_interval: int = Field(5, gt=0)
 
     # Internal (not from YML)
     cfg_path: Path = Path()
@@ -206,20 +209,30 @@ class Config(BaseModel):
             values[attr] = values["data_root"] / values[attr]
 
         return values
-
-    @model_validator(mode="before")
-    @classmethod
-    def validate_workers(cls, values: dict):
-        num_workers = values.get("num_workers", 1)
-        if num_workers == 0:
-            values["timeout"] = 0
-            values["persistent_workers"] = False
-        else:
-            values["timeout"] = values.get("timeout", 900)
-            values["persistent_workers"] = values.get("persistent_workers", True)
-        return values
+    
 
     # MODEL / AFTER
+    @model_validator(mode="after")
+    def warn_in_memory_workers(self):
+        if self.num_workers > 0 and self.in_memory:
+            warnings.warn(
+                "When in_memory=True and num_workers>0, the entire dataset will be copied to each worker causing to higher memory usage.",
+                UserWarning
+            )
+        return self
+    
+    @model_validator(mode="after")
+    def validate_log_intervals(self):
+        """
+        Ensure at least one of log_every_n_steps or log_every_n_minutes is not inf.
+        """
+        steps_inf = self.log_every_n_steps == np.inf
+        minutes_inf = self.log_every_n_minutes == np.inf
+        if steps_inf and minutes_inf:
+            raise ValueError("At least one of log_every_n_steps or log_every_n_minutes must be set to a finite value.")
+        return self
+    
+
     @model_validator(mode="after")
     def validate_nse_requires_seq2seq(self):
         """
@@ -236,6 +249,29 @@ class Config(BaseModel):
                 raise ValueError(
                     "loss_name='nse' requires a model type with a 'seq2seq' attribute AND seq2seq=True."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_time_gaps_keys(self):
+        """
+        Ensure that time_gaps dict has all the same keys as features.dynamic dict,
+        and that all values in time_gaps are single booleans.
+        """
+        dynamic_keys = set(self.features.dynamic.keys())
+        time_gaps_keys = set(self.time_gaps.keys())
+        if dynamic_keys != time_gaps_keys:
+            missing = dynamic_keys - time_gaps_keys
+            extra = time_gaps_keys - dynamic_keys
+            msg = []
+            if missing:
+                msg.append(f"Missing keys in time_gaps: {sorted(missing)}")
+            if extra:
+                msg.append(f"Extra keys in time_gaps: {sorted(extra)}")
+            raise ValueError("time_gaps keys must match features.dynamic keys. " + "; ".join(msg))
+        # Check that all values are single booleans
+        for k, v in self.time_gaps.items():
+            if not isinstance(v, bool):
+                raise TypeError(f"time_gaps['{k}'] must be a boolean, got {type(v)}.")
         return self
 
     # FIELD / BEFORE

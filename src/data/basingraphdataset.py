@@ -1,10 +1,8 @@
-import hashlib
 import warnings
 import json
 from typing import NamedTuple
 from collections import defaultdict
 
-import yaml
 from tqdm import tqdm
 import pandas as pd
 import xarray as xr
@@ -22,6 +20,9 @@ from config import Config, DataSubset
 class GraphBatch(NamedTuple):
     dynamic: dict[str, Array]
     graph_edges: Array
+    graph_idx: Array = None
+    node_mask: Array = None
+    edge_mask: Array = None
     static: Array = None
     y: Array = None
 
@@ -32,16 +33,6 @@ class GraphBatch(NamedTuple):
             stacklevel=2,
         )
         return getattr(self, key)
-
-    @classmethod
-    def in_axes(cls):
-        # Identifies the batch dimensions for jax.vmap
-        return cls(
-            dynamic=0,
-            static=0,
-            graph_edges=0,
-            y=0,
-        )
 
 
 class BasinGraphDataset(Dataset):
@@ -143,13 +134,13 @@ class BasinGraphDataset(Dataset):
 
         basin_datasets = {}
         self.basin_subbasin_map = {}
-        for basin_id in tqdm(self.basins, desc="Basins"):
+        for basin_id in tqdm(self.basins, disable=self.cfg.quiet, desc="Basins"):
             basin_paths = []
             for source in self.sources:
                 path = self.cfg.zarr_dir / source / basin_id
                 if path.exists():
                     basin_paths.append(str(path))
-            
+
             ds = xr.open_mfdataset(
                 basin_paths,
                 engine="zarr",
@@ -161,21 +152,24 @@ class BasinGraphDataset(Dataset):
             if self.cfg.in_memory:
                 ds = ds.compute()
 
-            # Encoding is fully prescribed in the config or from the 
-            ds, updated_enc = self._encode_data(ds, 'dynamic', self.d_encoding)
+            # Encoding is fully prescribed in the config or from the
+            ds, updated_enc = self._encode_data(ds, "dynamic", self.d_encoding)
             self.d_encoding = updated_enc
             # During training, this will calculate the global training normalization stats based
-            # on the metadata in the training basin zarr files the first time it is called, 
-            # then reuse the scaling in the repeated basins. 
-            ds, self.d_scale = self._normalize_data(ds, 'dynamic', self.d_encoding, self.d_scale)
+            # on the metadata in the training basin zarr files the first time it is called,
+            # then reuse the scaling in the repeated basins.
+            ds, self.d_scale = self._normalize_data(ds, "dynamic", self.d_encoding, self.d_scale)
             basin_datasets[basin_id] = ds
 
             subbasin_ids = ds.subbasin.values.tolist()  # This is small, OK to compute
             self.basin_subbasin_map[basin_id] = subbasin_ids
-        
+
+        self.basin_subbasin_counts = {
+            basin: len(subbasins) for basin, subbasins in self.basin_subbasin_map.items()
+        }
+
         warnings.resetwarnings()
         return basin_datasets
-
 
     def _load_basin_graphs(self) -> dict[str, np.ndarray]:
         """Loads all basin-specific graphs."""
@@ -362,15 +356,15 @@ class BasinGraphDataset(Dataset):
         assert feat_group in ["dynamic", "static"]
 
         columns_in = ds.data_vars
-        ds, categorical_enc = self._one_hot_encoding(ds, feat_group, encoding['categorical'])
-        ds, bitmask_enc = self._bitmask_expansion(ds, feat_group, encoding['bitmask'])
+        ds, categorical_enc = self._one_hot_encoding(ds, feat_group, encoding["categorical"])
+        ds, bitmask_enc = self._bitmask_expansion(ds, feat_group, encoding["bitmask"])
 
         new_columns = set(ds.data_vars) - set(columns_in)
 
         updated_encoding = {
             "categorical": categorical_enc,
             "bitmask": bitmask_enc,
-            "encoded_columns": list(new_columns)
+            "encoded_columns": list(new_columns),
         }
 
         return ds, updated_encoding
@@ -380,7 +374,7 @@ class BasinGraphDataset(Dataset):
 
         for col, prescribed in cat_enc.items():
             if col not in ds.data_vars:
-                # During inference we add zero-filled columns even if the column is missing. 
+                # During inference we add zero-filled columns even if the column is missing.
                 if not is_train and prescribed:
                     zero_df = pd.DataFrame(
                         0, index=ds.indexes["subbasin"], columns=[f"{col}_{c}" for c in prescribed]
@@ -660,7 +654,7 @@ class BasinGraphDataset(Dataset):
 
             valid_seq_mask = basin_ds["date"] >= min_train_date
             basin_ds = basin_ds.sel(date=valid_seq_mask)
-            
+
             # Mask out dates without valid data if we need it.
             if self.data_subset in ["train", "test"]:
                 target_mask = valid_target(basin_ds)
@@ -705,7 +699,6 @@ class BasinGraphDataset(Dataset):
             ]
 
         self._basin_date_batching()
-
 
     def create_basin_aware_chunks(self, ds):
         basin_coord = ds.coords["basin"].values

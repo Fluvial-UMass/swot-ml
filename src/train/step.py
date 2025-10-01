@@ -73,7 +73,7 @@ def compute_loss_fn(
     diff_model: PyTree,
     static_model: PyTree,
     data: GraphBatch,
-    keys: list[PRNGKeyArray],
+    key: PRNGKeyArray,
     *,
     loss_name: str = "mse",
     target_weights: float | list[float] = 1,
@@ -107,17 +107,17 @@ def compute_loss_fn(
     loss : float
     """
     model = eqx.combine(diff_model, static_model)
-
-    in_axes_keys = 0
-    y_pred = jax.vmap(model, in_axes=(GraphBatch.in_axes(), in_axes_keys))(data, keys)
+    y_pred = model(data, key)
 
     if loss_name in ["nse", "spin_up_nse"]:
         # NSE calc requires the full time series, not just the final value.
         y = data.y
+        node_padding_mask = data.node_mask[jnp.newaxis, :, jnp.newaxis]
     else:
-        y = data.y[:, -1, ...]  # End of time dimension
+        y = data.y[-1, ...]  # End of time dimension
+        node_padding_mask = data.node_mask[:, jnp.newaxis]
 
-    valid_mask = ~jnp.isnan(y)
+    valid_mask = ~jnp.isnan(y) & node_padding_mask
     masked_y = jnp.where(valid_mask, y, 0)
     masked_y_pred = jnp.where(valid_mask, y_pred, 0)
 
@@ -158,13 +158,12 @@ def clip_gradients(grads: PyTree, max_norm: float) -> PyTree:
     scale = jnp.minimum(max_norm / total_norm, 1.0)
     return jtu.tree_map(lambda g: scale * g, grads)
 
-compile_count = {"n": 0}
 
 @eqx.filter_jit
 def make_step(
     model: eqx.Module,
     data: GraphBatch,
-    keys: list[PRNGKeyArray],
+    key: PRNGKeyArray,
     opt_state: PyTree,
     optim: Callable,
     filter_spec: PyTree,
@@ -198,12 +197,9 @@ def make_step(
     opt_state: PyTree
         The updated optimizer state.
     """
-    compile_count["n"] += 1
-    print(f"JIT compile #{compile_count['n']} for shapes {data.y.shape}")
-
     diff_model, static_model = eqx.partition(model, filter_spec)
     loss_fn_with_grad = eqx.filter_value_and_grad(compute_loss_fn)
-    loss, grads = loss_fn_with_grad(diff_model, static_model, data, keys, **kwargs)
+    loss, grads = loss_fn_with_grad(diff_model, static_model, data, key, **kwargs)
     if kwargs.get("max_grad_norm"):
         grads = clip_gradients(grads, kwargs.get("max_grad_norm"))
     updates, opt_state = optim.update(grads, opt_state)

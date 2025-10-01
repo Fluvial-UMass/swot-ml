@@ -55,7 +55,7 @@ def train_from_config(cfg: Config, log_dir: Path | None = None):
         The BasinGraphDataset loaded for training.
     """
     trainer = None
-    dataset = BasinGraphDataset(cfg)
+    dataset = BasinGraphDataset(cfg, "train")
     dataloader = BasinGraphDataLoader(cfg, dataset)
 
     if log_dir and log_dir.is_dir():
@@ -258,9 +258,8 @@ def calc_attributions(run_dir: Path):
     trainer = Trainer.load_last_checkpoint(run_dir)
     cfg = trainer.cfg
     cfg.batch_size = cfg.batch_size // 10
-    cfg.data_subset = DataSubset.test
 
-    dataset = BasinGraphDataset(cfg)
+    dataset = BasinGraphDataset(cfg, DataSubset.test)
     dataloader = BasinGraphDataLoader(cfg, dataset)
 
     save_dir = run_dir / "figures" / "attribution"
@@ -294,14 +293,15 @@ def load_prediction_model(run_dir: Path, chunk_idx: int | None = None):
     # cfg, model, _ = load_model(run_dir)
     trainer = Trainer.load_last_checkpoint(run_dir)
     cfg = trainer.cfg
-
-    train_dataset = BasinGraphDataset(cfg)
-    cfg.data_subset = DataSubset.predict
     cfg.shuffle = False  # No need to shuffle for inference
+
+    # Load the train dataset to get normalization stats.
+    # TODO could just have the testing dataset calculate the train stats directly
+    train_dataset = BasinGraphDataset(cfg, DataSubset.train)
     if chunk_idx:
         cfg.test_basin_file = f"metadata/site_lists/predictions/chunk_{chunk_idx:02}.txt"
 
-    predict_dataset = BasinGraphDataset(cfg, train_ds=train_dataset, use_cache=False)
+    predict_dataset = BasinGraphDataset(cfg, DataSubset.predict, train_ds=train_dataset)
 
     eval_dir = run_dir / "inference"
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -402,8 +402,7 @@ def eval_model(
         results_file = log_dir / out_stem
         print(f"Evaluating {data_subset.value} subset and saving to: {results_file}")
 
-        dataset.cfg.exclude_target_from_index = None
-        dataset.update_indices(data_subset)
+        dataset = BasinGraphDataset(cfg, data_subset)
         dataloader = BasinGraphDataLoader(cfg, dataset)
 
         results = predict(model, dataloader, quiet=cfg.quiet, denormalize=True)

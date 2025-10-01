@@ -6,11 +6,26 @@ from jaxtyping import Array, PRNGKeyArray
 
 def segment_softmax(scores: Array, segment_ids: Array, num_segments: int) -> Array:
     """Applies a numerically stable softmax to scores over segments."""
+    # Clip scores to prevent overflow
+    scores = jnp.clip(scores, -20, 20)
     max_scores = jax.ops.segment_max(scores, segment_ids, num_segments=num_segments)
-    stable_scores = scores - max_scores[segment_ids]
+
+    # Handle segments where all scores are -inf
+    all_masked = max_scores < -10
+    safe_max_scores = jnp.where(all_masked, 0.0, max_scores)
+
+    stable_scores = scores - safe_max_scores[segment_ids]
     exp_scores = jnp.exp(stable_scores)
     sum_exp_scores = jax.ops.segment_sum(exp_scores, segment_ids, num_segments=num_segments)
-    return exp_scores / (sum_exp_scores[segment_ids] + 1e-9)
+
+    # Return zeros for fully masked segments
+    safe_sum = jnp.maximum(sum_exp_scores, 1e-6)
+    result = exp_scores / safe_sum[segment_ids]
+
+    # Zero out fully masked segments
+    result = jnp.where(all_masked[segment_ids], 0.0, result)
+
+    return result
 
 
 class MultiHeadFwdAttentionLayer(eqx.Module):
@@ -50,7 +65,7 @@ class MultiHeadFwdAttentionLayer(eqx.Module):
         )
 
     def __call__(
-        self, h: Array, x_s: Array, edge_index: tuple[Array, Array]
+        self, h: Array, x_s: Array, edge_index: tuple[Array, Array], edge_mask: Array
     ) -> tuple[Array, Array]:
         num_nodes, hidden_size = h.shape
         src, dest = edge_index
@@ -67,10 +82,14 @@ class MultiHeadFwdAttentionLayer(eqx.Module):
         temperature = jnp.sqrt(self.head_size)
         scaled_scores = raw_scores / temperature
 
+        # Apply the edge mask BEFORE the softmax.
+        # Set scores for padded edges to -inf so they become zero after softmax.
+        masked_scores = jnp.where(edge_mask[:, jnp.newaxis], scaled_scores, -jnp.inf)
+
         # 3. Compute per-head softmax
         # vmap is over the head dimension of the scores.
         weights = jax.vmap(segment_softmax, in_axes=(1, None, None), out_axes=1)(
-            scaled_scores, dest, num_nodes
+            masked_scores, dest, num_nodes
         )
 
         # 4. Apply weights to per-head messages
@@ -126,7 +145,7 @@ class MultiHeadRevGatingLayer(eqx.Module):
         )
 
     def __call__(
-        self, h: Array, x_s: Array, edge_index: tuple[Array, Array]
+        self, h: Array, x_s: Array, edge_index: tuple[Array, Array], edge_mask: Array
     ) -> tuple[Array, Array]:
         num_nodes, hidden_size = h.shape
         src, dest = edge_index[::-1]  # Reversed for downstream-to-upstream
@@ -136,8 +155,11 @@ class MultiHeadRevGatingLayer(eqx.Module):
         raw_scores = jax.vmap(self.gate_mlp)(mlp_input)
         gates = jax.nn.sigmoid(raw_scores)
 
+        # Multiply gates by the mask to zero out padded edges.
+        masked_gates = gates * edge_mask[:, jnp.newaxis]
+
         h_reshaped = h.reshape(num_nodes, self.num_heads, self.head_size)
-        gated_messages = h_reshaped[src] * gates[:, :, None]
+        gated_messages = h_reshaped[src] * masked_gates[:, :, None]
 
         aggregated_messages = jax.vmap(
             lambda msg: jax.ops.segment_sum(msg, dest, num_nodes), in_axes=1, out_axes=1
@@ -199,7 +221,7 @@ class MultiHeadStackedGAT(eqx.Module):
         self.candidate_mlp = eqx.nn.MLP(gate_input_size, hidden_size, hidden_size * 3, 1, key=c_key)
 
     def __call__(
-        self, x: Array, x_s: Array, edge_index: Array
+        self, x: Array, x_s: Array, edge_index: Array, edge_mask: Array
     ) -> tuple[Array, Array, Array, Array, Array]:
         # This __call__ method remains unchanged, as the optimizations were
         # encapsulated within the attention/gating layers.
@@ -208,7 +230,7 @@ class MultiHeadStackedGAT(eqx.Module):
         h_fwd = x
         for layer in self.fwd_layers:
             h_norm = jax.vmap(self.norm)(h_fwd)
-            fwd_messages, fwd_w = layer(h_norm, x_s, edge_index)
+            fwd_messages, fwd_w = layer(h_norm, x_s, edge_index, edge_mask)
             h_fwd = h_fwd + fwd_messages
             fwd_ws.append(fwd_w)
         fwd_ws = jnp.stack(fwd_ws, axis=-1)
@@ -216,7 +238,7 @@ class MultiHeadStackedGAT(eqx.Module):
         h_rev = x
         for layer in self.rev_layers:
             h_norm = jax.vmap(self.norm)(h_rev)
-            rev_messages, rev_w = layer(h_norm, x_s, edge_index)
+            rev_messages, rev_w = layer(h_norm, x_s, edge_index, edge_mask)
             h_rev = h_rev + rev_messages
             rev_ws.append(rev_w)
         rev_ws = jnp.stack(rev_ws, axis=-1)
@@ -281,6 +303,8 @@ class SpatioTemporalLSTMCell(eqx.Module):
         state: tuple[Array, Array],
         node_features: Array,  # x_s
         edge_index: Array,
+        node_mask: Array,
+        edge_mask: Array,
         *,
         key: PRNGKeyArray,
     ) -> tuple[tuple[Array, Array], tuple[Array, Array]]:
@@ -289,19 +313,23 @@ class SpatioTemporalLSTMCell(eqx.Module):
         """
         h_prev, c_prev = state
 
+        # Temporal update
         # Update states with new observations. Vmap'd over each location.
         h_candidate, c_new = jax.vmap(self.lstm_cell)(x_t, (h_prev, c_prev))
 
+        # Mask the hidden state for padded nodes
+        masked_h = h_candidate * node_mask[:, jnp.newaxis]
+        masked_c = c_new * node_mask[:, jnp.newaxis]
+
+        # Spatial update
         # Propagate the freshly updated hidden states spatially.
         gat_out, fwd_w, rev_w, z, r = self.gat(
-            h_candidate,
-            node_features,
-            edge_index=edge_index,
+            masked_h, node_features, edge_index=edge_index, edge_mask=edge_mask
         )
         h_new = self.dropout(gat_out, key=key)
 
         # The new state and a tuple of all traceable weights/gates
-        new_state = (h_new, c_new)
+        new_state = (h_new, masked_c)
         trace_data = (fwd_w, rev_w, z, r)
 
         return new_state, trace_data

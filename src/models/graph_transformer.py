@@ -106,7 +106,10 @@ class ST_GATransformer(BaseModel):
         )
 
     def __call__(self, data: GraphBatch, key: PRNGKeyArray) -> Array:
-        num_locations = data.static.shape[0]
+        num_locations = data.static.shape[0]  # including padding
+        node_mask = data.node_mask
+        edge_mask = data.edge_mask
+        graph_edges = data.graph_edges
 
         # --- 1. Data Embedding ---
         dense_emb_list = []
@@ -184,7 +187,9 @@ class ST_GATransformer(BaseModel):
             return h, tracing_weights
 
         @jax.checkpoint
-        def process_one_timestep(state_prev, scan_slice, static_data, graph_edges):
+        def process_one_timestep(
+            state_prev, scan_slice, static_data, graph_edges, node_mask, edge_mask
+        ):
             dense_input, step_obs_memory, step_key = scan_slice
 
             # Recurrent update
@@ -193,6 +198,8 @@ class ST_GATransformer(BaseModel):
                 state_prev,
                 static_data,
                 graph_edges,
+                node_mask,
+                edge_mask,
                 key=step_key,
             )
 
@@ -210,9 +217,13 @@ class ST_GATransformer(BaseModel):
         initial_c = jnp.zeros((num_locations, self.hidden_size))
         initial_state = (initial_h, initial_c)
 
-        # Closure of timestep fn with static data.
+        # Closure of timestep fn with static data and masks.
         timestep_with_static = partial(
-            process_one_timestep, static_data=data.static, graph_edges=data.graph_edges
+            process_one_timestep,
+            static_data=data.static,
+            graph_edges=graph_edges,
+            node_mask=node_mask,
+            edge_mask=edge_mask,
         )
 
         # Scan over the time sequence

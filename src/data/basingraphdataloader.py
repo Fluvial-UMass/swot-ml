@@ -1,6 +1,8 @@
+from collections import deque, defaultdict
+from functools import partial
+import random
 from typing import Iterator
 
-import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.sharding as jshard
@@ -11,108 +13,217 @@ from torch.utils.data import Sampler, DataLoader
 from config.config import Config
 from .basingraphdataset import GraphBatch, BasinGraphDataset
 
-import random
 
+class GraphPackingSampler(Sampler[list[int]]):
+    """
+    An infinite sampler that intelligently packs graphs to a target node count.
 
-class BasinBatchSampler(Sampler[list[int]]):
-    def __init__(self, cfg: Config, basin_date_map: dict[str, list[int]]):
-        self.basin_date_map = basin_date_map
-        self.batch_size = cfg.batch_size
-        self.shuffle = cfg.shuffle
-        self.basins = list(self.basin_date_map.keys())
+    This sampler continuously yields batches and re-shuffles the data
+    when one pass is complete. It uses a "best-fit" heuristic to fill batches,
+    reducing sampling bias against large graphs and minimizing wasted space.
+    """
 
-        # Pre-calculate the total number of batches we can create
-        self.num_batches = 0
-        for basin_indices in self.basin_date_map.values():
-            # Integer division to drop the last, potentially smaller batch
-            self.num_batches += len(basin_indices) // self.batch_size
+    def __init__(
+        self,
+        basin_index_map: dict[str, list[int]],
+        basin_node_counts: dict[str, int],
+        target_nodes_per_batch: int,
+        shuffle: bool,
+        candidate_pool_size: int,
+    ):
+        self.basin_index_map = basin_index_map
+        self.basin_node_counts = basin_node_counts
+        self.target_nodes = target_nodes_per_batch
+        self.shuffle = shuffle
+        self.candidate_pool_size = candidate_pool_size
+
+        # Ensure there is room for at least one padding node per batch.
+        # Otherwise, the padded edges will have to point at real nodes, which even if
+        # mask the results out later can cause gradient problems.
+        self.target_real_nodes = target_nodes_per_batch - 1
+
+        self.samples = []
+        for basin, indices in self.basin_index_map.items():
+            node_count = self.basin_node_counts.get(basin)
+            for index in indices:
+                self.samples.append({"index": index, "nodes": node_count})
+
+        # Check for any basin(s) that would be excluded from sampling
+        oversized_basins = {
+            basin: count
+            for basin, count in self.basin_node_counts.items()
+            if count > self.target_real_nodes
+        }
+        if oversized_basins:
+            raise ValueError(
+                "Arg target_nodes_per_batch cannot be less than the node count for any basin. "
+                f"Found {len(oversized_basins)} basins with more than {self.target_real_nodes} nodes.\n"
+                f"{oversized_basins=}"
+            )
 
     def __len__(self) -> int:
-        return self.num_batches
+        # This sampler is infinite, so __len__ is not well-defined.
+        # Returning a very large number can help with some utilities, but it's not strictly necessary.
+        return int(1e12)
 
     def __iter__(self) -> Iterator[list[int]]:
-        # Create a master list to hold all possible batches
-        all_batches = []
-
-        # Iterate through each basin to generate its batches
-        for basin in self.basins:
-            indices = self.basin_date_map[basin]
+        """
+        Yields batches indefinitely.
+        """
+        # --- CHANGE: Main loop is now wrapped in `while True` to make the iterator infinite ---
+        while True:
+            samples_for_epoch = self.samples[:]
             if self.shuffle:
-                # Shuffle the time steps within this basin's indices
-                random.shuffle(indices)
+                random.shuffle(samples_for_epoch)
 
-            # Create batches for this basin and add them to the master list
-            for i in range(0, len(indices), self.batch_size):
-                batch_indices = indices[i : i + self.batch_size]
-                # Skip the remaining dates from a basin that don't fit in a batch
-                if len(batch_indices) == self.batch_size:
-                    all_batches.append(batch_indices)
+            samples_deque = deque(samples_for_epoch)
+            while samples_deque:
+                # 1. Seed the batch with the next available sample
+                seed_sample = samples_deque.popleft()
+                current_batch_indices = [seed_sample["index"]]
+                nodes_in_batch = seed_sample["nodes"]
 
-        # The key change: shuffle the entire list of batches
-        if self.shuffle:
-            random.shuffle(all_batches)
+                # 2. Intelligently fill the rest of the batch
+                while nodes_in_batch < self.target_real_nodes:
+                    remaining_space = self.target_real_nodes - nodes_in_batch
+                    best_fit_candidate_idx = -1
+                    best_fit_nodes = 0
 
-        # Yield from the shuffled master list
-        for batch in all_batches:
-            yield batch
+                    # 3. Look ahead at a pool of candidates
+                    pool_size = min(self.candidate_pool_size, len(samples_deque))
+                    for i in range(pool_size):
+                        candidate = samples_deque[i]
+                        if best_fit_nodes < candidate["nodes"] <= remaining_space:
+                            best_fit_nodes = candidate["nodes"]
+                            best_fit_candidate_idx = i
+
+                    # 4. If a suitable candidate was found, add it to the batch
+                    if best_fit_candidate_idx != -1:
+                        best_fit_sample = samples_deque[best_fit_candidate_idx]
+                        current_batch_indices.append(best_fit_sample["index"])
+                        nodes_in_batch += best_fit_sample["nodes"]
+                        del samples_deque[best_fit_candidate_idx]
+                    else:
+                        break # No candidate in the pool fits, finalize the batch
+
+                yield current_batch_indices
 
 
-def collate_fn(batch_of_tuples: list):
+def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> GraphBatch:
     """
-    Collates a list of (basin, date, GraphBatch) tuples into a single batched GraphBatch.
-
-    We have to use np.stack and then cast as jnp.array because jnp.stack can't handle NaNs
-    for some reason. There might be a good JAX reason for this but I'm not sure.
+    Collates (basin, time) samples and then pads them to a fixed size.
     """
-    # Unzip the list of tuples into separate lists for basins, dates, and samples.
-    basins, dates, samples = zip(*batch_of_tuples)
+    basins, dates, samples = zip(*batch)  # List of tuples -> lists
 
-    # Collate the 'dynamic' dictionary.
-    batched_dynamic = {
-        key: jnp.array(np.stack([s.dynamic[key] for s in samples]))
-        for key in samples[0].dynamic.keys()
+    # Step 1: Pre-calculate sizes from all samples in the batch
+    num_nodes_per_graph = [s.static.shape[0] for s in samples]
+    num_real_nodes = sum(num_nodes_per_graph)
+    num_padding_nodes = target_nodes_per_batch - num_real_nodes
+    assert num_padding_nodes >= 0, "batch was created with more nodes than target"
+
+    # Step 2: Pack the "real" data by concatenating
+    # Dynamic features
+    packed_dynamic = defaultdict(list)
+    for sample in samples:
+        for source, data in sample.dynamic.items():
+            packed_dynamic[source].append(data)
+
+    unpadded_dynamic = {
+        source: jnp.concatenate(data_list, axis=1) for source, data_list in packed_dynamic.items()
     }
 
-    # 3. Collate the simple array fields by stacking them.
-    batched_graph_edges = jnp.stack([s.graph_edges for s in samples])
-
-    # 4. Handle optional fields, stacking only if they are not None.
-    if samples[0].static is None:
-        batched_static = None
-    else:
-        batched_static = jnp.array(np.stack([s.static for s in samples]))
-
-    if samples[0].y is None:
-        batched_y = None
-    else:
-        batched_y = jnp.array(np.stack([s.y for s in samples]))
-
-    # 5. Construct the final batched GraphBatch object.
-    batched_graph_batch = GraphBatch(
-        dynamic=batched_dynamic,
-        graph_edges=batched_graph_edges,
-        static=batched_static,
-        y=batched_y,
+    # Static features and Targets
+    unpadded_static = jnp.concatenate([s.static for s in samples if s.static is not None], axis=0)
+    unpadded_y = jnp.concatenate([s.y for s in samples if s.y is not None], axis=1)
+    unpadded_graph_idx = jnp.repeat(
+        jnp.arange(len(samples)), repeats=jnp.array(num_nodes_per_graph)
     )
 
-    # Return the collated data, converting tuples from zip to lists.
-    return list(basins), list(dates), batched_graph_batch
+    node_offset = 0
+    offset_edges_list = []
+    for i, sample in enumerate(samples):
+        offset_edges_list.append(sample.graph_edges + node_offset)
+        node_offset += num_nodes_per_graph[i]
+
+    unpadded_edges = jnp.concatenate(offset_edges_list, axis=1)
+    num_real_edges = unpadded_edges.shape[1]
+    target_edges_per_batch = target_nodes_per_batch
+    num_padding_edges = target_edges_per_batch - num_real_edges
+    assert num_padding_edges >= 0, "Batch has more edges than target"
+
+    # --- Step 3: Pad All Tensors to Target Size ---
+    # Pad node features
+    padded_static = jnp.pad(unpadded_static, ((0, num_padding_nodes), (0, 0)))
+    padded_y = jnp.pad(unpadded_y, ((0, 0), (0, num_padding_nodes), (0, 0)))
+    padded_graph_idx = jnp.pad(unpadded_graph_idx, (0, num_padding_nodes))
+    # ... (Pad dynamic features similarly) ...
+    # This example assumes you have the logic for dynamic features already
+    packed_dynamic = defaultdict(list)
+    for sample in samples:
+        for source, data in sample.dynamic.items():
+            packed_dynamic[source].append(data)
+    unpadded_dynamic = {
+        source: jnp.concatenate(data_list, axis=1) for source, data_list in packed_dynamic.items()
+    }
+    padded_dynamic = {
+        s: jnp.pad(d, ((0, 0), (0, num_padding_nodes), (0, 0))) for s, d in unpadded_dynamic.items()
+    }
+
+    # Pad with the index of the FIRST PADDED NODE (num_real_nodes).
+    # This creates harmless self-loops on a non-existent node.
+    padded_edges = jnp.pad(
+        unpadded_edges, ((0, 0), (0, num_padding_edges)), constant_values=num_real_nodes
+    )
+
+    # --- Step 4: Create Final Masks ---
+    node_mask = jnp.concatenate(
+        [jnp.ones(num_real_nodes, dtype=jnp.bool_), jnp.zeros(num_padding_nodes, dtype=jnp.bool_)]
+    )
+
+    edge_mask = jnp.concatenate(
+        [jnp.ones(num_real_edges, dtype=jnp.bool_), jnp.zeros(num_padding_edges, dtype=jnp.bool_)]
+    )
+    # # Unmask the FIRST padding edge to prevent NaN during the softmax edge calculations
+    # edge_mask = edge_mask.at[num_real_edges].set(True)
+
+    # --- Step 5: Assemble Final Batch ---
+    final_batch = GraphBatch(
+        dynamic=padded_dynamic,
+        static=padded_static,
+        graph_edges=padded_edges,
+        graph_idx=padded_graph_idx,
+        node_mask=node_mask,
+        edge_mask=edge_mask,
+        y=padded_y,
+    )
+
+    return list(basins), list(dates), final_batch
 
 
 class BasinGraphDataLoader(DataLoader):
     def __init__(self, cfg: Config, dataset: BasinGraphDataset):
         torch.manual_seed(cfg.model_args.seed)
 
-        batch_sampler = BasinBatchSampler(cfg, dataset.basin_index_map)
+        collate_fn = partial(padding_collate_fn, target_nodes_per_batch=cfg.target_nodes_per_batch)
 
+        batch_sampler = GraphPackingSampler(
+            dataset.basin_index_map,
+            dataset.basin_subbasin_counts,
+            cfg.target_nodes_per_batch,
+            cfg.shuffle,
+            cfg.candidate_pool_size,
+        )
+
+        timeout = 0 if cfg.num_workers==0 else 900
+        persistent_workers = False if cfg.num_workers==0 else True
         super().__init__(
             dataset,
             collate_fn=collate_fn,
             batch_sampler=batch_sampler,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
-            timeout=cfg.timeout,
-            persistent_workers=cfg.persistent_workers,
+            timeout=timeout,
+            persistent_workers=persistent_workers,
         )
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 

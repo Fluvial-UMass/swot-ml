@@ -36,7 +36,7 @@ esac
 
 
 # Set the partition and runtime args based on partition_name
-n_workers=1
+n_workers=4
 SBATCH_DIRECTIVES=""
 ENVIRONMENT_LINES=""
 case $partition_name in
@@ -59,7 +59,8 @@ case $partition_name in
         SBATCH_DIRECTIVES+="#SBATCH --gpus=1\n"
         SBATCH_DIRECTIVES+="#SBATCH --constraint=sm_61&vram11\n"
         ENVIRONMENT_LINES+="module load cuda/12.6\n"
-        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_MEM_FRACTION=0.8\n"
+        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_PREALLOCATE=false\n"
+        ENVIRONMENT_LINES+="nvidia-smi -L\n"
         ;;
     gpu-long)
         SBATCH_DIRECTIVES+="#SBATCH -c $n_workers\n"
@@ -69,7 +70,7 @@ case $partition_name in
         SBATCH_DIRECTIVES+="#SBATCH --gpus=2080ti:1\n"
         # SBATCH_DIRECTIVES+="#SBATCH --constraint=sm_61&vram11\n"
         ENVIRONMENT_LINES+="module load cuda/12.6\n"
-        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_MEM_FRACTION=0.8\n"
+        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_PREALLOCATE=false\n"
         ENVIRONMENT_LINES+="nvidia-smi -L\n"
         ;;
     gpupod)
@@ -80,7 +81,7 @@ case $partition_name in
         SBATCH_DIRECTIVES+="#SBATCH -A pi_cjgleason_umass_edu\n"
         SBATCH_DIRECTIVES+="#SBATCH --gpus=l40s:1\n"
         ENVIRONMENT_LINES+="module load cuda/12.6\n"
-        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_MEM_FRACTION=0.8\n"
+        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_PREALLOCATE=false\n"
         ENVIRONMENT_LINES+="nvidia-smi -L\n"
         ;;
     *)

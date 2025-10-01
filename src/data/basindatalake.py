@@ -1,6 +1,5 @@
 import os
 import warnings
-import json
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
