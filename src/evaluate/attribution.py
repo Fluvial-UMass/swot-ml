@@ -8,7 +8,6 @@ from tqdm.auto import tqdm
 import warnings
 
 from config import Config
-from data import Batch
 
 
 def _calculate_ig_single(model, single_input_tree, baseline_tree, target_idx, m_steps):
@@ -64,12 +63,7 @@ def _get_batch_ig(model, batch, target_idx, m_steps):
     if "graph" in baseline.keys():
         baseline["graph"] = batch["graph"]
 
-    # Vmap the single calculation over the batch
-    batched_ig_fn = jax.vmap(
-        _calculate_ig_single,
-        in_axes=(None, Batch.in_axes(), Batch.in_axes(), None, None),
-    )
-    batch_ig_attribs_tree = batched_ig_fn(
+    batch_ig_attribs_tree = _calculate_ig_single(
         model,
         batch,
         baseline,
@@ -101,12 +95,7 @@ def _get_batch_ig(model, batch, target_idx, m_steps):
 def _get_batch_predictions(model, batch, target_idx):
     """Helper to get predictions for a batch."""
     key = jax.random.PRNGKey(0)  # keys are only used for dropout.
-
-    def predict_single(single_input):
-        return model(single_input, key=key)[target_idx]
-
-    # Vmap the prediction function
-    return jax.vmap(predict_single, in_axes=(Batch.in_axes(),))(batch)
+    return model(batch, key)[target_idx]
 
 
 def get_intgrads_df(cfg: Config, model, dataloader, target, m_steps=50, max_iter=np.inf):

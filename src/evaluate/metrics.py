@@ -26,7 +26,7 @@ def get_basin_metrics(df: pd.DataFrame, disp: bool = False):
         A DataFrame containing the calculated metrics for each basin and feature.
         The columns are MultiIndexed with levels 'Feature' and 'Metric'.
     """
-    per_basin_metrics = df.groupby(level="basin").apply(get_all_metrics)
+    per_basin_metrics = df.groupby(level="subbasin").apply(get_all_metrics)
 
     # Initialize an empty DataFrame to store results with multi-level columns
     feature_names = df["obs"].columns
@@ -84,17 +84,14 @@ def get_all_metrics(df: pd.DataFrame, disp: bool = False):
         metrics[feature] = {
             "num_obs": np.sum(~np.isnan(y)),
             "R2": mask_nan(skm.r2_score)(y, y_hat),
+            "NSE": calc_nse(y, y_hat),
+            "KGE": calc_kge(y, y_hat),
+            "sigE": calc_sigE(y, y_hat),
+            "rRMSE": calc_rrmse(y, y_hat),
             "MAPE": calc_mape(y, y_hat),
             "nBias": calc_nbias(y, y_hat),
             "RE": calc_rel_err(y, y_hat),
             "RB": calc_rel_bias(y, y_hat),
-            "qRE": calc_q_rel_err(y, y_hat),
-            "qnBias": calc_q_nbias(y, y_hat),
-            "MAE": calc_mae(y, y_hat),
-            "RMSE": calc_rmse(y, y_hat),
-            "rRMSE": calc_rrmse(y, y_hat),
-            "KGE": calc_kge(y, y_hat),
-            "NSE": calc_nse(y, y_hat),
             "Agreement": calc_agreement(y, y_hat),
         }
 
@@ -130,6 +127,37 @@ def mask_nan(func):
 
 
 @mask_nan
+def calc_nse(y, y_hat):
+    denominator = ((y - y.mean()) ** 2).sum()
+    numerator = ((y - y_hat) ** 2).sum()
+    if denominator == 0:
+        return np.nan
+    else:
+        return 1 - (numerator / denominator)
+
+
+@mask_nan
+def calc_kge(y, y_hat):
+    correlation = np.corrcoef(y, y_hat)[0, 1]
+    mean_y = np.mean(y)
+    mean_y_hat = np.mean(y_hat)
+    std_y = np.std(y)
+    std_y_hat = np.std(y_hat)
+    if std_y == 0 or mean_y == 0:
+        return np.nan
+    else:
+        return 1 - np.sqrt(
+            (correlation - 1) ** 2 + (std_y_hat / std_y - 1) ** 2 + (mean_y_hat / mean_y - 1) ** 2
+        )
+
+
+@mask_nan
+def calc_sigE(y, y_hat):
+    abs_norm_res = np.abs((y_hat - y) / np.mean(y))
+    return np.quantile(abs_norm_res, 0.67)
+
+
+@mask_nan
 def calc_mape(y, y_hat):
     skm_mape = skm.mean_absolute_percentage_error(y, y_hat)
     return skm_mape * 100
@@ -161,19 +189,6 @@ def calc_rel_bias(y, y_hat):
 
 
 @mask_nan
-def calc_q_rel_err(y, y_hat):
-    qALQ = np.quantile(np.abs(np.log(y_hat / y)), [0.25, 0.5, 0.75])
-    return 100 * (np.exp(qALQ) - 1)
-
-
-@mask_nan
-def calc_q_nbias(y, y_hat):
-    nBias = (y_hat - y) / y
-    q_nBias = np.quantile(nBias, [0.25, 0.5, 0.75])
-    return q_nBias * 100
-
-
-@mask_nan
 def calc_rmse(y, y_hat):
     return np.sqrt(np.mean((y - y_hat) ** 2))
 
@@ -186,31 +201,6 @@ def calc_rrmse(y, y_hat):
         return np.nan
     else:
         return rmse / mean_y_hat * 100
-
-
-@mask_nan
-def calc_kge(y, y_hat):
-    correlation = np.corrcoef(y, y_hat)[0, 1]
-    mean_y = np.mean(y)
-    mean_y_hat = np.mean(y_hat)
-    std_y = np.std(y)
-    std_y_hat = np.std(y_hat)
-    if std_y == 0 or mean_y == 0:
-        return np.nan
-    else:
-        return 1 - np.sqrt(
-            (correlation - 1) ** 2 + (std_y_hat / std_y - 1) ** 2 + (mean_y_hat / mean_y - 1) ** 2
-        )
-
-
-@mask_nan
-def calc_nse(y, y_hat):
-    denominator = ((y - y.mean()) ** 2).sum()
-    numerator = ((y - y_hat) ** 2).sum()
-    if denominator == 0:
-        return np.nan
-    else:
-        return 1 - (numerator / denominator)
 
 
 @mask_nan

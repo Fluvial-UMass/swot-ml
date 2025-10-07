@@ -1,25 +1,29 @@
+from typing import Iterator
+from pathlib import Path
+
 import equinox as eqx
 import jax
 import pandas as pd
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 from tqdm import tqdm
-from typing import Iterator
+
 from jaxtyping import PRNGKeyArray
 
-from data import HydroDataLoader, Batch
+from data import BasinGraphDataLoader, GraphBatch
 
 
 @eqx.filter_jit
-def _model_map(model, batch: Batch, keys: list[PRNGKeyArray]):
+def _model_map(model, batch: GraphBatch, key: PRNGKeyArray):
     """Applies the model to a batch of data using jax.vmap."""
-    in_axes_keys = 0
-    y_pred = jax.vmap(model, in_axes=(Batch.in_axes(), in_axes_keys))(batch, keys)
+    y_pred = model(batch, key)
     return y_pred
 
 
 def model_iterate(
     model: eqx.Module,
-    dataloader: HydroDataLoader,
+    dataloader: BasinGraphDataLoader,
     quiet: bool = False,
     denormalize: bool = True,
 ) -> Iterator[dict]:
@@ -48,18 +52,16 @@ def model_iterate(
     """
     # Set model to inference mode (no dropout)
     model = eqx.nn.inference_mode(model)
-    # Dummy batch keys (only used for dropout, which is off).
+    # Dummy key (only used for dropout, which is off).
     key = jax.random.PRNGKey(0)
-    keys = jax.random.split(key, dataloader.batch_size)
 
     for basin, date, batch in tqdm(dataloader, disable=quiet):
-        # batch = dataloader.shard_batch(batch)
-        y_pred = _model_map(model, batch, keys)
+        y_pred = _model_map(model, batch, key)[batch.node_mask]
 
         # TODO bandaid for seq2seq models with 4 dimensions.
         if len(y_pred.shape) == 4:
             # Grab the final prediction for now.
-            y_pred = y_pred[:, -1, ...]
+            y_pred = y_pred[-1, ...]
 
         if denormalize:
             y_pred = dataloader.denormalize_target(y_pred)
@@ -67,7 +69,7 @@ def model_iterate(
         out_dict = {"basin": basin, "date": date, "y_pred": y_pred}
 
         if batch.y is not None:
-            y = batch.y[:, -1, ...]
+            y = batch.y[-1, ...][batch.node_mask]
             if denormalize:
                 y = dataloader.denormalize_target(y)
             out_dict["y"] = y
@@ -127,27 +129,110 @@ def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: 
         data = y_hat_arr
         cols = ["pred"]
 
-    if dataloader.dataset.graph_mode:
-        n_samples = len(basins)
-        graph_nodes = y_arr.shape[-2]
-        # Expand, reshape etc to get matching dimensions
-        dates = np.repeat(dates, graph_nodes)  # Shape: (n_samples * graph_nodes,)
-        basins = np.concatenate(basins)  # Shape: (n_samples * graph_nodes,)
-        data = data.reshape(n_samples * graph_nodes, data.shape[-1])
+    subbasin_map = dataloader.dataset.basin_subbasin_map  # dict[str: list[str]]
+    rows = [
+        (basin, subbasin, date)
+        for basin, date in zip(basins, dates)
+        for subbasin in subbasin_map[basin]
+    ]
 
     # Place the data arrays into a dataframe with multilevel indices.
-    datetime_index = pd.MultiIndex.from_arrays(
-        [basins, dates],
-        names=["basin", "date"],
-    )
+    row_index = pd.MultiIndex.from_tuples(rows, names=["basin", "subbasin", "date"])
     column_index = pd.MultiIndex.from_product(
         [cols, dataloader.dataset.target],
         names=["Type", "Feature"],
     )
     results = pd.DataFrame(
         data,
-        index=datetime_index,
+        index=row_index,
         columns=column_index,
     )
 
     return results
+
+
+def predict_to_parquet(
+    model: eqx.Module,
+    dataloader: BasinGraphDataLoader,
+    output_path: Path | str,
+    *,
+    quiet: bool = False,
+    denormalize: bool = True,
+):
+    """
+    Generates predictions and streams them directly to a Parquet file.
+
+    This function processes the dataset in batches, creates a pandas DataFrame for
+    each batch, and appends it to a Parquet file on disk. This approach is
+    memory-efficient as it avoids loading all predictions into memory at once.
+
+    Parameters
+    ----------
+    model: eqx.Module
+        The model to use for generating predictions.
+    dataloader: DataLoader
+        The dataloader providing data for the model.
+    output_path: Union[str, Path]
+        The path to the output Parquet file.
+    quiet: bool, optional
+        If True, suppresses the progress bar from the underlying iterator.
+        Default is False.
+    denormalize: bool, optional
+        If True, denormalizes the predictions and target values. Default is True.
+    """
+    writer = None  # Initialize the Parquet writer
+
+    try:
+        # Iterate through batches from the dataloader
+        for batch_results in model_iterate(model, dataloader, quiet=quiet, denormalize=denormalize):
+            # --- 1. Combine prediction and observation data for the batch ---
+            y_pred_batch = batch_results["y_pred"]
+
+            if "y" in batch_results:
+                y_obs_batch = batch_results["y"]
+                # Combine observations and predictions side-by-side
+                data_for_df = np.concatenate((y_obs_batch, y_pred_batch), axis=-1)
+                col_types = ["obs", "pred"]
+            else:
+                data_for_df = y_pred_batch
+                col_types = ["pred"]
+
+            # --- 2. Construct the row index for the batch ---
+            basins_in_batch = batch_results["basin"]
+            dates_in_batch = batch_results["date"]
+            subbasin_map = dataloader.dataset.basin_subbasin_map
+            rows = [
+                (basin, subbasin, date)
+                for basin, date in zip(basins_in_batch, dates_in_batch)
+                for subbasin in subbasin_map[basin]
+            ]
+            row_index = pd.MultiIndex.from_tuples(rows, names=["basin", "subbasin", "date"])
+
+            # --- 3. Construct the column index ---
+            column_index = pd.MultiIndex.from_product(
+                [col_types, dataloader.dataset.target],
+                names=["Type", "Feature"],
+            )
+
+            # --- 4. Create a DataFrame for the current batch ---
+            batch_df = pd.DataFrame(
+                data_for_df,
+                index=row_index,
+                columns=column_index,
+            )
+
+            # --- 5. Write the batch DataFrame to the Parquet file ---
+            table = pa.Table.from_pandas(batch_df)
+
+            if writer is None:
+                # For the first batch, create the writer with the table's schema
+                writer = pq.ParquetWriter(output_path, table.schema)
+
+            writer.write_table(table)
+
+    finally:
+        # Ensure the writer is closed to finalize the file
+        if writer:
+            writer.close()
+            if not quiet:
+                print(f"Results successfully written to {output_path}")

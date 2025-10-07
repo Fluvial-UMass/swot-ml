@@ -1,8 +1,8 @@
 import warnings
 import json
-import copy
 from typing import NamedTuple
 from collections import defaultdict
+import multiprocessing as mp
 
 from tqdm import tqdm
 import pandas as pd
@@ -36,49 +36,46 @@ class GraphBatch(NamedTuple):
         return getattr(self, key)
 
 
-class BasinGraphDataset(Dataset):
+class SharedBasinGraphDataset(Dataset):
     """
     DataLoader class for loading and preprocessing hydrological time series data.
     """
 
-    def __init__(self, cfg: Config, subset: DataSubset, *, for_stats: bool = False, debug=False):
+    def __init__(
+        self,
+        cfg: Config,
+        subset: DataSubset,
+        *,
+        train_ds: "SharedBasinGraphDataset" = None,
+    ):
         self.cfg = cfg
         self.log_pad = 0.001
         self.data_subset = subset
-        self.debug = debug
 
-        if subset == DataSubset.train:
+        self.inference_mode = isinstance(train_ds, self.__class__)
+        if self.inference_mode:
+            self.s_encoding = train_ds.s_encoding
+            self.s_scale = train_ds.s_scale
+            self.d_encoding = train_ds.d_encoding
+            self.d_scale = train_ds.d_scale
+        else:
             self.s_encoding = self.cfg.static_encoding.model_dump()
             self.d_encoding = self.cfg.dynamic_encoding.model_dump()
             self.s_scale = self.d_scale = None
-        elif not for_stats:
-            train_stats = self.get_training_stats(cfg)
-            self.s_encoding = train_stats["s_encoding"]
-            self.s_scale = train_stats["s_scale"]
-            self.d_encoding = train_stats["d_encoding"]
-            self.d_scale = train_stats["d_scale"]
-        else:
-            # This prevents infinite recursion from the get_training_stats method
-            raise ValueError(f"{for_stats=} only allowed with subset='train'.")
 
         self.features = self.cfg.features.model_dump()  # dump to dict
         self.target = [v for v_lists in self.features["target"].values() for v in v_lists]
 
-        dynamic_sources = set(self.features["dynamic"].keys())
-        target_sources = set(self.features["target"].keys())
-        self.sources = dynamic_sources.union(target_sources)
+        # Data will be loaded later, either lazily or into shared memory
+        self.basin_x_ds = None
+        self.shared_memory_info = None
 
         self.time_slice = self._get_time_slice()
         self.basins = self._read_basin_files()
+        self.graphs = self._load_basin_graphs()
         self.x_s = self._load_attributes()
-
-        if not for_stats:
-            self.basin_x_ds = self._open_zarr_store()
-            self.graphs = self._load_basin_graphs()
-            self.update_indices()
-        else:
-            self.d_encoding = self._get_dummy_dynamic_encoding()
-            self.d_scale = self._get_scale_from_precomp_stats(self.d_encoding)
+        # self.basin_x_ds = self._open_zarr_store()
+        # self.update_indices()
 
     def __len__(self):
         """
@@ -122,10 +119,74 @@ class BasinGraphDataset(Dataset):
 
         return basins
 
-    def _open_zarr_store(self) -> xr.Dataset:
+    def setup_data_source(self, shared_memory_info: dict = None):
+        """
+        Finalizes the data source for the dataset. Called by DataLoader or worker.
+        """
+        if shared_memory_info:
+            self.shared_memory_info = shared_memory_info
+            self.basin_x_ds = self._reconstruct_from_shared_memory()
+        else:
+            self.basin_x_ds = self._open_zarr_store()
+            self.update_indices()
+
+    def setup_shared_memory(self):
+        """
+        Loads data from Zarr and moves it to shared memory.
+        This should only be called ONCE from the main process.
+        Returns the shared memory blocks and the info dictionary.
+        """
+        from multiprocessing import shared_memory
+
+        # Step 1: Open lazy references to Zarr stores
+        lazy_basin_datasets = self._open_zarr_store(load_in_memory=False)
+
+        # Step 2: Create shared memory blocks and copy data
+        print("Computing data into shared memory...")
+        shm_blocks = []
+        shared_memory_info = {}
+
+        for basin_id, ds in tqdm(lazy_basin_datasets.items(), desc="Basins to shared memory"):
+            # The rest of this method is identical to your original _load_to_shared_memory
+            basin_info = {"variables": {}}
+            for var_name in ds.data_vars:
+                shape = ds[var_name].shape
+                dtype = ds[var_name].dtype
+                dims = list(ds[var_name].dims)
+                coords = [ds[var_name][dim].values for dim in dims]
+                nbytes = int(np.prod(shape) * np.dtype(dtype).itemsize)
+
+                shm = shared_memory.SharedMemory(create=True, size=nbytes)
+                shm_blocks.append(shm)
+
+                shm_arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+                shm_arr[:] = ds[var_name].values  # Compute happens here
+
+                basin_info["variables"][var_name] = {
+                    "shm_name": shm.name,
+                    "shape": shape,
+                    "dtype": dtype,
+                    "dims": dims,
+                    "coords": coords,
+                }
+            shared_memory_info[basin_id] = basin_info
+
+        print("Temporarily attaching to shared memory to build sampler index...")
+        self.setup_data_source(shared_memory_info)
+        self.update_indices()
+        self.basin_x_ds = None
+        self.shared_memory_info = None
+        print("Cleaned main process dataset.")
+
+        return shm_blocks, shared_memory_info
+
+    def _open_zarr_store(self, load_in_memory=True) -> xr.Dataset:
         """Opens all basin-specific Zarr groups and stores them as lazy datasets."""
-        print("Opening dynamic data...")
         warnings.filterwarnings("ignore", category=ZarrUserWarning)
+
+        dynamic_sources = set(self.features["dynamic"].keys())
+        target_sources = set(self.features["target"].keys())
+        self.sources = dynamic_sources.union(target_sources)
 
         dynamic_columns = set([vv for v in self.features["dynamic"].values() for vv in v])
         target_columns = set([vv for v in self.features["target"].values() for vv in v])
@@ -140,33 +201,45 @@ class BasinGraphDataset(Dataset):
         self.basin_subbasin_map = {}
         globally_found_columns = set()
 
-        for basin_id in tqdm(self.basins, disable=self.cfg.quiet, desc="Loading basins"):
+        for basin_id in tqdm(self.basins, disable=self.cfg.quiet, desc="Basins"):
             ds = xr.open_zarr(self.cfg.zarr_dir / basin_id)
             ds = ds.sel(date=self.time_slice)
 
-            # Find and track missing columns
-            available_columns = all_config_columns.intersection(set(ds.data_vars))
+            # Find and add missing columns as NaN arrays
+            available_columns = set(ds.data_vars)
             globally_found_columns.update(available_columns)
 
-            ds = ds[list(available_columns)]
+            missing_columns = all_config_columns - available_columns
+            if missing_columns:
+                # Create a dictionary of NaN DataArrays to add
+                nan_arrays_to_add = {}
+                for col in missing_columns:
+                    # Create a new DataArray with the same coordinates and dimensions,
+                    # filled with np.nan. Use float32 to be consistent.
+                    nan_da = xr.DataArray(
+                        data=np.full((len(ds.date), len(ds.subbasin)), np.nan, dtype=np.float32),
+                        coords={"date": ds.date, "subbasin": ds.subbasin},
+                        dims=["date", "subbasin"],
+                    )
+                    nan_arrays_to_add[col] = nan_da
 
-            # # Remote sensing data are not always observed in every basin
-            # available_columns = [col for col in columns if col in ds.data_vars]
-            # ds = ds[available_columns]
+                # Use assign() to add all missing variables at once
+                ds = ds.assign(**nan_arrays_to_add)
 
-            if self.cfg.in_memory:
+            # Now that all columns are guaranteed to exist, we can select them.
+            # It's also good practice to select them explicitly to ensure a consistent order.
+            ds = ds[list(all_config_columns)]
+
+            # Don't compute yet if we're going to shared memory
+            if self.cfg.in_memory and load_in_memory:
                 ds = ds.compute()
 
-
-            
             # Encoding is fully prescribed in the config or from the
-            ds, updated_enc = self._encode_data(ds, "dynamic", self.d_encoding)
-            self.d_encoding = updated_enc
+            ds, self.d_encoding = self._encode_data(ds, "dynamic", self.d_encoding)
             # During training, this will calculate the global training normalization stats based
             # on the metadata in the training basin zarr files the first time it is called,
             # then reuse the scaling in the repeated basins.
             ds, self.d_scale = self._normalize_data(ds, "dynamic", self.d_encoding, self.d_scale)
-
             basin_datasets[basin_id] = ds
 
             subbasin_ids = ds.subbasin.values.tolist()  # This is small, OK to compute
@@ -176,14 +249,39 @@ class BasinGraphDataset(Dataset):
             basin: len(subbasins) for basin, subbasins in self.basin_subbasin_map.items()
         }
 
-        never_found_columns = all_config_columns - globally_found_columns
-        if never_found_columns:
-            raise KeyError(
-                "The following dynamic columns from the config file were not found in ANY basin file."
-                f"This may indicate a configuration error or typo: {sorted(list(never_found_columns))}"
-            )
-
         warnings.resetwarnings()
+        return basin_datasets
+
+    def _reconstruct_from_shared_memory(self) -> dict:
+        """Reconstruct xarray datasets from shared memory without copying data."""
+        from multiprocessing import shared_memory
+
+        print(f"Worker {mp.current_process().name}: Reconstructing from shared memory...")
+        basin_datasets = {}
+
+        # CRITICAL: Keep references to shared memory objects to prevent segfaults
+        if not hasattr(self, "_worker_shm_refs"):
+            self._worker_shm_refs = []
+
+        for basin_id, basin_info in self.shared_memory_info.items():
+            data_vars = {}
+
+            for var_name, var_info in basin_info["variables"].items():
+                # Attach to existing shared memory
+                shm = shared_memory.SharedMemory(name=var_info["shm_name"])
+                self._worker_shm_refs.append(shm)  # KEEP REFERENCE ALIVE
+
+                # Create numpy array view (no copy!)
+                arr = np.ndarray(var_info["shape"], dtype=var_info["dtype"], buffer=shm.buf)
+
+                data_vars[var_name] = xr.DataArray(
+                    arr,
+                    dims=var_info["dims"],
+                    coords={k: v for k, v in zip(var_info["dims"], var_info["coords"])},
+                )
+
+            basin_datasets[basin_id] = xr.Dataset(data_vars)
+
         return basin_datasets
 
     def _load_basin_graphs(self) -> dict[str, np.ndarray]:
@@ -240,14 +338,23 @@ class BasinGraphDataset(Dataset):
         # This Series will have 'subbasin' as its index and 'basin' as its values
         subbasin_to_basin_map = df.index.to_frame(index=False).set_index("subbasin")["basin"]
 
+        # Series with basin as index and subbasins as values
+        basin_to_subbasin_map = df.index.to_frame(index=False).set_index("basin")["subbasin"]
+        self.basin_subbasin_map = {
+            basin: list(subbasins) for basin, subbasins in basin_to_subbasin_map.groupby("basin")
+        }
+        self.basin_subbasin_counts = {
+            basin: len(subbasins) for basin, subbasins in self.basin_subbasin_map.items()
+        }
+
         # 3. Drop the 'basin' level to proceed with data-only processing
         df = df.droplevel("basin")
 
-        if self.data_subset != DataSubset.train:
+        if self.inference_mode:
             unencoded_cols = [k for k, v in self.s_scale.items() if not v["encoded"]]
-            categorical_cols = list((self.s_encoding["categorical"] or {}).keys())
+            one_hot_cols = list((self.s_encoding["one_hot"] or {}).keys())
             bitmask_cols = list((self.s_encoding["bitmask"] or {}).keys())
-            feat = unencoded_cols + categorical_cols + bitmask_cols
+            feat = unencoded_cols + one_hot_cols + bitmask_cols
             df = df[feat]
 
         else:
@@ -311,24 +418,6 @@ class BasinGraphDataset(Dataset):
         date_slice = slice(start_date, end_date)
         ds = self.basin_x_ds[basin].sel(date=date_slice)
 
-        # NaN padding
-        # Identify all dynamic and target columns that are required for this sample.
-        all_dynamic_cols = [col for cols in self.features["dynamic"].values() for col in cols]
-        all_needed_cols = set(all_dynamic_cols + self.target)
-        missing_cols = all_needed_cols - set(ds.data_vars)
-        # If any columns are missing, create NaN placeholders and assign them to the dataset
-        # We do it here, instead of during data loading, because we only need to pad this slice.
-        if missing_cols:
-            nan_arrays_to_add = {}
-            for col in missing_cols:
-                nan_da = xr.DataArray(
-                    data=np.full((len(ds.date), len(ds.subbasin)), np.nan, dtype=np.float32),
-                    coords={'date': ds.date, 'subbasin': ds.subbasin},
-                    dims=['date', 'subbasin']
-                )
-                nan_arrays_to_add[col] = nan_da
-            ds = ds.assign(**nan_arrays_to_add)
-
         dynamic = {}
         # select the dynamic, static, and target arrays
         for source, columns in self.features["dynamic"].items():
@@ -389,11 +478,8 @@ class BasinGraphDataset(Dataset):
         assert feat_group in ["dynamic", "static"]
 
         columns_in = ds.data_vars
-        encoding_copy = copy.deepcopy(encoding)
-        ds, categorical_enc = self._one_hot_encoding(
-            ds, feat_group, encoding_copy.get("categorical", {})
-        )
-        ds, bitmask_enc = self._bitmask_expansion(ds, feat_group, encoding_copy.get("bitmask", {}))
+        ds, categorical_enc = self._one_hot_encoding(ds, feat_group, encoding["categorical"])
+        ds, bitmask_enc = self._bitmask_expansion(ds, feat_group, encoding["bitmask"])
 
         new_columns = set(ds.data_vars) - set(columns_in)
 
@@ -406,40 +492,42 @@ class BasinGraphDataset(Dataset):
         return ds, updated_encoding
 
     def _one_hot_encoding(self, ds: xr.Dataset, feat_group: str, cat_enc: dict[str, list[str]]):
+        is_train = self.data_subset == "train"
+
         for col, prescribed in cat_enc.items():
             if col not in ds.data_vars:
+                # During inference we add zero-filled columns even if the column is missing.
+                if not is_train and prescribed:
+                    zero_df = pd.DataFrame(
+                        0, index=ds.indexes["subbasin"], columns=[f"{col}_{c}" for c in prescribed]
+                    )
+                    ds = xr.merge([ds, zero_df.to_xarray()])
                 continue
 
             df = ds[col].to_dataframe()
             encoded = pd.get_dummies(df[col].astype(str), prefix=col)
 
-            if prescribed:
-                # Apply prescribed encoding
+            ds = ds.drop_vars(col)
+
+            if is_train and not prescribed:
+                # discover categories
+                cat_enc[col] = encoded.columns.tolist()
+            else:
+                # enforce prescribed ordering
                 for c in prescribed:
                     if c not in encoded.columns:
                         encoded[c] = 0
                 encoded = encoded[prescribed]
-            else:
-                if feat_group == "static":
-                    # Discovery is allowed for static features
-                    cat_enc[col] = encoded.columns.tolist()
-                else:  # feat_group == "dynamic"
-                    raise ValueError(
-                        f"Dynamic categorical variable '{col}' must have its categories "
-                        "prescribed in the config. Discovery is not supported for dynamic data."
-                    )
 
-            ds = ds.drop_vars(col)  # Drop the original column
-            ds = xr.merge([ds, encoded.to_xarray()])  # Merge the encoded columns
+            ds = xr.merge([ds, encoded.to_xarray()])
 
-            # Update the feature dicts
+            # update features dict
             if feat_group == "dynamic":
-                # Scan through sources to remove original column and append encoded
-                for feats in self.features["dynamic"].values():
+                for source, feats in self.features["dynamic"].items():
                     if col in feats:
                         feats.remove(col)
                         feats.extend(encoded.columns)
-            else:  # static
+            else:
                 if col in self.features["static"]:
                     self.features["static"].remove(col)
                 self.features["static"].extend(encoded.columns)
@@ -449,48 +537,60 @@ class BasinGraphDataset(Dataset):
     def _bitmask_expansion(
         self, ds: xr.Dataset, feat_group: str, bitmask_enc: dict[str, list[int]]
     ):
+        is_train = self.data_subset == "train"
+
         for col, prescribed_bits in bitmask_enc.items():
-            if col not in ds.data_vars:
-                continue
+            new_vars = {}
 
-            x = ds[col].values
-            finite_mask = np.isfinite(x)
-            x_int = np.where(finite_mask, x, 0).astype(int)
+            if col in ds.data_vars:
+                x = ds[col].values
+                finite_mask = np.isfinite(x)
+                x_int = np.where(finite_mask, x, 0).astype(int)
 
-            if not prescribed_bits:
-                if feat_group == "static":
-                    # Discovery is allowed for static features
+                if is_train and not prescribed_bits:
+                    # infer used bits
                     max_val = x_int.max()
                     nbits = int(np.ceil(np.log2(max_val + 1))) if max_val > 0 else 0
                     prescribed_bits = [
                         n for n in range(nbits) if ((x_int // 2**n) % 2)[finite_mask].sum() > 0
                     ]
                     bitmask_enc[col] = prescribed_bits
-                else:  # feat_group == 'dynamic'
-                    raise ValueError(
-                        f"Dynamic bitmask variable '{col}' must have its bits "
-                        "prescribed in the config. Discovery is not supported for dynamic data."
-                    )
 
-            new_vars = {}
-            if prescribed_bits:
                 for n in prescribed_bits:
                     bit_arr = ((x_int // 2**n) % 2).astype(float)
                     bit_arr[~finite_mask] = np.nan
                     new_vars[f"{col}_bit_{n}"] = xr.DataArray(
                         bit_arr, dims=ds[col].dims, coords=ds[col].coords
                     )
+
                 ds = ds.drop_vars(col)
+
+            else:
+                # col missing
+                if not is_train and prescribed_bits:
+                    if feat_group == "dynamic":
+                        dims = ("subbasin", "date")
+                        coords = {"subbasin": ds.subbasin, "date": ds.date}
+                        shape = (len(ds.subbasin), len(ds.date))
+                    else:
+                        dims = ("subbasin",)
+                        coords = {"subbasin": ds.subbasin}
+                        shape = (len(ds.subbasin),)
+                    for n in prescribed_bits:
+                        new_vars[f"{col}_bit_{n}"] = xr.DataArray(
+                            np.zeros(shape), dims=dims, coords=coords
+                        )
 
             if new_vars:
                 ds = xr.merge([ds, xr.Dataset(new_vars)], compat="no_conflicts")
-                # Update the feature dicts
+
+                # update features
                 if feat_group == "dynamic":
                     for source, feats in self.features["dynamic"].items():
                         if col in feats:
                             feats.remove(col)
                             feats.extend(new_vars.keys())
-                else:  # static
+                else:
                     if col in self.features["static"]:
                         self.features["static"].remove(col)
                     self.features["static"].extend(new_vars.keys())
@@ -680,9 +780,10 @@ class BasinGraphDataset(Dataset):
             # Mask out dates without valid data if we need it.
             if self.data_subset in ["train", "test"]:
                 target_mask = valid_target(basin_ds)
-                basin_date_map[basin] = basin_ds["date"][target_mask].values
             else:
-                basin_date_map[basin] = basin_ds["date"].values
+                target_mask = True
+
+            basin_date_map[basin] = basin_ds["date"][target_mask].values
 
         # Now build unique indices for each pairing...
         # Master list of (basin, date) tuples that we use during __getitem__
@@ -738,62 +839,3 @@ class BasinGraphDataset(Dataset):
             subbasin_chunks.append(chunk_size)
 
         return {"date": self.cfg.sequence_length, "subbasin": tuple(subbasin_chunks)}
-
-    @classmethod
-    def get_training_stats(cls, cfg: Config) -> dict:
-        """
-        Calculates normalization and encoding statistics from the training data subset
-        in a memory-efficient way.
-
-        Args:
-            cfg: The configuration object pointing to the training data.
-
-        Returns:
-            A dictionary containing the calculated 's_encoding', 's_scale',
-            'd_encoding', and 'd_scale'.
-        """
-        print("Calculating training statistics for encoding and normalization...")
-
-        # Force lazy loading for this operation to ensure low memory usage
-        temp_cfg = copy.deepcopy(cfg)
-        temp_cfg.in_memory = False
-
-        # Create a 'lightweight' instance. This initializes the dataset, calculates
-        # all stats via _load_attributes and _open_zarr_store, but does not
-        # build the sampler indices, saving time and memory.
-        temp_train_ds = cls(temp_cfg, DataSubset.train, for_stats=True)
-
-        return temp_train_ds.stats_dict()
-
-    def _get_dummy_dynamic_encoding(self):
-        encoding = copy.deepcopy(self.d_encoding)
-        encoded_columns = []
-        # Handle categorical columns
-        if encoding.get("categorical"):
-            for col, categories in encoding["categorical"].items():
-                if not categories:
-                    raise ValueError(
-                        f"Dynamic categorical variable '{col}' must either be excluded or have "
-                        "its categories prescribed in the config."
-                    )
-                encoded_columns.extend([f"{col}_{cat}" for cat in categories])
-        # Handle bitmask columns
-        if encoding.get("bitmask"):
-            for col, bits in encoding["bitmask"].items():
-                if not bits:
-                    raise ValueError(
-                        f"Dynamic bitmask variable '{col}' must either be excluded or have "
-                        "its bits prescribed in the config."
-                    )
-                encoded_columns.extend([f"{col}_bit_{bit}" for bit in bits])
-        encoding["encoded_columns"] = encoded_columns
-        return encoding
-
-    def stats_dict(self):
-        stats = {
-            "s_encoding": self.s_encoding,
-            "s_scale": self.s_scale,
-            "d_encoding": self.d_encoding,
-            "d_scale": self.d_scale,
-        }
-        return stats

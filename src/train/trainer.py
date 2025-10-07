@@ -117,11 +117,10 @@ class Trainer:
                 self.early_stopper = EarlyStopper(**cfg.early_stop_kwargs.model_dump())
             else:
                 self.early_stopper = None
-        
+
         # Initialize the filterspec. Defaults to training all components of the model.
         self.freeze_components([])
-        
-        self.last_log_time = time.time()
+        self.checkpoint_losses = []
 
     def _setup_logging(self, log_dir=None):
         """Sets up logging for training.
@@ -206,7 +205,8 @@ class Trainer:
             self.training_dl,
             total=max_steps if np.isfinite(max_steps) else None,
             initial=self.step,
-            disable=self.cfg.quiet
+            disable=self.cfg.quiet,
+            desc="Training Steps",
         )
 
         # Logging intervals and states
@@ -215,14 +215,10 @@ class Trainer:
         last_log_step = self.step
         last_log_time = time.time()
 
-        for basins, dates, batch in pbar:
+        for _, _, batch in pbar:
             # Perform one training step
             loss, grads = self._train_step(batch)
-            if loss is not None:
-                pbar.set_description(f"Step:{self.step:06d}")
-                pbar.set_postfix_str(f"Loss:{loss:0.04f}")
-                self.losses.append(float(loss))
-
+            self.checkpoint_losses.append(float(loss))
             self.step += 1
             pbar.update(1)
 
@@ -252,7 +248,6 @@ class Trainer:
                 self.save_state()
                 last_log_step = self.step
                 last_log_time = time.time()
-                self.last_log_time = last_log_time
 
         self.save_state()  # Final save
         self.logger.info("~~~ Training done ~~~")
@@ -263,7 +258,7 @@ class Trainer:
         keys = jax.random.split(self.train_key)
         self.train_key = keys[0]
         step_key = keys[1]
-        
+
         try:
             loss, grads, self.model, self.opt_state = make_step(
                 self.model,
@@ -278,27 +273,27 @@ class Trainer:
                 raise RuntimeError("NaN loss encountered")
 
             return loss, grads
-        
+
         except Exception as e:
             if self.cfg.log:
                 error_dir = self.log_dir / "exceptions" / f"step_{self.step}"
                 self.save_state(error_dir)
-                with open(error_dir / "data.pkl", "wb") as f: 
+                with open(error_dir / "data.pkl", "wb") as f:
                     pickle.dump(batch, f)
-                with open(error_dir / "exception.txt", "w") as f: 
+                with open(error_dir / "exception.txt", "w") as f:
                     f.write(f"{str(e)}\n{traceback.format_exc()}")
                 error_str = f"{type(e).__name__} at step {self.step}. See {error_dir} for details."
             else:
                 error_str = f"{str(e)}\n{traceback.format_exc()}"
             self.logger.error(error_str)
             raise e
-        
+
     # Monitor gradients
     def check_grads(self, grads):
         grad_norms = jtu.tree_map(jnp.linalg.norm, grads)
         grad_norms = jtu.tree_leaves_with_path(grad_norms)
 
-        bad_grads = {'vanishing': {}, 'exploding': {}}
+        bad_grads = {"vanishing": {}, "exploding": {}}
         for keypath, norm in grad_norms:
             tree_key = jtu.keystr(keypath)
             type_key = "vanishing" if norm < 1e-6 else "exploding" if norm > 1e3 else None
@@ -307,7 +302,7 @@ class Trainer:
                     bad_grads[type_key][tree_key] = 1
                 else:
                     bad_grads[type_key][tree_key] += 1
-        
+
         # Log the counts of any bad gradients.
         for type_key, tree_counts in bad_grads.items():
             if tree_counts:
@@ -315,7 +310,6 @@ class Trainer:
                 for tree_key, count in tree_counts.items():
                     warning_str += f"\n\t{tree_key}: {count}"
                 self.logger.info(warning_str)
-
 
     def get_validation_loss(self) -> float:
         # Set model and dataloader for inference
@@ -388,6 +382,14 @@ class Trainer:
         if save_dir is None:
             save_dir = self.log_dir / f"step_{self.step:06d}"
         os.makedirs(save_dir, exist_ok=True)
+
+        self.logger.info(
+            f"Saving model checkpoint at step {self.step:06d}. "
+            f"Average loss since last checkpoint: {np.mean(self.checkpoint_losses)}"
+        )
+        # Shuffle checkpoint losses over to main list and then reset.
+        self.losses.extend(self.checkpoint_losses)
+        self.checkpoint_losses = []
 
         with open(save_dir / "model_and_opt.eqx", "wb") as f:
             eqx.tree_serialise_leaves(f, self.model)
@@ -481,7 +483,7 @@ def _create_lr_schedule(cfg: Config):
     """Helper to create LR schedule from config based on total training steps."""
     return optax.exponential_decay(
         cfg.initial_lr,
-        cfg.max_training_steps, # Total steps for the decay
+        cfg.max_training_steps,  # Total steps for the decay
         cfg.decay_rate,
         cfg.transition_begin,
     )

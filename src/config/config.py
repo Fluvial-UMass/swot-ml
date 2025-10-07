@@ -127,6 +127,7 @@ class Config(BaseModel):
     # Data processing
     features: Features
     time_gaps: dict
+    precomp_scaling: bool = True
     dynamic_encoding: Encoding = Field(default_factory=Encoding)
     static_encoding: Encoding = Field(default_factory=Encoding)
     log_norm_cols: list[str] = Field(default_factory=list)
@@ -159,12 +160,12 @@ class Config(BaseModel):
     model_args: ModelArgs = Field(discriminator="name")
 
     # Trainer
-    max_training_steps: int = Field(..., gt=0) # Required
+    max_training_steps: int = Field(..., gt=0)  # Required
     max_training_hours: int = Field(np.inf, gt=0)
-    log_every_n_steps: int  = Field(np.inf, gt=0)
+    log_every_n_steps: int = Field(np.inf, gt=0)
     log_every_n_minutes: int = Field(np.inf, gt=0)
 
-    validate_every_n_steps: int = Field(np.inf, gt=0) 
+    validate_every_n_steps: int = Field(np.inf, gt=0)
     initial_lr: float = Field(..., gt=0, lt=1.0)
     decay_rate: float = Field(..., gt=0, lt=1.0)
     transition_begin: int = Field(0, ge=0)
@@ -209,18 +210,8 @@ class Config(BaseModel):
             values[attr] = values["data_root"] / values[attr]
 
         return values
-    
 
     # MODEL / AFTER
-    @model_validator(mode="after")
-    def warn_in_memory_workers(self):
-        if self.num_workers > 0 and self.in_memory:
-            warnings.warn(
-                "When in_memory=True and num_workers>0, the entire dataset will be copied to each worker causing to higher memory usage.",
-                UserWarning
-            )
-        return self
-    
     @model_validator(mode="after")
     def validate_log_intervals(self):
         """
@@ -229,9 +220,10 @@ class Config(BaseModel):
         steps_inf = self.log_every_n_steps == np.inf
         minutes_inf = self.log_every_n_minutes == np.inf
         if steps_inf and minutes_inf:
-            raise ValueError("At least one of log_every_n_steps or log_every_n_minutes must be set to a finite value.")
+            raise ValueError(
+                "At least one of log_every_n_steps or log_every_n_minutes must be set to a finite value."
+            )
         return self
-    
 
     @model_validator(mode="after")
     def validate_nse_requires_seq2seq(self):

@@ -55,7 +55,7 @@ def train_from_config(cfg: Config, log_dir: Path | None = None):
         The BasinGraphDataset loaded for training.
     """
     trainer = None
-    dataset = BasinGraphDataset(cfg, "train")
+    dataset = BasinGraphDataset(cfg, DataSubset.train)
     dataloader = BasinGraphDataLoader(cfg, dataset)
 
     if log_dir and log_dir.is_dir():
@@ -257,7 +257,6 @@ def calc_attributions(run_dir: Path):
 
     trainer = Trainer.load_last_checkpoint(run_dir)
     cfg = trainer.cfg
-    cfg.batch_size = cfg.batch_size // 10
 
     dataset = BasinGraphDataset(cfg, DataSubset.test)
     dataloader = BasinGraphDataLoader(cfg, dataset)
@@ -354,7 +353,6 @@ def make_all_plots(
 def eval_model(
     cfg: Config,
     model,
-    dataset: BasinGraphDataset,
     log_dir: Path,
     run_test: bool | str = True,
     run_predict: bool | str = True,
@@ -386,38 +384,38 @@ def eval_model(
     -----
     Pickled results, bulk metrics, and basin metrics for each data subset. Plots in the `log_dir` directory if `make_plots` is `True`.
     """
-    from evaluate import predict, get_all_metrics, get_basin_metrics
+    from evaluate import predict_to_parquet, get_all_metrics, get_basin_metrics
+
+    results_dir = log_dir / "results"
+    results_dir.mkdir(exist_ok=True)
 
     def eval_data_subset(data_subset: DataSubset, out_stem=None):
-        if out_stem is False:
-            return
-        elif isinstance(out_stem, str):
-            if out_stem[-4:] != ".pkl":
-                out_stem += ".pkl"
+        if isinstance(out_stem, bool):
+            if out_stem:
+                out_stem = data_subset.value
             else:
-                print("Pass string")
-        else:
-            out_stem = f"{data_subset.value}_data.pkl"
+                return
+        results_file = results_dir / f"{out_stem}_results.parquet"
+        metrics_file = results_dir / f"{out_stem}_metrics.pkl"
 
-        results_file = log_dir / out_stem
         print(f"Evaluating {data_subset.value} subset and saving to: {results_file}")
 
         dataset = BasinGraphDataset(cfg, data_subset)
         dataloader = BasinGraphDataLoader(cfg, dataset)
 
-        results = predict(model, dataloader, quiet=cfg.quiet, denormalize=True)
+        predict_to_parquet(model, dataloader, results_file, quiet=cfg.quiet)
         cleanup_dl(dataloader)
 
-        if data_subset != "predict":
-            bulk_metrics = get_all_metrics(results)
-            basin_metrics = get_basin_metrics(results)
-            out = (results, bulk_metrics, basin_metrics)
-        else:
-            out = results
-        with open(results_file, "wb") as f:
-            pickle.dump(out, f)
+        if data_subset == DataSubset.predict:
+            return
 
-        if make_plots and (data_subset != DataSubset.predict):
+        results = pd.read_parquet(results_file)
+        bulk_metrics = get_all_metrics(results)
+        basin_metrics = get_basin_metrics(results)
+        with open(metrics_file, "wb") as f:
+            pickle.dump((bulk_metrics, basin_metrics), f)
+
+        if make_plots:
             make_all_plots(cfg, results, bulk_metrics, basin_metrics, data_subset, log_dir)
 
     eval_data_subset(DataSubset.test, run_test)
@@ -465,9 +463,7 @@ def smac_optimize(config_path: Path, smac_runs: int, smac_workers: int):
 @app.command()
 def test(training_dir: Path):
     trainer = Trainer.load_last_checkpoint(training_dir.resolve())
-    cfg = trainer.cfg
-    dataset = BasinGraphDataset(cfg)
-    eval_model(cfg, trainer.model, dataset, training_dir, True, True, True)
+    eval_model(trainer.cfg, trainer.model, training_dir, True, True, True)
 
 
 @app.command()
@@ -475,12 +471,12 @@ def attribute(training_dir: Path):
     calc_attributions(training_dir.resolve())
 
 
-@app.command()
-def predict(model_dir: Path, basin_chunk_index: int):
-    run_test = run_train = False
-    run_predict = f"chunk_{basin_chunk_index:02}"
-    cfg, model, dataset, eval_dir = load_prediction_model(model_dir.resolve(), basin_chunk_index)
-    eval_model(cfg, model, dataset, eval_dir, run_test, run_predict, run_train)
+# @app.command()
+# def predict(model_dir: Path, basin_chunk_index: int):
+#     run_test = run_train = False
+#     run_predict = f"chunk_{basin_chunk_index:02}"
+#     cfg, model, dataset, eval_dir = load_prediction_model(model_dir.resolve(), basin_chunk_index)
+#     eval_model(cfg, model, dataset, eval_dir, run_test, run_predict, run_train)
 
 
 if __name__ == "__main__":

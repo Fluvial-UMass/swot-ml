@@ -58,7 +58,7 @@ def mosaic_scatter(cfg: Config, results: pd.DataFrame, metrics: pd.DataFrame, ti
         ax.set_xlabel("Observed")
         ax.set_ylabel("Predicted")
 
-    targets = cfg.features.target
+    targets = list(metrics.keys())
     fig, axes = plt.subplots(
         1,
         len(targets),
@@ -84,9 +84,9 @@ def basin_metric_histograms(
 ) -> dict[str, plt.Figure]:
     if metric_args is None:
         metric_args = {
-            "R2": {"range": [-1, 1]},
-            "RE": {"range": [0, 100]},
+            "NSE": {"range": [-1, 1]},
             "KGE": {"range": [-1, 1]},
+            "sigE": {"range": [0, 1]},
         }
 
     cols = 3

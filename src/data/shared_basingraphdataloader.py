@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import Sampler, DataLoader
 
 from config.config import Config
-from .basingraphdataset import GraphBatch, BasinGraphDataset
+from .shared_basingraphdataset import SharedBasinGraphDataset, GraphBatch
 
 
 class GraphPackingSampler(Sampler[list[int]]):
@@ -63,16 +63,10 @@ class GraphPackingSampler(Sampler[list[int]]):
                 f"{oversized_basins=}"
             )
 
-        total_nodes = sum(s["nodes"] for s in self.samples)
-        self.estimated_len = (total_nodes // self.target_real_nodes) + 1
-
     def __len__(self) -> int:
         # This sampler is infinite, so __len__ is not well-defined.
         # Returning a very large number can help with some utilities, but it's not strictly necessary.
-        if self.infinite_sampling:
-            return int(1e12)
-        else:
-            return self.estimated_len
+        return int(1e12)
 
     def __iter__(self) -> Iterator[list[int]]:
         """
@@ -117,6 +111,7 @@ class GraphPackingSampler(Sampler[list[int]]):
                 yield current_batch_indices
 
             if not self.infinite_sampling:
+                # Break after exhausting the dataset
                 break
 
 
@@ -194,8 +189,6 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
     edge_mask = jnp.concatenate(
         [jnp.ones(num_real_edges, dtype=jnp.bool_), jnp.zeros(num_padding_edges, dtype=jnp.bool_)]
     )
-    # # Unmask the FIRST padding edge to prevent NaN during the softmax edge calculations
-    # edge_mask = edge_mask.at[num_real_edges].set(True)
 
     # --- Step 5: Assemble Final Batch ---
     final_batch = GraphBatch(
@@ -211,11 +204,22 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
     return list(basins), list(dates), final_batch
 
 
-class BasinGraphDataLoader(DataLoader):
-    def __init__(self, cfg: Config, dataset: BasinGraphDataset):
+class SharedBasinGraphDataLoader(DataLoader):
+    def __init__(self, cfg: Config, dataset: SharedBasinGraphDataset):
         torch.manual_seed(cfg.model_args.seed)
 
-        collate_fn = partial(padding_collate_fn, target_nodes_per_batch=cfg.target_nodes_per_batch)
+        if cfg.in_memory and cfg.num_workers > 0:
+            # Make the dataset load the data into shared memory.
+            # The references to these data are stored in the dataloader so they persist and
+            # are not copied into each worker.
+            self.shm_blocks, self.shared_memory_info = dataset.setup_shared_memory()
+            worker_init_fn = self._worker_init_fn
+        else:
+            # Single worker or lazy loading, just load data directly
+            self.shm_blocks = None
+            self.shared_memory_info = None
+            worker_init_fn = None
+            dataset.setup_data_source()
 
         batch_sampler = GraphPackingSampler(
             dataset.basin_index_map,
@@ -223,11 +227,13 @@ class BasinGraphDataLoader(DataLoader):
             cfg.target_nodes_per_batch,
             cfg.shuffle,
             cfg.candidate_pool_size,
-            infinite_sampling=dataset.data_subset == "train",
+            infinite_sampling=True,
         )
 
+        collate_fn = partial(padding_collate_fn, target_nodes_per_batch=cfg.target_nodes_per_batch)
         timeout = 0 if cfg.num_workers == 0 else 900
         persistent_workers = False if cfg.num_workers == 0 else True
+
         super().__init__(
             dataset,
             collate_fn=collate_fn,
@@ -236,10 +242,36 @@ class BasinGraphDataLoader(DataLoader):
             pin_memory=cfg.pin_memory,
             timeout=timeout,
             persistent_workers=persistent_workers,
+            worker_init_fn=worker_init_fn,
         )
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 
         # self.set_jax_sharding(cfg.backend, cfg.num_devices)
+
+    def _worker_init_fn(self, worker_id):
+        """Initialize each worker's dataset copy to use the shared memory."""
+        worker_info = torch.utils.data.get_worker_info()
+        dataset = worker_info.dataset  # This is the lightweight, pickled copy
+
+        # The dataset copy has no data yet. We tell it to reconstruct from shared memory.
+        if self.shared_memory_info is not None:
+            dataset.setup_data_source(self.shared_memory_info)
+        else:
+            # lazy loading (non-shared memory)
+            dataset.setup_data_source()
+
+    def __del__(self):
+        """Clean up shared memory on DataLoader deletion."""
+        if self.shm_blocks is not None:
+            print("Cleaning up shared memory blocks from DataLoader...")
+            for shm in self.shm_blocks:
+                try:
+                    shm.close()
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass  # May have already been unlinked
+                except Exception as e:
+                    print(f"Warning: Failed to cleanup shared memory: {e}")
 
     def set_jax_sharding(self, backend: str | None = None, num_devices: int | None = None):
         """

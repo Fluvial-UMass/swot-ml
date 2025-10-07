@@ -1,10 +1,16 @@
-import os
+# ruff: noqa: E402
 import warnings
+from zarr.errors import ZarrUserWarning, UnstableSpecificationWarning
+
+warnings.filterwarnings("ignore", category=ZarrUserWarning)
+warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
+
+import os
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Suppress 'warn' and 'info' messages from the Rust backend.
-# deltalake is receiving a deprecation warning about future updates to DataFusion.
+# deltalake is receiving deprecation warnings about future updates to DataFusion.
 # https://github.com/delta-io/delta-rs/issues/3709
 # Will probably go away with updates, but we are locking versions anyway.
 # Has to be set before deltalakes is imported
@@ -17,11 +23,21 @@ import pyarrow as pa
 import xarray as xr
 import zarr
 from dask.distributed import Client
-from zarr.errors import ZarrUserWarning
 from deltalake import DeltaTable, write_deltalake
 from deltalake.exceptions import TableNotFoundError
 
 LOG_PAD = 1e-6  # IMPORTANT: This must match the log_pad value the dataloader class
+
+
+def validate_list_or_str(arg: list[str] | str | None) -> list[str]:
+    if arg is None:
+        return []
+    elif isinstance(arg, str):
+        return [arg]
+    elif isinstance(arg, list):
+        return arg
+    else:
+        raise TypeError(f"Argument must be list, str, or None. Received {type(arg)=} ({arg=}).")
 
 
 class BasinDataLake:
@@ -131,11 +147,13 @@ class BasinDataLake:
         data : dict[str, Optional[pd.DataFrame]]
             Dictionary mapping subbasin IDs to DataFrames.
         mode : str, optional
-            Write mode: 'upsert' (default) performs a merge, 'append' performs a
-            fast append without checking for duplicates.
+            Write mode:
+            - 'upsert': (default) performs a merge based on 'subbasin' and 'date'.
+            - 'append': performs a fast append without checking for duplicates.
+            - 'overwrite': atomically replaces all data for the specified 'basin'.
         """
-        if mode not in ["upsert", "append"]:
-            raise ValueError("Mode must be either 'upsert' or 'append'.")
+        if mode not in ["upsert", "append", "overwrite"]:
+            raise ValueError("Mode must be either 'upsert', 'append', or 'overwrite'.")
 
         df = self._prepare_dynamic_df(basin, source, data)
 
@@ -159,7 +177,20 @@ class BasinDataLake:
                     partition_by=partition_cols,
                     schema_mode="merge",
                 )
-                self._append_processing_record(basin, source, data)
+                self._upsert_processing_record(basin, source, data)
+
+            elif mode == "overwrite":
+                partition_filters = [("basin", "=", basin)]
+                write_deltalake(
+                    table_uri,
+                    df,
+                    mode="overwrite",
+                    partition_by=partition_cols,
+                    partition_filters=partition_filters,
+                    schema_mode="merge",
+                )
+                # Use upsert to update the metadata to reflect the new state
+                self._upsert_processing_record(basin, source, data)
 
             else:  # mode == "upsert"
                 try:
@@ -238,10 +269,20 @@ class BasinDataLake:
         if not sources_to_read:
             return pd.DataFrame() if concat_sources else {}
 
-        if isinstance(start_date, str):
-            start_date = pd.Timestamp(start_date, tz="UTC")
-        if isinstance(end_date, str):
-            end_date = pd.Timestamp(end_date, tz="UTC")
+        def validate_date(date):
+            if date is None:
+                pass
+            elif isinstance(date, str):
+                date = pd.Timestamp(date, tz="UTC")
+            elif isinstance(date, pd.Timestamp):
+                if date.tz is None:
+                    date = date.tz_localize("UTC")
+            else:
+                raise ValueError(f"Dates must be either string or timestamp, received {date=}")
+            return date
+
+        start_date = validate_date(start_date)
+        end_date = validate_date(end_date)
 
         def read_source(source: str) -> pd.DataFrame:
             """Read data from a single source table."""
@@ -265,7 +306,6 @@ class BasinDataLake:
                 df.drop(columns=["basin", "year"], inplace=True)
 
                 df.set_index(["subbasin", "date"], inplace=True)
-
                 return df
 
             except TableNotFoundError:
@@ -273,7 +313,6 @@ class BasinDataLake:
                 return pd.DataFrame()
 
         source_data = {s: read_source(s) for s in sources_to_read}
-
         if not concat_sources:
             return source_data
 
@@ -402,6 +441,13 @@ class BasinDataLake:
         has_data = status.groupby("basin").apply(grp_is_true)
         return has_data
 
+    def get_basin_subbasin_map(self) -> dict:
+        def get_subbasin_list(row):
+            return list(row.index.get_level_values("subbasin"))
+
+        status = self.get_processing_status()
+        return status.groupby("basin").apply(get_subbasin_list).to_dict()
+
     # -------------------------------
     # Maintenance Operations
     # -------------------------------
@@ -429,11 +475,8 @@ class BasinDataLake:
         print_stats(stats, "Metadata")
 
         # Optimize source tables
-        available_sources = self._discover_sources()
-        if sources is not None:
-            sources_to_optimize = [s for s in sources if s in available_sources]
-        else:
-            sources_to_optimize = available_sources
+        sources = validate_list_or_str(sources)
+        sources_to_optimize = sources if sources else self._discover_sources()
 
         for source in sources_to_optimize:
             table_uri = self._get_source_table_uri(source)
@@ -491,97 +534,96 @@ class BasinDataLake:
         chunk_days: int = 365,
         overwrite: bool = False,
     ):
-        # Temporarily ignore the specific ZarrUserWarning about consolidated metadata
-        warnings.filterwarnings("ignore", category=ZarrUserWarning)
-
         zarr_path = Path(zarr_path)
 
-        # basins = self.list_processed_basins() if basins is None else basins
-        basin_data_flags = self.list_source_basin_data()
-        sources = self.list_sources() if sources is None else sources
         start_date = pd.Timestamp(start_date, tz="UTC") if start_date else None
         end_date = pd.Timestamp(end_date, tz="UTC") if end_date else None
 
-        status = self.get_processing_status()
-        subbasin_map = status.groupby("basin").apply(len).to_dict()
+        basin_subbasin_map = self.get_basin_subbasin_map()
+        basin_source_df = self.list_source_basin_data()
+        basin_source_map = {
+            basin: list(row.index[row]) for basin, row in basin_source_df.iterrows()
+        }
+        basins_w_data = set(basin_source_map.keys())
 
-        for source in sources:
-            basins_w_data = basin_data_flags[basin_data_flags[source]].index
-            source_path = zarr_path / source
-            if basins:
-                # Use the basins argument if it exists
-                basins_to_export = basins
-            elif overwrite or not source_path.exists():
-                # Get all basins with data
+        if sources is None:
+            sources = self.list_sources()
+        elif isinstance(sources, str):
+            sources = [sources]
+        sources = set(sources)
+
+        if basins:
+            # Use the basins argument if it exists
+            basins_to_export = basins
+        elif overwrite:
+            # Get all basins with data
+            basins_to_export = set(basins_w_data)
+        else:
+            # Filter the basins based on what has already been exported.
+            if zarr_path.exists():
+                exported_basins = {d.name for d in zarr_path.iterdir() if d.is_dir()}
+                basins_to_export = set(basins_w_data) - exported_basins
+            else:
                 basins_to_export = set(basins_w_data)
-            else:
-                # Filter the basins based on what has already been exported.
-                exported = [d.stem for d in source_path.iterdir() if d.is_dir()]
-                basins_to_export = set(basins_w_data) - set(exported)
 
-            if not basins_to_export:
-                print(f"No new basins to process for source: {source}.")
-                continue
-            print(f"Processing {len(basins_to_export)} basins for source: {source}.")
+        if not basins_to_export:
+            print("No new basins to process.")
+            return
+        print(f"Processing {len(basins_to_export)} basins.")
 
-            count = 0
-            if workers > 1:
-                with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = {
-                        executor.submit(
-                            self.export_basin_group_to_zarr,
-                            basin=basin,
-                            subbasin_count=subbasin_map[basin],
-                            source=source,
-                            zarr_path=zarr_path,
-                            start_date=start_date,
-                            end_date=end_date,
-                            chunk_days=chunk_days,
-                        ): basin
-                        for basin in basins_to_export
-                    }
+        count = 0
+        if workers > 1:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(
+                        self.export_basin_to_zarr,
+                        basin=basin,
+                        subbasins=basin_subbasin_map[basin],
+                        sources=sources.intersection(basin_source_map[basin]),
+                        zarr_path=zarr_path,
+                        start_date=start_date,
+                        end_date=end_date,
+                        chunk_days=chunk_days,
+                    ): basin
+                    for basin in basins_to_export
+                }
 
-                    with tqdm(
-                        total=len(basins_to_export), desc=f"Processing {source} basins"
-                    ) as pbar:
-                        for future in as_completed(futures):
-                            basin = futures[future]
-                            try:
-                                written = future.result()
-                                if written:
-                                    count += 1
-                                pbar.set_postfix({"completed": count, "basin": basin})
-                            except Exception as e:
-                                print(f"\nError in basin {basin}, source {source}: {e}")
-                            finally:
-                                pbar.update(1)
+                with tqdm(total=len(basins_to_export), desc="Processing basins") as pbar:
+                    for future in as_completed(futures):
+                        basin = futures[future]
+                        try:
+                            written = future.result()
+                            if written:
+                                count += 1
+                            pbar.set_postfix({"completed": count, "basin": basin})
+                        except Exception as e:
+                            print(f"\nError in basin {basin}: {e}")
+                        finally:
+                            pbar.update(1)
 
-            else:
-                for basin in tqdm(basins_to_export, desc="Iterating through basins"):
-                    try:
-                        written = self.export_basin_group_to_zarr(
-                            basin=basin,
-                            subbasin_count=subbasin_map[basin],
-                            source=source,
-                            zarr_path=zarr_path,
-                            start_date=start_date,
-                            end_date=end_date,
-                            chunk_days=chunk_days,
-                        )
-                        count += 1 if written else 0
-                    except Exception as e:
-                        print(f"{basin=}, {source=}")
-                        raise e
-
+        else:
+            for basin in tqdm(basins_to_export, desc="Iterating through basins"):
+                try:
+                    written = self.export_basin_to_zarr(
+                        basin=basin,
+                        subbasins=basin_subbasin_map[basin],
+                        sources=sources,
+                        zarr_path=zarr_path,
+                        start_date=start_date,
+                        end_date=end_date,
+                        chunk_days=chunk_days,
+                    )
+                    count += 1 if written else 0
+                except Exception as e:
+                    print(f"{basin=}")
+                    raise e
             print(f"Wrote data for {count} basins.")
 
-        warnings.resetwarnings()
-
-    def export_basin_group_to_zarr(
+    def export_basin_to_zarr(
         self,
         basin: str,
-        subbasin_count: int,
-        source: str,
+        subbasins: list[str],
+        sources: list[str],
         zarr_path: Path | str,
         start_date: pd.Timestamp | None,
         end_date: pd.Timestamp | None,
@@ -607,132 +649,181 @@ class BasinDataLake:
         dtype : numpy dtype
             Storage type for Zarr.
         """
-        if subbasin_count <= 1000:
+        # One of the offending basins = ABOM-213983010
+
+        zarr_group_path = Path(zarr_path) / basin
+        global_calendar = pd.date_range(start_date, end_date, freq="D").tz_localize(None)
+        subbasin_idx = pd.Index(subbasins)  # Faster indexing than list of str
+
+        # Determine the time chunks to iterate over for reading from Delta Lake
+        if len(subbasins) <= 500:
             year_step = 50
-        elif subbasin_count <= 2000:
+        elif len(subbasins) <= 1000:
             year_step = 10
         else:
             year_step = 1
-        date_range = pd.date_range(start_date, end_date, freq=f"{year_step}YE", inclusive="both")
+        # Create the date range for iteration
+        iter_dates = pd.date_range(start_date, end_date, freq=f"{year_step}YS-JAN")
+        if end_date not in iter_dates:
+            iter_dates = iter_dates.append(pd.DatetimeIndex([end_date]))
 
-        # Ensure the last date is exactly end_date
-        if date_range[-1] != pd.Timestamp(end_date):
-            date_range = date_range.append(pd.DatetimeIndex([end_date]))
+        def write_coords(dates, subbasins):
+            template_ds = xr.Dataset(coords={"date": dates, "subbasin": subbasins})
+            template_ds = template_ds.chunk({"date": chunk_days, "subbasin": -1})
 
-        written = False
-        group_path = f"{source}/{basin}"
-        for chunk_start, chunk_end in zip(date_range[:-1], date_range[1:]):
-            df = self.read_dynamic(
-                basin=basin, source=source, start_date=chunk_start, end_date=chunk_end
+            # Write the empty template to disk. This establishes the coordinate grid and chunks
+            template_ds.to_zarr(zarr_group_path, mode="w", consolidated=True)
+
+        def init_empty_var_arrays(var_names, dates, subbasins):
+            ds = xr.open_dataset(zarr_group_path, engine="zarr")
+            existing_vars = list(ds.data_vars)
+
+            for var_name in var_names:
+                if var_name not in existing_vars:
+                    # Create a dummy DataArray with the correct structure
+                    dummy_data = xr.DataArray(
+                        np.full((len(dates), len(subbasins)), np.nan),
+                        coords={"date": dates, "subbasin": subbasins},
+                        dims=["date", "subbasin"],
+                        name=var_name,
+                    )
+                    # Chunk and write to the existing zarr store
+                    dummy_data = dummy_data.chunk({"date": chunk_days, "subbasin": -1})
+                    dummy_data.to_zarr(zarr_group_path, mode="a")
+
+        def write_df_to_zarr(df: pd.DataFrame):
+            chunk_data = {}
+            for var_name in df.columns:
+                pivoted_data = df[var_name].unstack(level="subbasin")
+                chunk_data[var_name] = (["date", "subbasin"], pivoted_data.values)
+
+            chunk_ds = xr.Dataset(
+                data_vars=chunk_data,
+                coords={
+                    "date": pivoted_data.index.tz_localize(None),
+                    "subbasin": pivoted_data.columns,
+                },
             )
 
-            df = df[source]
-            if df.empty:
+            chunk_dates = df.index.get_level_values("date").unique().tz_localize(None)
+            all_chunk_dates = pd.date_range(chunk_dates.min(), chunk_dates.max(), freq="D")
+
+            chunk_ds = chunk_ds.reindex(date=all_chunk_dates, subbasin=subbasins, fill_value=np.nan)
+
+            # Write to the specific region
+            # xarray will automatically align based on coordinate values
+            chunk_ds.to_zarr(
+                zarr_group_path,
+                region="auto",  # automatically determines the region based on coordinates
+                mode="r+",  # read-write mode (must exist)
+                consolidated=False,
+            )
+
+        written = False
+        for i in range(len(iter_dates) - 1):
+            chunk_start, chunk_end = iter_dates[i], iter_dates[i + 1]
+
+            df_chunk = self.read_dynamic(
+                basin=basin, source=sources, start_date=chunk_start, end_date=chunk_end
+            ).droplevel(level="source", axis=1)
+
+            if df_chunk.empty:
                 continue
 
-            df = df.reset_index()
-            df["date"] = df["date"].dt.tz_localize(None).astype("datetime64[ns]")
-            df = df.set_index(["date", "subbasin"]).sort_index()
+            if not written and not zarr_group_path.is_dir():
+                write_coords(global_calendar, subbasin_idx)
 
-            if source == "gauge":
-                df = df.drop(columns=["quality_flag", "provider"])
+            init_empty_var_arrays(list(df_chunk), global_calendar, subbasin_idx)
+            write_df_to_zarr(df_chunk)
 
-            # Convert to xarray
-            ds_xr = xr.Dataset.from_dataframe(df)
-            ds_xr = ds_xr.transpose("date", "subbasin", ...)  # ensure index ordering
-            ds_xr = ds_xr.chunk({"date": chunk_days, "subbasin": -1})
+        return True
 
-            # Write this dataset to its own unique group. Use mode="w" to overwrite.
-            if not written:
-                ds_xr.to_zarr(str(zarr_path), group=group_path, mode="w")
-                written = True
-            else:
-                ds_xr.to_zarr(
-                    str(zarr_path), group=group_path, mode="a", append_dim="date", align_chunks=True
-                )
-
-        return written
-
-    def consolidate_zarr(self, zarr_root: Path | str):
-        zarr_root = Path(zarr_root)
-        sources = [p for p in zarr_root.iterdir() if p.is_dir()]
-
-        for source_path in sources:
-            basin_paths = [p for p in source_path.iterdir() if p.is_dir()]
-            print(f"Consolidating source: {source_path.name}...")
-
-            for basin_path in tqdm(basin_paths, desc=f"Basins in {source_path.name}"):
-                zarr.consolidate_metadata(basin_path)
-
-    def compute_and_store_stats(self, zarr_root: Path, overwrite: bool = False):
+    def compute_and_store_stats(
+        self, zarr_root: Path, vars: str | list[str] = None, overwrite: bool = False
+    ):
         """
         Iterates through all basin Zarr groups to compute and store normalization statistics.
         This is a standalone script to be run once after data is exported to Zarr.
         """
+        zarr_root = Path(zarr_root)
+        vars = validate_list_or_str(vars)
+        basin_paths = [p for p in zarr_root.iterdir() if p.is_dir()]
+
         with Client() as client:
             print(f"Dask client started. Dashboard at: {client.dashboard_link}")
 
-            zarr_root = Path(zarr_root)
-            sources = [p for p in zarr_root.iterdir() if p.is_dir()]
+            for basin_path in tqdm(basin_paths, desc="Basins"):
+                ds = None  # initialize ds for the 'finally' block
+                try:
+                    # Open with Zarr to read existing attributes without loading the dataset
+                    z_group = zarr.open(str(basin_path), mode="r")
+                    existing_stats = z_group.attrs.get("normalization_stats", {})
 
-            for source_path in sources:
-                basin_paths = [p for p in source_path.iterdir() if p.is_dir()]
-                print(f"Processing source: {source_path.name}...")
+                    ds = xr.open_zarr(basin_path, consolidated=True)
+                    all_numeric_vars = [v for v in ds.data_vars if ds[v].dtype.kind in "fi"]
+                    target_vars = vars if vars else all_numeric_vars
 
-                for basin_path in tqdm(basin_paths, desc=f"Basins in {source_path.name}"):
-                    try:
-                        # Check for existing stats before opening with Dask
-                        z_group = zarr.open(str(basin_path), mode="r")
-                        if "normalization_stats" in z_group.attrs and not overwrite:
+                    # Determine which variables need stats computed
+                    if overwrite:
+                        # process all target variables
+                        vars_to_scale = target_vars
+                    else:
+                        # process only target variables that don't have existing stats
+                        vars_to_scale = [v for v in target_vars if v not in existing_stats]
+
+                    # Go to next basin if no variables to process
+                    if not vars_to_scale:
+                        continue
+
+                    stats_dict = {}
+                    computations = {}
+                    # Prepare all Dask computations for the necessary variables
+                    for var_name in vars_to_scale:
+                        variable = ds[var_name].astype(np.float64)
+                        valid_values = variable.where(variable.notnull())
+                        positive_values = valid_values.where(valid_values > 0)
+
+                        # Store the delayed computation objects
+                        computations[var_name] = {
+                            "count": valid_values.count(),
+                            "sum": valid_values.sum(),
+                            "sum_sq": (valid_values**2).sum(),
+                            "min": valid_values.min(),
+                            "max": valid_values.max(),
+                            "log_sum": np.log(positive_values + LOG_PAD).sum(),
+                            "positive_count": positive_values.count(),
+                        }
+
+                    # Trigger all computations in parallel
+                    results = client.compute(computations)
+                    processed_results = client.gather(results)
+
+                    # Process the computed results
+                    for var_name, stats in processed_results.items():
+                        count = stats["count"].item()
+                        if count == 0:
                             continue
 
-                        ds = xr.open_zarr(basin_path, consolidated=True)
-                        stats_dict = {}
-                        vars_to_scale = [v for v in ds.data_vars if ds[v].dtype.kind in "fi"]
+                        stats_dict[var_name] = {
+                            "count": count,
+                            "sum": stats["sum"].item(),
+                            "sum_sq": stats["sum_sq"].item(),
+                            "min": stats["min"].item(),
+                            "max": stats["max"].item(),
+                            "log_sum": stats["log_sum"].item()
+                            if stats["positive_count"].item() > 0
+                            else 0.0,
+                        }
 
-                        # Prepare all Dask computations
-                        computations = {}
-                        for var_name in vars_to_scale:
-                            variable = ds[var_name].astype(np.float64)
-                            valid_values = variable.where(variable.notnull())
-                            positive_values = valid_values.where(valid_values > 0)
+                    if stats_dict:
+                        # Merge new stats with existing stats and write back
+                        existing_stats.update(stats_dict)
 
-                            # Store the delayed computation objects
-                            computations[var_name] = {
-                                "count": valid_values.count(),
-                                "sum": valid_values.sum(),
-                                "sum_sq": (valid_values**2).sum(),
-                                "min": valid_values.min(),
-                                "max": valid_values.max(),
-                                "log_sum": np.log(positive_values + LOG_PAD).sum(),
-                                "positive_count": positive_values.count(),
-                            }
+                        # Re-open with zarr library to write attributes
+                        z_group_write = zarr.open(str(basin_path), mode="r+")
+                        z_group_write.attrs["normalization_stats"] = existing_stats
 
-                        # 2. Trigger all computations in parallel with a single Dask call
-                        results = client.compute(computations)
-                        processed_results = client.gather(results)
-
-                        # 3. Process the results after they are computed
-                        for var_name, stats in processed_results.items():
-                            count = stats["count"].item()
-                            if count == 0:
-                                continue
-
-                            stats_dict[var_name] = {
-                                "count": count,
-                                "sum": stats["sum"].item(),
-                                "sum_sq": stats["sum_sq"].item(),
-                                "min": stats["min"].item(),
-                                "max": stats["max"].item(),
-                                "log_sum": stats["log_sum"].item()
-                                if stats["positive_count"].item() > 0
-                                else 0.0,
-                            }
-
-                        if stats_dict:
-                            # Re-open with zarr library to write attributes
-                            z_group_write = zarr.open(str(basin_path), mode="r+")
-                            z_group_write.attrs["normalization_stats"] = stats_dict
-
-                    except Exception as e:
-                        print(f"\nFailed to process {basin_path}: {e}")
+                finally:
+                    # Ensure the xarray dataset is closed
+                    if ds is not None:
+                        ds.close()
