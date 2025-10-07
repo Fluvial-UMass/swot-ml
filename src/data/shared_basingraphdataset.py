@@ -1,5 +1,6 @@
 import warnings
 import json
+import copy
 from typing import NamedTuple
 from collections import defaultdict
 import multiprocessing as mp
@@ -7,6 +8,8 @@ import multiprocessing as mp
 from tqdm import tqdm
 import pandas as pd
 import xarray as xr
+import dask.dataframe as dd
+import dask.array as da
 import zarr
 from zarr.errors import ZarrUserWarning
 import networkx as nx
@@ -132,43 +135,69 @@ class SharedBasinGraphDataset(Dataset):
 
     def setup_shared_memory(self):
         """
-        Loads data from Zarr and moves it to shared memory.
+        Loads data from Zarr and moves it to a single shared memory block per basin.
         This should only be called ONCE from the main process.
-        Returns the shared memory blocks and the info dictionary.
         """
         from multiprocessing import shared_memory
 
-        # Step 1: Open lazy references to Zarr stores
         lazy_basin_datasets = self._open_zarr_store(load_in_memory=False)
 
-        # Step 2: Create shared memory blocks and copy data
         print("Computing data into shared memory...")
         shm_blocks = []
         shared_memory_info = {}
 
         for basin_id, ds in tqdm(lazy_basin_datasets.items(), desc="Basins to shared memory"):
-            # The rest of this method is identical to your original _load_to_shared_memory
             basin_info = {"variables": {}}
+
+            # --- MODIFICATION START ---
+            # 1. Calculate total size and prepare variable metadata
+            total_nbytes = 0
+            var_metadata = []
             for var_name in ds.data_vars:
-                shape = ds[var_name].shape
-                dtype = ds[var_name].dtype
-                dims = list(ds[var_name].dims)
-                coords = [ds[var_name][dim].values for dim in dims]
+                data = ds[var_name]
+                shape = data.shape
+                dtype = data.dtype
                 nbytes = int(np.prod(shape) * np.dtype(dtype).itemsize)
 
-                shm = shared_memory.SharedMemory(create=True, size=nbytes)
-                shm_blocks.append(shm)
+                var_metadata.append(
+                    {
+                        "name": var_name,
+                        "shape": shape,
+                        "dtype": dtype,
+                        "dims": list(data.dims),
+                        "coords": [data[dim].values for dim in data.dims],
+                        "nbytes": nbytes,
+                    }
+                )
+                total_nbytes += nbytes
 
-                shm_arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
-                shm_arr[:] = ds[var_name].values  # Compute happens here
+            # 2. Create ONE shared memory block for the entire basin
+            shm = shared_memory.SharedMemory(create=True, size=total_nbytes)
+            shm_blocks.append(shm)
+            basin_info["shm_name"] = shm.name
 
-                basin_info["variables"][var_name] = {
-                    "shm_name": shm.name,
-                    "shape": shape,
-                    "dtype": dtype,
-                    "dims": dims,
-                    "coords": coords,
+            # 3. Copy data for each variable into the block, tracking the offset
+            current_offset = 0
+            for meta in var_metadata:
+                # Create a view into the specific slice of the shared memory buffer
+                shm_arr = np.ndarray(
+                    meta["shape"], dtype=meta["dtype"], buffer=shm.buf, offset=current_offset
+                )
+
+                # Copy the data (computation happens here)
+                shm_arr[:] = ds[meta["name"]].values
+
+                # Store the metadata, including the offset
+                basin_info["variables"][meta["name"]] = {
+                    "shape": meta["shape"],
+                    "dtype": meta["dtype"],
+                    "dims": meta["dims"],
+                    "coords": meta["coords"],
+                    "offset": current_offset,
                 }
+                current_offset += meta["nbytes"]
+            # --- MODIFICATION END ---
+
             shared_memory_info[basin_id] = basin_info
 
         print("Temporarily attaching to shared memory to build sampler index...")
@@ -259,20 +288,26 @@ class SharedBasinGraphDataset(Dataset):
         print(f"Worker {mp.current_process().name}: Reconstructing from shared memory...")
         basin_datasets = {}
 
-        # CRITICAL: Keep references to shared memory objects to prevent segfaults
         if not hasattr(self, "_worker_shm_refs"):
             self._worker_shm_refs = []
 
         for basin_id, basin_info in self.shared_memory_info.items():
             data_vars = {}
 
-            for var_name, var_info in basin_info["variables"].items():
-                # Attach to existing shared memory
-                shm = shared_memory.SharedMemory(name=var_info["shm_name"])
-                self._worker_shm_refs.append(shm)  # KEEP REFERENCE ALIVE
+            # --- MODIFICATION START ---
+            # 1. Attach to the single shared memory block for the basin
+            shm = shared_memory.SharedMemory(name=basin_info["shm_name"])
+            self._worker_shm_refs.append(shm)  # KEEP REFERENCE ALIVE
 
-                # Create numpy array view (no copy!)
-                arr = np.ndarray(var_info["shape"], dtype=var_info["dtype"], buffer=shm.buf)
+            for var_name, var_info in basin_info["variables"].items():
+                # 2. Create a numpy array view using the buffer and the specific offset
+                arr = np.ndarray(
+                    var_info["shape"],
+                    dtype=var_info["dtype"],
+                    buffer=shm.buf,
+                    offset=var_info["offset"],
+                )
+                # --- MODIFICATION END ---
 
                 data_vars[var_name] = xr.DataArray(
                     arr,
@@ -478,8 +513,11 @@ class SharedBasinGraphDataset(Dataset):
         assert feat_group in ["dynamic", "static"]
 
         columns_in = ds.data_vars
-        ds, categorical_enc = self._one_hot_encoding(ds, feat_group, encoding["categorical"])
-        ds, bitmask_enc = self._bitmask_expansion(ds, feat_group, encoding["bitmask"])
+        encoding_copy = copy.deepcopy(encoding)
+        ds, categorical_enc = self._one_hot_encoding(
+            ds, feat_group, encoding_copy.get("categorical", {})
+        )
+        ds, bitmask_enc = self._bitmask_expansion(ds, feat_group, encoding_copy.get("bitmask", {}))
 
         new_columns = set(ds.data_vars) - set(columns_in)
 
@@ -492,105 +530,111 @@ class SharedBasinGraphDataset(Dataset):
         return ds, updated_encoding
 
     def _one_hot_encoding(self, ds: xr.Dataset, feat_group: str, cat_enc: dict[str, list[str]]):
-        is_train = self.data_subset == "train"
-
         for col, prescribed in cat_enc.items():
             if col not in ds.data_vars:
-                # During inference we add zero-filled columns even if the column is missing.
-                if not is_train and prescribed:
-                    zero_df = pd.DataFrame(
-                        0, index=ds.indexes["subbasin"], columns=[f"{col}_{c}" for c in prescribed]
-                    )
-                    ds = xr.merge([ds, zero_df.to_xarray()])
                 continue
 
-            df = ds[col].to_dataframe()
-            encoded = pd.get_dummies(df[col].astype(str), prefix=col)
+            # Convert to a lazy Dask DataFrame instead of a Pandas DataFrame
+            ddf = ds[[col]].to_dask_dataframe(set_index=True).categorize(columns=[col])
 
-            ds = ds.drop_vars(col)
+            # Perform one-hot encoding lazily using Dask
+            encoded_ddf = dd.get_dummies(ddf, prefix=col, columns=[col])
 
-            if is_train and not prescribed:
-                # discover categories
-                cat_enc[col] = encoded.columns.tolist()
-            else:
-                # enforce prescribed ordering
+            if prescribed:
+                # Add missing prescribed columns lazily
                 for c in prescribed:
-                    if c not in encoded.columns:
-                        encoded[c] = 0
-                encoded = encoded[prescribed]
+                    if c not in encoded_ddf.columns:
+                        encoded_ddf[c] = 0
+                # Ensure order and presence of prescribed columns
+                encoded_ddf = encoded_ddf[prescribed]
+            else:
+                if feat_group == "static":
+                    # Discovery for static features requires computing the columns.
+                    # This is a one-time, metadata-only operation and should be acceptable.
+                    discovered_cols = encoded_ddf.columns.tolist()
+                    cat_enc[col] = discovered_cols
+                else:  # feat_group == "dynamic"
+                    raise ValueError(
+                        f"Dynamic categorical variable '{col}' must have its categories "
+                        "prescribed in the config. Discovery is not supported for dynamic data."
+                    )
 
-            ds = xr.merge([ds, encoded.to_xarray()])
+            # Convert the lazy Dask DataFrame back to a lazy xarray.Dataset
+            encoded_ds = xr.Dataset.from_dataframe(encoded_ddf)
 
-            # update features dict
+            ds = ds.drop_vars(col)  # Drop the original column
+            ds = xr.merge([ds, encoded_ds])  # Merge the lazy encoded columns
+
+            # Update the feature dicts (logic remains the same)
+            encoded_columns = list(encoded_ds.data_vars)
             if feat_group == "dynamic":
-                for source, feats in self.features["dynamic"].items():
+                for feats in self.features["dynamic"].values():
                     if col in feats:
                         feats.remove(col)
-                        feats.extend(encoded.columns)
-            else:
+                        feats.extend(encoded_columns)
+            else:  # static
                 if col in self.features["static"]:
                     self.features["static"].remove(col)
-                self.features["static"].extend(encoded.columns)
+                self.features["static"].extend(encoded_columns)
 
         return ds, cat_enc
 
     def _bitmask_expansion(
         self, ds: xr.Dataset, feat_group: str, bitmask_enc: dict[str, list[int]]
     ):
-        is_train = self.data_subset == "train"
-
         for col, prescribed_bits in bitmask_enc.items():
-            new_vars = {}
+            if col not in ds.data_vars:
+                continue
 
-            if col in ds.data_vars:
-                x = ds[col].values
-                finite_mask = np.isfinite(x)
-                x_int = np.where(finite_mask, x, 0).astype(int)
+            # Operate directly on the lazy xarray.DataArray (which is a Dask array)
+            x = ds[col]
+            finite_mask = da.isfinite(x.data)
+            x_int = da.where(finite_mask, x.data, 0).astype(int)
 
-                if is_train and not prescribed_bits:
-                    # infer used bits
-                    max_val = x_int.max()
+            if not prescribed_bits:
+                if feat_group == "static":
+                    # Discovery requires computing max value. This is a one-time cost.
+                    max_val = x_int.max().compute()
                     nbits = int(np.ceil(np.log2(max_val + 1))) if max_val > 0 else 0
-                    prescribed_bits = [
-                        n for n in range(nbits) if ((x_int // 2**n) % 2)[finite_mask].sum() > 0
-                    ]
-                    bitmask_enc[col] = prescribed_bits
 
-                for n in prescribed_bits:
-                    bit_arr = ((x_int // 2**n) % 2).astype(float)
-                    bit_arr[~finite_mask] = np.nan
-                    new_vars[f"{col}_bit_{n}"] = xr.DataArray(
-                        bit_arr, dims=ds[col].dims, coords=ds[col].coords
+                    # Check which bits are active across the dataset
+                    # This part still requires computation to discover bits
+                    active_bits = []
+                    for n in range(nbits):
+                        if ((x_int // 2**n) % 2)[finite_mask].sum().compute() > 0:
+                            active_bits.append(n)
+                    prescribed_bits = active_bits
+                    bitmask_enc[col] = prescribed_bits
+                else:  # feat_group == 'dynamic'
+                    raise ValueError(
+                        f"Dynamic bitmask variable '{col}' must have its bits "
+                        "prescribed in the config. Discovery is not supported for dynamic data."
                     )
 
+            new_vars = {}
+            if prescribed_bits:
+                for n in prescribed_bits:
+                    # All these operations are lazy Dask operations
+                    bit_arr_data = ((x_int // 2**n) % 2).astype(float)
+                    bit_arr_data = da.where(finite_mask, bit_arr_data, np.nan)
+
+                    new_var_name = f"{col}_bit_{n}"
+                    new_vars[new_var_name] = xr.DataArray(
+                        bit_arr_data, dims=ds[col].dims, coords=ds[col].coords
+                    )
                 ds = ds.drop_vars(col)
 
-            else:
-                # col missing
-                if not is_train and prescribed_bits:
-                    if feat_group == "dynamic":
-                        dims = ("subbasin", "date")
-                        coords = {"subbasin": ds.subbasin, "date": ds.date}
-                        shape = (len(ds.subbasin), len(ds.date))
-                    else:
-                        dims = ("subbasin",)
-                        coords = {"subbasin": ds.subbasin}
-                        shape = (len(ds.subbasin),)
-                    for n in prescribed_bits:
-                        new_vars[f"{col}_bit_{n}"] = xr.DataArray(
-                            np.zeros(shape), dims=dims, coords=coords
-                        )
-
             if new_vars:
+                # Merge the new lazy variables
                 ds = xr.merge([ds, xr.Dataset(new_vars)], compat="no_conflicts")
 
-                # update features
+                # Update the feature dicts (logic remains the same)
                 if feat_group == "dynamic":
                     for source, feats in self.features["dynamic"].items():
                         if col in feats:
                             feats.remove(col)
                             feats.extend(new_vars.keys())
-                else:
+                else:  # static
                     if col in self.features["static"]:
                         self.features["static"].remove(col)
                     self.features["static"].extend(new_vars.keys())

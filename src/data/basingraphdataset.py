@@ -7,6 +7,8 @@ from collections import defaultdict
 from tqdm import tqdm
 import pandas as pd
 import xarray as xr
+import dask.dataframe as dd
+import dask.array as da
 import zarr
 from zarr.errors import ZarrUserWarning
 import networkx as nx
@@ -41,11 +43,10 @@ class BasinGraphDataset(Dataset):
     DataLoader class for loading and preprocessing hydrological time series data.
     """
 
-    def __init__(self, cfg: Config, subset: DataSubset, *, for_stats: bool = False, debug=False):
+    def __init__(self, cfg: Config, subset: DataSubset, *, for_stats: bool = False):
         self.cfg = cfg
         self.log_pad = 0.001
         self.data_subset = subset
-        self.debug = debug
 
         if subset == DataSubset.train:
             self.s_encoding = self.cfg.static_encoding.model_dump()
@@ -157,8 +158,6 @@ class BasinGraphDataset(Dataset):
             if self.cfg.in_memory:
                 ds = ds.compute()
 
-
-            
             # Encoding is fully prescribed in the config or from the
             ds, updated_enc = self._encode_data(ds, "dynamic", self.d_encoding)
             self.d_encoding = updated_enc
@@ -274,6 +273,7 @@ class BasinGraphDataset(Dataset):
 
         # Encode and scale the data.
         ds = df.to_xarray()
+
         ds, self.s_encoding = self._encode_data(ds, "static", self.s_encoding)
         x_s, self.s_scale = self._normalize_data(ds, "static", self.s_encoding, self.s_scale)
 
@@ -323,8 +323,8 @@ class BasinGraphDataset(Dataset):
             for col in missing_cols:
                 nan_da = xr.DataArray(
                     data=np.full((len(ds.date), len(ds.subbasin)), np.nan, dtype=np.float32),
-                    coords={'date': ds.date, 'subbasin': ds.subbasin},
-                    dims=['date', 'subbasin']
+                    coords={"date": ds.date, "subbasin": ds.subbasin},
+                    dims=["date", "subbasin"],
                 )
                 nan_arrays_to_add[col] = nan_da
             ds = ds.assign(**nan_arrays_to_add)
@@ -410,39 +410,48 @@ class BasinGraphDataset(Dataset):
             if col not in ds.data_vars:
                 continue
 
-            df = ds[col].to_dataframe()
-            encoded = pd.get_dummies(df[col].astype(str), prefix=col)
+            # Convert to a lazy Dask DataFrame instead of a Pandas DataFrame
+            ddf = ds[[col]].to_dask_dataframe(set_index=True).categorize(columns=[col])
+
+            # Perform one-hot encoding lazily using Dask
+            encoded_ddf = dd.get_dummies(ddf, prefix=col, columns=[col])
 
             if prescribed:
-                # Apply prescribed encoding
+                # Add missing prescribed columns lazily
                 for c in prescribed:
-                    if c not in encoded.columns:
-                        encoded[c] = 0
-                encoded = encoded[prescribed]
+                    if c not in encoded_ddf.columns:
+                        encoded_ddf[c] = 0
+                # Ensure order and presence of prescribed columns
+                encoded_ddf = encoded_ddf[prescribed]
             else:
                 if feat_group == "static":
-                    # Discovery is allowed for static features
-                    cat_enc[col] = encoded.columns.tolist()
+                    # Discovery for static features requires computing the columns.
+                    # This is a one-time, metadata-only operation and should be acceptable.
+                    discovered_cols = encoded_ddf.columns.tolist()
+                    cat_enc[col] = discovered_cols
                 else:  # feat_group == "dynamic"
                     raise ValueError(
                         f"Dynamic categorical variable '{col}' must have its categories "
                         "prescribed in the config. Discovery is not supported for dynamic data."
                     )
 
-            ds = ds.drop_vars(col)  # Drop the original column
-            ds = xr.merge([ds, encoded.to_xarray()])  # Merge the encoded columns
+            # Convert the lazy Dask DataFrame back to a lazy xarray.Dataset
+            encoded_ds = xr.Dataset.from_dataframe(encoded_ddf)
 
-            # Update the feature dicts
+            ds = ds.drop_vars(col)  # Drop the original column
+            ds = xr.merge([ds, encoded_ds])  # Merge the lazy encoded columns
+
+            # Update the feature dicts (logic remains the same)
+            encoded_columns = list(encoded_ds.data_vars)
             if feat_group == "dynamic":
-                # Scan through sources to remove original column and append encoded
                 for feats in self.features["dynamic"].values():
                     if col in feats:
                         feats.remove(col)
-                        feats.extend(encoded.columns)
+                        feats.extend(encoded_columns)
             else:  # static
                 if col in self.features["static"]:
                     self.features["static"].remove(col)
-                self.features["static"].extend(encoded.columns)
+                self.features["static"].extend(encoded_columns)
 
         return ds, cat_enc
 
@@ -453,18 +462,24 @@ class BasinGraphDataset(Dataset):
             if col not in ds.data_vars:
                 continue
 
-            x = ds[col].values
-            finite_mask = np.isfinite(x)
-            x_int = np.where(finite_mask, x, 0).astype(int)
+            # Operate directly on the lazy xarray.DataArray (which is a Dask array)
+            x = ds[col]
+            finite_mask = da.isfinite(x.data)
+            x_int = da.where(finite_mask, x.data, 0).astype(int)
 
             if not prescribed_bits:
                 if feat_group == "static":
-                    # Discovery is allowed for static features
-                    max_val = x_int.max()
+                    # Discovery requires computing max value. This is a one-time cost.
+                    max_val = x_int.max().compute()
                     nbits = int(np.ceil(np.log2(max_val + 1))) if max_val > 0 else 0
-                    prescribed_bits = [
-                        n for n in range(nbits) if ((x_int // 2**n) % 2)[finite_mask].sum() > 0
-                    ]
+
+                    # Check which bits are active across the dataset
+                    # This part still requires computation to discover bits
+                    active_bits = []
+                    for n in range(nbits):
+                        if ((x_int // 2**n) % 2)[finite_mask].sum().compute() > 0:
+                            active_bits.append(n)
+                    prescribed_bits = active_bits
                     bitmask_enc[col] = prescribed_bits
                 else:  # feat_group == 'dynamic'
                     raise ValueError(
@@ -475,16 +490,21 @@ class BasinGraphDataset(Dataset):
             new_vars = {}
             if prescribed_bits:
                 for n in prescribed_bits:
-                    bit_arr = ((x_int // 2**n) % 2).astype(float)
-                    bit_arr[~finite_mask] = np.nan
-                    new_vars[f"{col}_bit_{n}"] = xr.DataArray(
-                        bit_arr, dims=ds[col].dims, coords=ds[col].coords
+                    # All these operations are lazy Dask operations
+                    bit_arr_data = ((x_int // 2**n) % 2).astype(float)
+                    bit_arr_data = da.where(finite_mask, bit_arr_data, np.nan)
+
+                    new_var_name = f"{col}_bit_{n}"
+                    new_vars[new_var_name] = xr.DataArray(
+                        bit_arr_data, dims=ds[col].dims, coords=ds[col].coords
                     )
                 ds = ds.drop_vars(col)
 
             if new_vars:
+                # Merge the new lazy variables
                 ds = xr.merge([ds, xr.Dataset(new_vars)], compat="no_conflicts")
-                # Update the feature dicts
+
+                # Update the feature dicts (logic remains the same)
                 if feat_group == "dynamic":
                     for source, feats in self.features["dynamic"].items():
                         if col in feats:
@@ -721,23 +741,11 @@ class BasinGraphDataset(Dataset):
 
         self._basin_date_batching()
 
-    def create_basin_aware_chunks(self, ds):
-        basin_coord = ds.coords["basin"].values
-        basin_boundaries = [0]
-        current_basin = basin_coord[0]
-
-        for i, basin in enumerate(basin_coord[1:], 1):
-            if basin != current_basin:
-                basin_boundaries.append(i)
-                current_basin = basin
-        basin_boundaries.append(len(basin_coord))
-
-        subbasin_chunks = []
-        for i in range(len(basin_boundaries) - 1):
-            chunk_size = basin_boundaries[i + 1] - basin_boundaries[i]
-            subbasin_chunks.append(chunk_size)
-
-        return {"date": self.cfg.sequence_length, "subbasin": tuple(subbasin_chunks)}
+    def load_dynamic_in_memory(self):
+        for basin, ds in tqdm(
+            self.basin_x_ds.items(), disable=self.cfg.quiet, desc="Loading dynamic data into memory"
+        ):
+            self.basin_x_ds[basin] = ds.compute()
 
     @classmethod
     def get_training_stats(cls, cfg: Config) -> dict:

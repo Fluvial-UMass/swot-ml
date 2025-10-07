@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import Sampler, DataLoader
 
 from config.config import Config
-from .basingraphdataset import GraphBatch, BasinGraphDataset
+from .lightweight_basingraphdataset import GraphBatch, LightBasinGraphDataset, get_basin_index_map, get_basin_subbasin_counts
 
 
 class GraphPackingSampler(Sampler[list[int]]):
@@ -211,25 +211,25 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
     return list(basins), list(dates), final_batch
 
 
-class BasinGraphDataLoader(DataLoader):
-    def __init__(self, cfg: Config, dataset: BasinGraphDataset, worker_in_memory=True):
+class LightBasinGraphDataLoader(DataLoader):
+    def __init__(self, cfg: Config, dataset: LightBasinGraphDataset):
         torch.manual_seed(cfg.model_args.seed)
-
         collate_fn = partial(padding_collate_fn, target_nodes_per_batch=cfg.target_nodes_per_batch)
+        is_training = dataset.data_subset == "train"
+
 
         batch_sampler = GraphPackingSampler(
-            dataset.basin_index_map,
-            dataset.basin_subbasin_counts,
+            get_basin_index_map(),
+            get_basin_subbasin_counts(),
             cfg.target_nodes_per_batch,
             cfg.shuffle,
             cfg.candidate_pool_size,
-            infinite_sampling=dataset.data_subset == "train",
+            infinite_sampling=is_training,
         )
 
         threading = cfg.num_workers > 0
         timeout = 900 if threading else 0
         persistent_workers = True if threading else False
-        worker_init_fn = self._worker_init_fn if (threading and worker_in_memory) else None
 
         super().__init__(
             dataset,
@@ -239,17 +239,10 @@ class BasinGraphDataLoader(DataLoader):
             pin_memory=cfg.pin_memory,
             timeout=timeout,
             persistent_workers=persistent_workers,
-            worker_init_fn=worker_init_fn,
         )
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 
         # self.set_jax_sharding(cfg.backend, cfg.num_devices)
-
-    def _worker_init_fn(self, worker_id):
-        """Initialize each worker's dataset copy to use the shared memory."""
-        worker_info = torch.utils.data.get_worker_info()
-        dataset = worker_info.dataset  # This is the worker copy of the lazy dataset
-        dataset.load_dynamic_in_memory()
 
     def set_jax_sharding(self, backend: str | None = None, num_devices: int | None = None):
         """
