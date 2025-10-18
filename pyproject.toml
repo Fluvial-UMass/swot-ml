@@ -56,4 +56,5 @@ dev = [
     "jupyter>=1.1.1",
     "memory-profiler>=0.61.0",
     "notebook>=7.4.3",
+    "objgraph>=3.6.2",
 ]

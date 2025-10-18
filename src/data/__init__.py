@@ -1,21 +1,11 @@
-from .basingraphdataset import GraphBatch, BasinGraphDataset
-from .basingraphdataloader import BasinGraphDataLoader
 from .basindatalake import BasinDataLake
-
-from .lightweight_basingraphdataset import (
-    initialize_dataset_globals,
-    return_globals,
-    LightBasinGraphDataset,
-)
-from .lightweight_basingraphdataloader import LightBasinGraphDataLoader
+from .cached_basingraphdataset import GraphBatch, DynamicCacheManager, CachedBasinGraphDataset
+from .cached_basingraphdataloader import CachedBasinGraphDataLoader
 
 __all__ = [
     GraphBatch,
-    BasinGraphDataset,
-    BasinGraphDataLoader,
+    DynamicCacheManager,
+    CachedBasinGraphDataset,
+    CachedBasinGraphDataLoader,
     BasinDataLake,
-    initialize_dataset_globals,
-    return_globals,
-    LightBasinGraphDataset,
-    LightBasinGraphDataLoader
 ]

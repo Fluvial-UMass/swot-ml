@@ -56,8 +56,9 @@ def model_iterate(
     key = jax.random.PRNGKey(0)
 
     for basin, date, batch in tqdm(dataloader, disable=quiet):
+        batch = batch.to_jax()
         y_pred = _model_map(model, batch, key)[batch.node_mask]
-
+        y_pred = np.asarray(y_pred) # detach from jax 
         # TODO bandaid for seq2seq models with 4 dimensions.
         if len(y_pred.shape) == 4:
             # Grab the final prediction for now.
@@ -219,7 +220,7 @@ def predict_to_parquet(
                 data_for_df,
                 index=row_index,
                 columns=column_index,
-            )
+            ).dropna() # unobserved subbasins
 
             # --- 5. Write the batch DataFrame to the Parquet file ---
             table = pa.Table.from_pandas(batch_df)

@@ -3,15 +3,14 @@ from functools import partial
 import random
 from typing import Iterator
 
+import numpy as np
 import jax
-import jax.numpy as jnp
-import jax.sharding as jshard
 from jaxtyping import Array
 import torch
 from torch.utils.data import Sampler, DataLoader
 
 from config.config import Config
-from .lightweight_basingraphdataset import GraphBatch, LightBasinGraphDataset, get_basin_index_map, get_basin_subbasin_counts
+from .cached_basingraphdataset import GraphBatch, CachedBasinGraphDataset
 
 
 class GraphPackingSampler(Sampler[list[int]]):
@@ -140,14 +139,14 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
             packed_dynamic[source].append(data)
 
     unpadded_dynamic = {
-        source: jnp.concatenate(data_list, axis=1) for source, data_list in packed_dynamic.items()
+        source: np.concatenate(data_list, axis=1) for source, data_list in packed_dynamic.items()
     }
 
     # Static features and Targets
-    unpadded_static = jnp.concatenate([s.static for s in samples if s.static is not None], axis=0)
-    unpadded_y = jnp.concatenate([s.y for s in samples if s.y is not None], axis=1)
-    unpadded_graph_idx = jnp.repeat(
-        jnp.arange(len(samples)), repeats=jnp.array(num_nodes_per_graph)
+    unpadded_static = np.concatenate([s.static for s in samples if s.static is not None], axis=0)
+    unpadded_y = np.concatenate([s.y for s in samples if s.y is not None], axis=1)
+    unpadded_graph_idx = np.repeat(
+        np.arange(len(samples)), repeats=np.array(num_nodes_per_graph)
     )
 
     node_offset = 0
@@ -156,7 +155,7 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
         offset_edges_list.append(sample.graph_edges + node_offset)
         node_offset += num_nodes_per_graph[i]
 
-    unpadded_edges = jnp.concatenate(offset_edges_list, axis=1)
+    unpadded_edges = np.concatenate(offset_edges_list, axis=1)
     num_real_edges = unpadded_edges.shape[1]
     target_edges_per_batch = target_nodes_per_batch
     num_padding_edges = target_edges_per_batch - num_real_edges
@@ -164,9 +163,9 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
 
     # --- Step 3: Pad All Tensors to Target Size ---
     # Pad node features
-    padded_static = jnp.pad(unpadded_static, ((0, num_padding_nodes), (0, 0)))
-    padded_y = jnp.pad(unpadded_y, ((0, 0), (0, num_padding_nodes), (0, 0)))
-    padded_graph_idx = jnp.pad(unpadded_graph_idx, (0, num_padding_nodes))
+    padded_static = np.pad(unpadded_static, ((0, num_padding_nodes), (0, 0)))
+    padded_y = np.pad(unpadded_y, ((0, 0), (0, num_padding_nodes), (0, 0)))
+    padded_graph_idx = np.pad(unpadded_graph_idx, (0, num_padding_nodes))
     # ... (Pad dynamic features similarly) ...
     # This example assumes you have the logic for dynamic features already
     packed_dynamic = defaultdict(list)
@@ -174,25 +173,25 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
         for source, data in sample.dynamic.items():
             packed_dynamic[source].append(data)
     unpadded_dynamic = {
-        source: jnp.concatenate(data_list, axis=1) for source, data_list in packed_dynamic.items()
+        source: np.concatenate(data_list, axis=1) for source, data_list in packed_dynamic.items()
     }
     padded_dynamic = {
-        s: jnp.pad(d, ((0, 0), (0, num_padding_nodes), (0, 0))) for s, d in unpadded_dynamic.items()
+        s: np.pad(d, ((0, 0), (0, num_padding_nodes), (0, 0))) for s, d in unpadded_dynamic.items()
     }
 
     # Pad with the index of the FIRST PADDED NODE (num_real_nodes).
     # This creates harmless self-loops on a non-existent node.
-    padded_edges = jnp.pad(
+    padded_edges = np.pad(
         unpadded_edges, ((0, 0), (0, num_padding_edges)), constant_values=num_real_nodes
     )
 
     # --- Step 4: Create Final Masks ---
-    node_mask = jnp.concatenate(
-        [jnp.ones(num_real_nodes, dtype=jnp.bool_), jnp.zeros(num_padding_nodes, dtype=jnp.bool_)]
+    node_mask = np.concatenate(
+        [np.ones(num_real_nodes, dtype=np.bool_), np.zeros(num_padding_nodes, dtype=np.bool_)]
     )
 
-    edge_mask = jnp.concatenate(
-        [jnp.ones(num_real_edges, dtype=jnp.bool_), jnp.zeros(num_padding_edges, dtype=jnp.bool_)]
+    edge_mask = np.concatenate(
+        [np.ones(num_real_edges, dtype=np.bool_), np.zeros(num_padding_edges, dtype=np.bool_)]
     )
     # # Unmask the FIRST padding edge to prevent NaN during the softmax edge calculations
     # edge_mask = edge_mask.at[num_real_edges].set(True)
@@ -211,16 +210,17 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
     return list(basins), list(dates), final_batch
 
 
-class LightBasinGraphDataLoader(DataLoader):
-    def __init__(self, cfg: Config, dataset: LightBasinGraphDataset):
+class CachedBasinGraphDataLoader(DataLoader):
+    def __init__(self, cfg: Config, dataset: CachedBasinGraphDataset):
         torch.manual_seed(cfg.model_args.seed)
+
         collate_fn = partial(padding_collate_fn, target_nodes_per_batch=cfg.target_nodes_per_batch)
         is_training = dataset.data_subset == "train"
-
+        basin_subbasin_counts = {k: len(v) for k, v in dataset.basin_subbasin_map.items()}
 
         batch_sampler = GraphPackingSampler(
-            get_basin_index_map(),
-            get_basin_subbasin_counts(),
+            dataset.basin_index_map,
+            basin_subbasin_counts,
             cfg.target_nodes_per_batch,
             cfg.shuffle,
             cfg.candidate_pool_size,
@@ -229,7 +229,8 @@ class LightBasinGraphDataLoader(DataLoader):
 
         threading = cfg.num_workers > 0
         timeout = 900 if threading else 0
-        persistent_workers = True if threading else False
+        persistent_workers = False
+        # persistent_workers = True if threading else False
 
         super().__init__(
             dataset,
@@ -242,60 +243,6 @@ class LightBasinGraphDataLoader(DataLoader):
         )
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 
-        # self.set_jax_sharding(cfg.backend, cfg.num_devices)
-
-    def set_jax_sharding(self, backend: str | None = None, num_devices: int | None = None):
-        """
-        Updates the jax device sharding of data.
-
-        Args:
-        backend (str): XLA backend to use (cpu, gpu, or tpu). If None is passed, select GPU if available.
-        num_devices (int): Number of devices to use. If None is passed, use all available devices for 'backend'.
-        """
-        available_devices = _get_available_devices()
-        # Default use GPU if available
-        if backend is None:
-            backend = "gpu" if "gpu" in available_devices.keys() else "cpu"
-        else:
-            backend = backend.lower()
-
-        # Validate the requested number of devices.
-        if num_devices is None:
-            self.num_devices = available_devices[backend]
-        elif num_devices > available_devices[backend]:
-            raise ValueError(
-                f"requested devices ({backend}: {num_devices}) cannot be greater than available backend devices ({available_devices})."
-            )
-        elif num_devices <= 0:
-            raise ValueError(f"num_devices {num_devices} cannot be <= 0.")
-        else:
-            self.num_devices = num_devices
-
-        if self.batch_size % self.num_devices != 0:
-            raise ValueError(
-                f"batch_size ({self.batch_size}) must be evenly divisible by the num_devices ({self.num_devices})."
-            )
-
-        print(f"Batch sharding set to {self.num_devices} {backend}(s)")
-        devices = jax.local_devices(backend=backend)[: self.num_devices]
-        mesh = jshard.Mesh(devices, ("batch",))
-        pspec = jshard.PartitionSpec("batch")
-        self.sharding = jshard.NamedSharding(mesh, pspec)
-
-    def shard_batch(self, batch: dict):
-        def map_fn(path, leaf):
-            # Extract names/keys/indexes from all PyTree path parts
-            keys = [
-                getattr(p, "name", getattr(p, "key", getattr(p, "index", str(p)))) for p in path
-            ]
-            # keys = [p.key for p in path]
-            if "dynamic_dt" in keys:
-                return leaf
-            return jax.device_put(jnp.array(leaf), self.sharding)
-
-        batch = jax.tree_util.tree_map_with_path(map_fn, batch)
-
-        return batch
 
     # Expose these dataset methods for convenience.
     def denormalize(self, x: Array, name: str):
@@ -303,9 +250,6 @@ class LightBasinGraphDataLoader(DataLoader):
 
     def denormalize_target(self, y_normalized: Array):
         return self.dataset.denormalize_target(y_normalized)
-
-    def update_indices(self, data_subset: str, basin_subset: list[str] = None):
-        self.dataset.update_indices(data_subset, basin_subset)
 
 
 def _get_available_devices():

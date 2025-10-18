@@ -6,10 +6,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
 
-from config.config import Config
 
-
-def mosaic_scatter(cfg: Config, results: pd.DataFrame, metrics: pd.DataFrame, title: str):
+def mosaic_scatter(results: pd.DataFrame, metrics: pd.DataFrame, title: str):
     def hexbin_1to1(ax: plt.Axes, x: pd.Series, y: pd.Series, target: str):
         positive_mask = (x > 0) & (y > 0)
         x = x[positive_mask]

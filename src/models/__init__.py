@@ -8,7 +8,7 @@ from config.model_args import (
     MSAttnArgs,
     STGATArgs,
 )
-from data import BasinGraphDataset, BasinGraphDataLoader
+from data import CachedBasinGraphDataset, CachedBasinGraphDataLoader
 
 from models.base_model import BaseModel
 from models.lstm_mlp_attn import LSTM_MLP_ATTN
@@ -26,7 +26,7 @@ MODEL_MAP = {
 }
 
 
-def make(cfg: Config, dl: BasinGraphDataLoader = None):
+def make(cfg: Config, dl: CachedBasinGraphDataLoader = None):
     """Creates a model based on the provided configuration.
 
     Parameters
@@ -52,41 +52,45 @@ def make(cfg: Config, dl: BasinGraphDataLoader = None):
     return cfg, model
 
 
-def set_model_data_args(cfg: Config, dataset: BasinGraphDataset):
+def set_model_data_args(cfg: Config, dataset: CachedBasinGraphDataset):
     """Set model arguments based on configuration and dataset."""
-    dyn_feat = dict(dataset.features["dynamic"])
+    dyn_feat = dict(dataset.features.dynamic)
 
     if isinstance(cfg.model_args, SeqAttnArgs):
         cfg.model_args.target = dataset.target
         cfg.model_args.seq_length = cfg.sequence_length
         cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dyn_feat.items()}
-        cfg.model_args.static_size = len(dataset.features["static"])
+        cfg.model_args.static_size = len(dataset.features.static)
         cfg.model_args.time_aware = cfg.time_gaps
 
     elif isinstance(cfg.model_args, STGATArgs):
         cfg.model_args.target = dataset.target
         cfg.model_args.seq_length = cfg.sequence_length
         cfg.model_args.dense_sizes = {
-            k: len(dataset.features["dynamic"][k])
+            k: len(dataset.features.dynamic[k])
             for k, has_gaps in cfg.time_gaps.items()
             if not has_gaps
         }
         cfg.model_args.sparse_sizes = {
-            k: len(dataset.features["dynamic"][k])
+            k: len(dataset.features.dynamic[k])
             for k, has_gaps in cfg.time_gaps.items()
             if has_gaps
         }
-        cfg.model_args.static_size = len(dataset.features["static"])
+        if dataset.features.static is not None:
+            cfg.model_args.static_size = len(dataset.features.static)
+        else:
+            cfg.model_args.static_size = 0
+        
 
     elif isinstance(cfg.model_args, StackArgs):
         cfg.model_args.dynamic_size = len(list(dyn_feat.values())[0])
-        cfg.model_args.static_size = len(dataset.features["static"])
+        cfg.model_args.static_size = len(dataset.features.static)
 
     elif isinstance(cfg.model_args, MSAttnArgs):
         cfg.model_args.target = dataset.target
         cfg.model_args.seq_length = cfg.sequence_length
         cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dyn_feat.items()}
-        cfg.model_args.static_size = len(dataset.features["static"])
+        cfg.model_args.static_size = len(dataset.features.static)
 
     else:
         raise ValueError(f"Unknown model_args type: {type(cfg.model_args)}")

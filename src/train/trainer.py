@@ -216,6 +216,7 @@ class Trainer:
         last_log_time = time.time()
 
         for _, _, batch in pbar:
+            batch = batch.to_jax()
             # Perform one training step
             loss, grads = self._train_step(batch)
             self.checkpoint_losses.append(float(loss))
@@ -385,7 +386,7 @@ class Trainer:
 
         self.logger.info(
             f"Saving model checkpoint at step {self.step:06d}. "
-            f"Average loss since last checkpoint: {np.mean(self.checkpoint_losses)}"
+            f"Average loss since last checkpoint: {np.mean(self.checkpoint_losses):0.3f}"
         )
         # Shuffle checkpoint losses over to main list and then reset.
         self.losses.extend(self.checkpoint_losses)
@@ -441,7 +442,7 @@ class Trainer:
             opt_state = eqx.tree_deserialise_leaves(f, serialized_opt_state)
 
         # --- Create and Populate New Trainer Instance ---
-        print("Creating new Trainer instance...")
+        print(f"Loading trainer from checkpoint {checkpoint_dir.stem}")
         # Call class constructor with loaded/recreated components
         trainer = cls(
             cfg=cfg,

@@ -223,8 +223,6 @@ class MultiHeadStackedGAT(eqx.Module):
     def __call__(
         self, x: Array, x_s: Array, edge_index: Array, edge_mask: Array
     ) -> tuple[Array, Array, Array, Array, Array]:
-        # This __call__ method remains unchanged, as the optimizations were
-        # encapsulated within the attention/gating layers.
         fwd_ws, rev_ws = [], []
 
         h_fwd = x
@@ -262,9 +260,8 @@ class MultiHeadStackedGAT(eqx.Module):
 
 class SpatioTemporalLSTMCell(eqx.Module):
     """
-    A recurrent cell that first uses an LSTMCell to update the temporal state locally,
+    A recurrent cell that first uses an LSTM cell to update the each location state
     and then uses a StackedGAT to propagate that new state spatially.
-    (Note: This implements the temporal-first, spatial-second logic).
     """
 
     gat: MultiHeadStackedGAT

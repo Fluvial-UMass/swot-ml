@@ -47,13 +47,13 @@ def nse_loss(y: Array, y_pred: Array, mask: Array):
 
 
 def spin_up_nse_loss(y: Array, y_pred: Array, mask: Array):
-    "Equivalent to nse_loss but with weights that favor the final ~1/3 of the sequence"
-    seq_len = y.shape[1]
+    """Equivalent to nse_loss but with weights that favor the final ~1/3 of the sequence"""
+    seq_len = y.shape[0]
     weights = jax.nn.sigmoid(jnp.linspace(-10, 10, seq_len))
 
-    sq_error = jnp.square(y - y_pred) * mask * weights[None, :, None]
-    std_y = jnp.std(y, axis=1, where=mask.astype(bool))  # Per-basin standard deviation
-    mse = jnp.mean(sq_error, axis=1)  # Sum of squared errors per basin
+    sq_error = jnp.square(y - y_pred) * mask * weights[:, None]
+    std_y = jnp.std(y, axis=0, where=mask.astype(bool))  # Per-basin standard deviation
+    mse = jnp.mean(sq_error, axis=0)  # Sum of squared errors per basin
     denom = jnp.square(
         jnp.nan_to_num(std_y) + 0.1
     )  # Denominator with smoothing and epsilon for stability
@@ -113,6 +113,7 @@ def compute_loss_fn(
         # NSE calc requires the full time series, not just the final value.
         y = data.y
         node_padding_mask = data.node_mask[jnp.newaxis, :, jnp.newaxis]
+
     else:
         y = data.y[-1, ...]  # End of time dimension
         node_padding_mask = data.node_mask[:, jnp.newaxis]

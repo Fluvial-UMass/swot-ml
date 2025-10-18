@@ -22,11 +22,11 @@ import pandas as pd
 
 # import config, data, train, evaluate
 from config import Config, DataSubset
-from data import BasinGraphDataset, BasinGraphDataLoader
+from data import DynamicCacheManager, CachedBasinGraphDataset, CachedBasinGraphDataLoader
 from train import Trainer
 
 
-def cleanup_dl(dl: BasinGraphDataLoader):
+def cleanup_dl(dl: CachedBasinGraphDataLoader):
     if dl is None:
         return
     if dl._iterator:
@@ -51,13 +51,15 @@ def train_from_config(cfg: Config, log_dir: Path | None = None):
         The updated configuration object.
     trainer : Trainer
         The Trainer object after training. Contains the model and other useful attributes.
-    dataset : BasinGraphDataset
-        The BasinGraphDataset loaded for training.
+    dataset : CachedBasinGraphDataset
+        The CachedBasinGraphDataset loaded for training.
     """
-    trainer = None
-    dataset = BasinGraphDataset(cfg, DataSubset.train)
-    dataloader = BasinGraphDataLoader(cfg, dataset)
+    manager = DynamicCacheManager(cfg)
+    cache_dir = manager.create_cache('train')
+    dataset = CachedBasinGraphDataset(cfg, cache_dir, DataSubset.train)
+    dataloader = CachedBasinGraphDataLoader(cfg, dataset)
 
+    trainer = None
     if log_dir and log_dir.is_dir():
         trainer = Trainer.load_last_checkpoint(log_dir)
         # Could fail to load if nothing was saved.
@@ -91,8 +93,8 @@ def train_from_config_ensemble(config_path: Path, ensemble_seed: int):
         The trained model.
     log_dir : Path
         The directory where training logs and checkpoints were saved.
-    dataset : BasinGraphDataset
-        The BasinGraphDataset loaded for training.
+    dataset : CachedBasinGraphDataset
+        The CachedBasinGraphDataset loaded for training.
     """
     cfg = Config.from_file(config_path)
     cfg.model_args.seed += ensemble_seed
@@ -121,8 +123,8 @@ def train_from_config_ensemble(config_path: Path, ensemble_seed: int):
 #         The fine-tuned model.
 #     log_dir : Path
 #         The directory where training logs and checkpoints were saved.
-#     dataset : BasinGraphDataset
-#         The BasinGraphDataset loaded for training.
+#     dataset : CachedBasinGraphDataset
+#         The CachedBasinGraphDataset loaded for training.
 #     """
 #     # Load the config and manipulate it a bit
 #     run_dir = finetune_yml.parent
@@ -131,8 +133,8 @@ def train_from_config_ensemble(config_path: Path, ensemble_seed: int):
 #
 #     # Read in the finetuning parameters
 #     finetune = read_yml(finetune_yml)
-#     cfg.num_epochs = trainer.epoch + finetune.get('additional_epochs', 0)
-#     cfg.transition_begin = trainer.epoch if finetune.get('reset_lr') else 0
+#     cfg.num_steps = trainer.step + finetune.get('additional_steps', 0)
+#     cfg.transition_begin = trainer.step if finetune.get('reset_lr') else 0
 #     cfg.cfg_path = finetune_yml
 #
 #     # Insert these params directly.
@@ -181,24 +183,25 @@ def hyperparam_grid_search(config_path: Path, idx: int):
 
         cfg.test_basin_file = f"metadata/site_lists/k_folds/test_{i}_{k}.txt"
         cfg.train_basin_file = f"metadata/site_lists/k_folds/train_{i}_{k}.txt"
-        dataset = BasinGraphDataset(cfg)
-        dataloader = BasinGraphDataLoader(cfg, dataset)
+        manager = DynamicCacheManager(cfg)
+        cache_dir = manager.create_cache('train')
+        dataset = CachedBasinGraphDataset(cfg, cache_dir, DataSubset.train)
+        dataloader = CachedBasinGraphDataLoader(cfg, dataset)
 
         if log_dir.is_dir():
             trainer = Trainer.load_last_checkpoint(log_dir)
-            trainer.dataloader = dataloader
         else:
             trainer = Trainer(cfg, dataloader, log_dir=log_dir)
 
-        start_epoch = trainer.epoch
-        while trainer.epoch < trainer.num_epochs:
-            start_epoch = trainer.epoch
+        start_step = trainer.step
+        while trainer.step < trainer.num_steps:
+            start_step = trainer.step
             trainer.start_training()
-            if trainer.epoch == start_epoch:
+            if trainer.step == start_step:
                 break
 
         # Check if we actually did some training this run.
-        if (start_epoch != trainer.epoch) or (not out_file.is_file()):
+        if (start_step != trainer.step) or (not out_file.is_file()):
             eval_model(
                 cfg,
                 trainer.model,
@@ -214,102 +217,101 @@ def hyperparam_grid_search(config_path: Path, idx: int):
             cleanup_dl(dataloader)
 
 
-def hyperparam_smac_optimize(config_path: Path, n_workers: int, n_runs: int):
-    from train import update_smac_config, manual_smac_optimize
-    from smac.utils.configspace import get_config_hash
+# def hyperparam_smac_optimize(config_path: Path, n_workers: int, n_runs: int):
+#     from train import update_smac_config, manual_smac_optimize
+#     from smac.utils.configspace import get_config_hash
 
-    cfg = Config.from_file(config_path)
+#     cfg = Config.from_file(config_path)
 
-    def target_fun(updates, seed):
-        local_cfg = Config.from_file(updates["cfg_path"])
-        local_cfg = update_smac_config(local_cfg, updates, seed)
+#     def target_fun(updates, seed):
+#         local_cfg = Config.from_file(updates["cfg_path"])
+#         local_cfg = update_smac_config(local_cfg, updates, seed)
 
-        trial_name = get_config_hash(updates)
-        path = Path(local_cfg.cfg_path)
-        log_dir = path.parent / "trials" / f"{path.stem}_{trial_name}_{seed}"
+#         trial_name = get_config_hash(updates)
+#         path = Path(local_cfg.cfg_path)
+#         log_dir = path.parent / "trials" / f"{path.stem}_{trial_name}_{seed}"
 
-        local_cfg, trainer, dataset = train_from_config(local_cfg, log_dir)
+#         local_cfg, trainer, dataset = train_from_config(local_cfg, log_dir)
 
-        eval_model(
-            local_cfg,
-            trainer.model,
-            dataset,
-            trainer.log_dir,
-            run_test=True,
-            run_predict=False,
-            run_train=False,
-            make_plots=False,
-        )
+#         eval_model(
+#             local_cfg,
+#             trainer.model,
+#             dataset,
+#             trainer.log_dir,
+#             run_test=True,
+#             run_predict=False,
+#             run_train=False,
+#             make_plots=False,
+#         )
 
-        # Weird to load instead of returning directly but this is a bandaid.
-        results_file = trainer.log_dir / "test_data.pkl"
-        with open(results_file, "rb") as f:
-            results, bulk_metrics, basin_metrics = pickle.load(f)
+#         # Weird to load instead of returning directly but this is a bandaid.
+#         results_file = trainer.log_dir / "test_data.pkl"
+#         with open(results_file, "rb") as f:
+#             results, bulk_metrics, basin_metrics = pickle.load(f)
 
-        # return basin_metrics['flux']['RE'].median()
-        return basin_metrics[:]["RE"].median().mean()
+#         # return basin_metrics['flux']['RE'].median()
+#         return basin_metrics[:]["RE"].median().mean()
 
-    manual_smac_optimize(cfg, n_workers, n_runs, target_fun)
-
-
-def calc_attributions(run_dir: Path):
-    from evaluate import save_all_intgrads, plot_average_attribution
-
-    trainer = Trainer.load_last_checkpoint(run_dir)
-    cfg = trainer.cfg
-
-    dataset = BasinGraphDataset(cfg, DataSubset.test)
-    dataloader = BasinGraphDataLoader(cfg, dataset)
-
-    save_dir = run_dir / "figures" / "attribution"
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    save_all_intgrads(cfg, trainer.model, dataloader, save_dir, m_steps=10)
-    plot_average_attribution(save_dir, dataset)
+#     manual_smac_optimize(cfg, n_workers, n_runs, target_fun)
 
 
-def load_prediction_model(run_dir: Path, chunk_idx: int | None = None):
-    """Loads a pre-trained model and chunk of the dataset into memory.
+# def calc_attributions(run_dir: Path):
+#     from evaluate import save_all_intgrads, plot_average_attribution
 
-    Parameters
-    ----------
-    run_dir : Path
-        Path to the model training directory.
-    chunk_idx : int
-        Index of the basin chunking to select and predict on.
+#     trainer = Trainer.load_last_checkpoint(run_dir)
+#     cfg = trainer.cfg
 
-    Returns
-    -------
-    cfg : dict
-        The model training configuration dictionary.
-    model : eqx.Module
-        The pre-trained model weights and structure.
-    predict_dataset : BasinGraphDataset
-        A dataset containing a subset of the prediction domain.
-    eval_dir : Path
-        A directory for saving the results of this subset.
-    """
-    # cfg, model, _ = load_model(run_dir)
-    trainer = Trainer.load_last_checkpoint(run_dir)
-    cfg = trainer.cfg
-    cfg.shuffle = False  # No need to shuffle for inference
+#     dataset = CachedBasinGraphDataset(cfg, DataSubset.test)
+#     dataloader = CachedBasinGraphDataLoader(cfg, dataset)
 
-    # Load the train dataset to get normalization stats.
-    # TODO could just have the testing dataset calculate the train stats directly
-    train_dataset = BasinGraphDataset(cfg, DataSubset.train)
-    if chunk_idx:
-        cfg.test_basin_file = f"metadata/site_lists/predictions/chunk_{chunk_idx:02}.txt"
+#     save_dir = run_dir / "figures" / "attribution"
+#     save_dir.mkdir(parents=True, exist_ok=True)
 
-    predict_dataset = BasinGraphDataset(cfg, DataSubset.predict, train_ds=train_dataset)
+#     save_all_intgrads(cfg, trainer.model, dataloader, save_dir, m_steps=10)
+#     plot_average_attribution(save_dir, dataset)
 
-    eval_dir = run_dir / "inference"
-    eval_dir.mkdir(parents=True, exist_ok=True)
 
-    return cfg, trainer.model, predict_dataset, eval_dir
+# def load_prediction_model(run_dir: Path, chunk_idx: int | None = None):
+#     """Loads a pre-trained model and chunk of the dataset into memory.
+
+#     Parameters
+#     ----------
+#     run_dir : Path
+#         Path to the model training directory.
+#     chunk_idx : int
+#         Index of the basin chunking to select and predict on.
+
+#     Returns
+#     -------
+#     cfg : dict
+#         The model training configuration dictionary.
+#     model : eqx.Module
+#         The pre-trained model weights and structure.
+#     predict_dataset : CachedBasinGraphDataset
+#         A dataset containing a subset of the prediction domain.
+#     eval_dir : Path
+#         A directory for saving the results of this subset.
+#     """
+#     # cfg, model, _ = load_model(run_dir)
+#     trainer = Trainer.load_last_checkpoint(run_dir)
+#     cfg = trainer.cfg
+#     cfg.shuffle = False  # No need to shuffle for inference
+
+#     # Load the train dataset to get normalization stats.
+#     # TODO could just have the testing dataset calculate the train stats directly
+#     train_dataset = CachedBasinGraphDataset(cfg, DataSubset.train)
+#     if chunk_idx:
+#         cfg.test_basin_file = f"metadata/site_lists/predictions/chunk_{chunk_idx:02}.txt"
+
+#     predict_dataset = CachedBasinGraphDataset(cfg, DataSubset.predict, train_ds=train_dataset)
+
+#     eval_dir = run_dir / "inference"
+#     eval_dir.mkdir(parents=True, exist_ok=True)
+
+#     return cfg, trainer.model, predict_dataset, eval_dir
 
 
 def make_all_plots(
-    cfg: Config,
     results: pd.DataFrame,
     bulk_metrics: dict,
     basin_metrics: pd.DataFrame,
@@ -342,7 +344,7 @@ def make_all_plots(
     fig_dir = log_dir / "figures" / data_subset.value
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    fig = mosaic_scatter(cfg, results, bulk_metrics, str(log_dir))
+    fig = mosaic_scatter(results, bulk_metrics, str(log_dir))
     fig.savefig(fig_dir / "density_scatter.png", dpi=300)
 
     figs = basin_metric_histograms(basin_metrics)
@@ -367,7 +369,7 @@ def eval_model(
         The model training configuration object.
     model : eqx.Module
         The pre-trained model weights and structure.
-    dataset : BasinGraphDataset
+    dataset : CachedBasinGraphDataset
         A dataset for estimating and evaluating.
     log_dir : Path
         The directory to save results in.
@@ -400,8 +402,10 @@ def eval_model(
 
         print(f"Evaluating {data_subset.value} subset and saving to: {results_file}")
 
-        dataset = BasinGraphDataset(cfg, data_subset)
-        dataloader = BasinGraphDataLoader(cfg, dataset)
+        manager = DynamicCacheManager(cfg)
+        cache_dir = manager.create_cache(data_subset)
+        dataset = CachedBasinGraphDataset(cfg, cache_dir, data_subset)
+        dataloader = CachedBasinGraphDataLoader(cfg, dataset)
 
         predict_to_parquet(model, dataloader, results_file, quiet=cfg.quiet)
         cleanup_dl(dataloader)
@@ -416,11 +420,11 @@ def eval_model(
             pickle.dump((bulk_metrics, basin_metrics), f)
 
         if make_plots:
-            make_all_plots(cfg, results, bulk_metrics, basin_metrics, data_subset, log_dir)
+            make_all_plots(results, bulk_metrics, basin_metrics, data_subset, log_dir)
 
     eval_data_subset(DataSubset.test, run_test)
-    eval_data_subset(DataSubset.predict, run_predict)
-    eval_data_subset(DataSubset.train, run_train)
+    # eval_data_subset(DataSubset.predict, run_predict)
+    # eval_data_subset(DataSubset.train, run_train)
 
 
 # ┌────────────────────────────────┐ #
@@ -455,20 +459,27 @@ def grid_search(config_path: Path, grid_index: int):
     hyperparam_grid_search(config_path.resolve(), grid_index)
 
 
-@app.command()
-def smac_optimize(config_path: Path, smac_runs: int, smac_workers: int):
-    hyperparam_smac_optimize(config_path.resolve(), smac_workers, smac_runs)
+# @app.command()
+# def smac_optimize(config_path: Path, smac_runs: int, smac_workers: int):
+#     hyperparam_smac_optimize(config_path.resolve(), smac_workers, smac_runs)
 
 
 @app.command()
-def test(training_dir: Path):
-    trainer = Trainer.load_last_checkpoint(training_dir.resolve())
-    eval_model(trainer.cfg, trainer.model, training_dir, True, True, True)
+def test(log_or_state_dir: Path):
+    is_state_dir = (log_or_state_dir / 'model_and_opt.eqx').is_file()
+    if is_state_dir:
+        trainer = Trainer.load_checkpoint(log_or_state_dir)
+        log_dir = log_or_state_dir.parent
+    else:
+        trainer = Trainer.load_last_checkpoint(log_or_state_dir)
+        log_dir = log_or_state_dir
+
+    eval_model(trainer.cfg, trainer.model, log_dir, True, True, True)
 
 
-@app.command()
-def attribute(training_dir: Path):
-    calc_attributions(training_dir.resolve())
+# @app.command()
+# def attribute(training_dir: Path):
+#     calc_attributions(training_dir.resolve())
 
 
 # @app.command()

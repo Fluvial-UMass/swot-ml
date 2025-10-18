@@ -23,7 +23,7 @@ from .model_args import ModelArgs
 class Features(BaseModel):
     dynamic: dict[str, list[str]]
     static: list[str] | None = None
-    target: list[str]
+    target: dict[str, list[str]]
 
 
 class Encoding(BaseModel):

@@ -2373,6 +2373,15 @@ wheels = [
 ]
 
 [[package]]
+name = "objgraph"
+version = "3.6.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ba/74/60dfb345ca493d69551dd1ba599ceb6fe325527fedabe4217d6e030449e2/objgraph-3.6.2.tar.gz", hash = "sha256:00b9f2f40f7422e3c7f45a61c4dafdaf81f03ff0649d6eaec866f01030e51ad8", size = 759524, upload_time = "2024-10-10T12:00:45.207Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8e/67/7bffbb861cb8a0a62b7df50738d35812bf40dc8bcc1559c04bdf593f1164/objgraph-3.6.2-py3-none-any.whl", hash = "sha256:8114c97712291c3ba30d882406a384d0a7651b307ea9a06e0d83836ccde85e15", size = 17667, upload_time = "2024-10-10T12:00:41.581Z" },
+]
+
+[[package]]
 name = "opt-einsum"
 version = "3.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3594,6 +3603,7 @@ dev = [
     { name = "jupyter" },
     { name = "memory-profiler" },
     { name = "notebook" },
+    { name = "objgraph" },
 ]
 
 [package.metadata]
@@ -3635,6 +3645,7 @@ dev = [
     { name = "jupyter", specifier = ">=1.1.1" },
     { name = "memory-profiler", specifier = ">=0.61.0" },
     { name = "notebook", specifier = ">=7.4.3" },
+    { name = "objgraph", specifier = ">=3.6.2" },
 ]
 
 [[package]]
