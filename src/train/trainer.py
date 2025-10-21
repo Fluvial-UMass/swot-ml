@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 import models
 from config import Config
-from data import BasinGraphDataLoader
+from data import CachedBasinGraphDataLoader
 from .step import make_step, compute_loss_fn
 from .early_stop import EarlyStopper
 
@@ -50,8 +50,8 @@ class Trainer:
 
     cfg: Config
     logger: logging.Logger
-    training_dl: BasinGraphDataLoader
-    validation_dl: BasinGraphDataLoader
+    training_dl: CachedBasinGraphDataLoader
+    validation_dl: CachedBasinGraphDataLoader
     log_dir: Path
     lr_schedule: optax.Schedule
     model: eqx.Module
@@ -67,8 +67,8 @@ class Trainer:
     def __init__(
         self,
         cfg: Config,
-        training_dl: BasinGraphDataLoader = None,
-        validation_dl: BasinGraphDataLoader = None,
+        training_dl: CachedBasinGraphDataLoader = None,
+        validation_dl: CachedBasinGraphDataLoader = None,
         *,
         log_dir: Path | None = None,
         checkpoint: dict | None = None,

@@ -44,11 +44,11 @@ class GraphBatch(NamedTuple):
         jax_batch = jt_map(lambda x: jnp.asarray(x) if isinstance(x, np.ndarray) else x, self)
         return jax_batch
 
+
 _LOG_PAD = 0.001
 
 
-
-def get_train_ds_stats(cfg: Config, *, dynamic:bool=True, static:bool=True) -> dict:
+def get_train_ds_stats(cfg: Config, *, dynamic: bool = True, static: bool = True) -> dict:
     print("Calculating training statistics for encoding and normalization...")
 
     train_basins = _get_basin_list(cfg, "train")
@@ -57,7 +57,9 @@ def get_train_ds_stats(cfg: Config, *, dynamic:bool=True, static:bool=True) -> d
 
     stats = {}
     if static:
-        stats["s_encoding"] = _get_static_encoding(static_train_df, cfg.static_encoding.model_dump())
+        stats["s_encoding"] = _get_static_encoding(
+            static_train_df, cfg.static_encoding.model_dump()
+        )
         stats["s_scale"] = _calculate_scale_from_data(cfg, static_train_df, stats["s_encoding"])
     if dynamic:
         stats["d_encoding"] = _get_prescribed_encoding(cfg.dynamic_encoding.model_dump())
@@ -240,24 +242,20 @@ def config_hash(cfg: Config) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 
 
-
-
-class DynamicCacheManager():
+class DynamicCacheManager:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.cache_dir = cfg.zarr_dir / '_cache' / config_hash(cfg)
-        self.train_stats = None #lazy 
+        self.cache_dir = cfg.zarr_dir / "_cache" / config_hash(cfg)
+        self.train_stats = None  # lazy
         print(f"Caches will be stored at: {self.cache_dir}/<subset>")
 
-
-    def create_cache(self, subset:str, overwrite: bool = False):
+    def create_cache(self, subset: str, overwrite: bool = False):
         sub_cache_dir = self.cache_dir / subset
         sub_cache_dir.mkdir(exist_ok=True, parents=True)
-        
+
         basins = _get_basin_list(self.cfg, subset)
         time_slice = _get_time_slice(self.cfg, subset)
         features = copy.deepcopy(self.cfg.features)
-
 
         globally_found_columns = set()
         written = 0
@@ -284,9 +282,9 @@ class DynamicCacheManager():
 
             ds, features = _encode_data(ds, "dynamic", features, encoding)
             ds = _normalize_data(ds, scale)
-            ds = ds.chunk({'date': self.cfg.sequence_length})
+            ds = ds.chunk({"date": self.cfg.sequence_length})
 
-            ds.to_zarr(store = sub_cache_dir, mode = 'w', group = basin_id)
+            ds.to_zarr(store=sub_cache_dir, mode="w", group=basin_id)
             written += 1
 
         print(f"Wrote {written} new basin files to cache.")
@@ -297,14 +295,11 @@ class DynamicCacheManager():
                     "The following dynamic columns from the config file were not found in ANY of the processed basin files."
                     f"This may indicate a configuration error or typo: {sorted(list(never_found_columns))}"
                 )
-                
+
             # self._cache_indices(sub_cache_dir, subset, basins, time_slice, features)
 
-        
         print("✅ Cached resources are loaded and ready.")
         return sub_cache_dir
-
-
 
     # def _cache_indices(self, sub_cache_dir: Path, subset: str, basins: list[str], time_slice: slice, features: Features):
     #     """Computes and caches the sample_list and basin_index_map."""
@@ -334,7 +329,7 @@ class DynamicCacheManager():
     #             with xr.open_zarr(sub_cache_dir / basin, consolidated=False) as basin_ds:
     #                 valid_seq_mask = basin_ds["date"] >= min_train_date
     #                 basin_ds = basin_ds.sel(date=valid_seq_mask)
-    
+
     #                 if subset in ["train", "test"]:
     #                     target_mask = valid_target(basin_ds)
     #                     dates = basin_ds["date"][target_mask].values
@@ -362,7 +357,6 @@ class DynamicCacheManager():
     #         json.dump(basin_index_map, f)
 
     #     print(f"✅ Cached {len(sample_list)} indices.")
-
 
 
 # --- Helper functions moved outside the class or made static ---
@@ -401,9 +395,6 @@ def _get_time_slice(cfg: Config, subset: DataSubset):
         case _:
             raise ValueError(f"This data_subset ({subset}) is not implemented.")
     return slice(start, end)
-
-
-
 
 
 def _load_basin_graphs(cfg: Config, basins: list[str]) -> dict[str, np.ndarray]:
@@ -559,21 +550,6 @@ def _normalize_data(ds: xr.Dataset, scale=None):
     return ds
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 class CachedBasinGraphDataset(Dataset):
     """
     DataLoader class for loading and preprocessing hydrological time series data.
@@ -587,8 +563,8 @@ class CachedBasinGraphDataset(Dataset):
 
         self.features = copy.deepcopy(self.cfg.features)
         self.time_slice = _get_time_slice(cfg, subset)
-        self.basins =  _get_basin_list(cfg, subset)
-        
+        self.basins = _get_basin_list(cfg, subset)
+
         train_stats = get_train_ds_stats(cfg)
         self.s_encoding = train_stats["s_encoding"]
         self.s_scale = train_stats["s_scale"]
@@ -619,7 +595,6 @@ class CachedBasinGraphDataset(Dataset):
         Returns the number of valid sequences in the dataset.
         """
         return len(self.sample_list)
-
 
     def _load_basin_graphs(self) -> dict[str, np.ndarray]:
         """Loads all basin-specific graphs."""
@@ -658,8 +633,6 @@ class CachedBasinGraphDataset(Dataset):
         print("Done!")
         return graphs
 
-
-    
     def _load_attributes(self) -> xr.Dataset:
         """
         Loads the basin attributes from a CSV file.
@@ -685,7 +658,6 @@ class CachedBasinGraphDataset(Dataset):
 
         print("Done!")
         return ds, basin_subbasin_map
-    
 
     def _create_indices(self):
         # First get the dates that can build a complete sequence
@@ -726,7 +698,6 @@ class CachedBasinGraphDataset(Dataset):
                 index += 1
 
         return sample_list, basin_index_map
-
 
     def __getitem__(self, idx: int) -> dict:
         """Generate one batch of data."""
@@ -775,7 +746,7 @@ class CachedBasinGraphDataset(Dataset):
                 .transpose("date", "subbasin", "variable")
                 .compute()
             )
-            target =  np.asarray(target_arr)
+            target = np.asarray(target_arr)
 
         static = None
         if self.x_s is not None and self.features.static:
@@ -787,16 +758,13 @@ class CachedBasinGraphDataset(Dataset):
                 .transpose("subbasin", "variable")
                 .compute()
             )
-            static =  np.asarray(static_arr)
+            static = np.asarray(static_arr)
 
         sample = GraphBatch(
             dynamic=dynamic, graph_edges=self.graphs[basin], static=static, y=target
         )
 
         return basin, end_date, sample
-
-
-
 
     def denormalize(self, x: Array, name: str) -> Array:
         """

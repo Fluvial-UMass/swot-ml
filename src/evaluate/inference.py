@@ -3,6 +3,7 @@ from pathlib import Path
 
 import equinox as eqx
 import jax
+import jax.numpy as jnp
 import pandas as pd
 import numpy as np
 import pyarrow as pa
@@ -11,7 +12,7 @@ from tqdm import tqdm
 
 from jaxtyping import PRNGKeyArray
 
-from data import BasinGraphDataLoader, GraphBatch
+from data import CachedBasinGraphDataLoader, GraphBatch
 
 
 @eqx.filter_jit
@@ -23,7 +24,7 @@ def _model_map(model, batch: GraphBatch, key: PRNGKeyArray):
 
 def model_iterate(
     model: eqx.Module,
-    dataloader: BasinGraphDataLoader,
+    dataloader: CachedBasinGraphDataLoader,
     quiet: bool = False,
     denormalize: bool = True,
 ) -> Iterator[dict]:
@@ -52,17 +53,18 @@ def model_iterate(
     """
     # Set model to inference mode (no dropout)
     model = eqx.nn.inference_mode(model)
-    # Dummy key (only used for dropout, which is off).
+    # Dummy key (only used for dropout, which we just turned off).
     key = jax.random.PRNGKey(0)
 
     for basin, date, batch in tqdm(dataloader, disable=quiet):
         batch = batch.to_jax()
-        y_pred = _model_map(model, batch, key)[batch.node_mask]
-        y_pred = np.asarray(y_pred) # detach from jax 
-        # TODO bandaid for seq2seq models with 4 dimensions.
-        if len(y_pred.shape) == 4:
-            # Grab the final prediction for now.
-            y_pred = y_pred[-1, ...]
+        y_pred = _model_map(model, batch, key)
+
+        # TODO Do we want to save anything more than the final prediction?
+        if len(y_pred.shape) == 3:
+            y_pred = y_pred[-1, ...]  # Grab the final prediction for now.
+        y_pred = y_pred[batch.node_mask, :]  # Drop padded nodes
+        y_pred = np.asarray(y_pred)  # detach from jax
 
         if denormalize:
             y_pred = dataloader.denormalize_target(y_pred)
@@ -70,10 +72,12 @@ def model_iterate(
         out_dict = {"basin": basin, "date": date, "y_pred": y_pred}
 
         if batch.y is not None:
-            y = batch.y[-1, ...][batch.node_mask]
+            # TODO Do we want to save anything more than the final prediction?
+            y = batch.y[-1, ...][batch.node_mask, :]
+
             if denormalize:
                 y = dataloader.denormalize_target(y)
-            out_dict["y"] = y
+            out_dict["y"] = np.asarray(y)
 
         yield out_dict
 
@@ -154,7 +158,7 @@ def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: 
 
 def predict_to_parquet(
     model: eqx.Module,
-    dataloader: BasinGraphDataLoader,
+    dataloader: CachedBasinGraphDataLoader,
     output_path: Path | str,
     *,
     quiet: bool = False,
@@ -220,7 +224,7 @@ def predict_to_parquet(
                 data_for_df,
                 index=row_index,
                 columns=column_index,
-            ).dropna() # unobserved subbasins
+            ).dropna()  # unobserved subbasins
 
             # --- 5. Write the batch DataFrame to the Parquet file ---
             table = pa.Table.from_pandas(batch_df)

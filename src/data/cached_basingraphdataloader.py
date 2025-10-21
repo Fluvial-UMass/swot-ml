@@ -145,9 +145,7 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
     # Static features and Targets
     unpadded_static = np.concatenate([s.static for s in samples if s.static is not None], axis=0)
     unpadded_y = np.concatenate([s.y for s in samples if s.y is not None], axis=1)
-    unpadded_graph_idx = np.repeat(
-        np.arange(len(samples)), repeats=np.array(num_nodes_per_graph)
-    )
+    unpadded_graph_idx = np.repeat(np.arange(len(samples)), repeats=np.array(num_nodes_per_graph))
 
     node_offset = 0
     offset_edges_list = []
@@ -242,7 +240,6 @@ class CachedBasinGraphDataLoader(DataLoader):
             persistent_workers=persistent_workers,
         )
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
-
 
     # Expose these dataset methods for convenience.
     def denormalize(self, x: Array, name: str):

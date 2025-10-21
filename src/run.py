@@ -55,8 +55,8 @@ def train_from_config(cfg: Config, log_dir: Path | None = None):
         The CachedBasinGraphDataset loaded for training.
     """
     manager = DynamicCacheManager(cfg)
-    cache_dir = manager.create_cache('train')
-    dataset = CachedBasinGraphDataset(cfg, cache_dir, DataSubset.train)
+    cache_dir = manager.create_cache("train")
+    dataset = CachedBasinGraphDataset(cfg, cache_dir, "train")
     dataloader = CachedBasinGraphDataLoader(cfg, dataset)
 
     trainer = None
@@ -184,8 +184,8 @@ def hyperparam_grid_search(config_path: Path, idx: int):
         cfg.test_basin_file = f"metadata/site_lists/k_folds/test_{i}_{k}.txt"
         cfg.train_basin_file = f"metadata/site_lists/k_folds/train_{i}_{k}.txt"
         manager = DynamicCacheManager(cfg)
-        cache_dir = manager.create_cache('train')
-        dataset = CachedBasinGraphDataset(cfg, cache_dir, DataSubset.train)
+        cache_dir = manager.create_cache("train")
+        dataset = CachedBasinGraphDataset(cfg, cache_dir, "train")
         dataloader = CachedBasinGraphDataLoader(cfg, dataset)
 
         if log_dir.is_dir():
@@ -392,19 +392,21 @@ def eval_model(
     results_dir.mkdir(exist_ok=True)
 
     def eval_data_subset(data_subset: DataSubset, out_stem=None):
+        data_subset_str = data_subset.value
+
         if isinstance(out_stem, bool):
             if out_stem:
-                out_stem = data_subset.value
+                out_stem = data_subset_str
             else:
                 return
         results_file = results_dir / f"{out_stem}_results.parquet"
         metrics_file = results_dir / f"{out_stem}_metrics.pkl"
 
-        print(f"Evaluating {data_subset.value} subset and saving to: {results_file}")
+        print(f"Evaluating {data_subset_str} subset and saving to: {results_file}")
 
         manager = DynamicCacheManager(cfg)
-        cache_dir = manager.create_cache(data_subset)
-        dataset = CachedBasinGraphDataset(cfg, cache_dir, data_subset)
+        cache_dir = manager.create_cache(data_subset_str)
+        dataset = CachedBasinGraphDataset(cfg, cache_dir, data_subset_str)
         dataloader = CachedBasinGraphDataLoader(cfg, dataset)
 
         predict_to_parquet(model, dataloader, results_file, quiet=cfg.quiet)
@@ -438,20 +440,20 @@ def train(config: Path):
     config_path = config.resolve()
     cfg = Config.from_file(config_path)
     cfg, trainer, dataset = train_from_config(cfg)
-    eval_model(cfg, trainer.model, dataset, trainer.log_dir, True, True, True)
+    eval_model(cfg, trainer.model, dataset, trainer.log_dir)
 
 
 @app.command()
 def train_ensemble(config_path: Path, ensemble_seed: int):
     config_path = config_path.resolve()
     cfg, model, eval_dir, dataset = train_from_config_ensemble(config_path, ensemble_seed)
-    eval_model(cfg, model, dataset, eval_dir, True, True, True)
+    eval_model(cfg, model, dataset, eval_dir)
 
 
 # @app.command()
 # def finetune(config: Path = typer.Option(..., exists=True, help="Path to fine-tuning config file.")):
 #     cfg, model, eval_dir, dataset = finetune(config.resolve())
-#     eval_model(cfg, model, dataset, eval_dir, True, True, True)
+#     eval_model(cfg, model, dataset, eval_dir)
 
 
 @app.command()
@@ -466,7 +468,7 @@ def grid_search(config_path: Path, grid_index: int):
 
 @app.command()
 def test(log_or_state_dir: Path):
-    is_state_dir = (log_or_state_dir / 'model_and_opt.eqx').is_file()
+    is_state_dir = (log_or_state_dir / "model_and_opt.eqx").is_file()
     if is_state_dir:
         trainer = Trainer.load_checkpoint(log_or_state_dir)
         log_dir = log_or_state_dir.parent
@@ -474,7 +476,7 @@ def test(log_or_state_dir: Path):
         trainer = Trainer.load_last_checkpoint(log_or_state_dir)
         log_dir = log_or_state_dir
 
-    eval_model(trainer.cfg, trainer.model, log_dir, True, True, True)
+    eval_model(trainer.cfg, trainer.model, log_dir)
 
 
 # @app.command()

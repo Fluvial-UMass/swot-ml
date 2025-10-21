@@ -17,9 +17,9 @@ from .layers.graph_attn import SpatioTemporalLSTMCell
 class ST_GATransformer(BaseModel):
     hidden_size: int
     seq_length: int
-    # time_embedding: Array
     dense_sources: list[str]
     sparse_sources: list[str]
+    static_size: int
     seq2seq: bool
     return_weights: bool
 
@@ -54,9 +54,9 @@ class ST_GATransformer(BaseModel):
 
         self.hidden_size = hidden_size
         self.seq_length = seq_length
-        # self.time_embedding = sinusoidal_encoding(hidden_size, seq_length)
         self.dense_sources = list(dense_sizes.keys())
         self.sparse_sources = list(sparse_sizes.keys())
+        self.static_size = static_size
         self.seq2seq = seq2seq
         self.return_weights = return_weights
 
@@ -67,32 +67,15 @@ class ST_GATransformer(BaseModel):
             self.dense_embedders[name] = eqx.nn.MLP(
                 in_size=size, out_size=hidden_size, width_size=hidden_size, depth=1, key=k
             )
+        self.fusion_norm = eqx.nn.LayerNorm(hidden_size)
 
         # Create embedding and assimilation networks for the sparse sources
-        sparse_keys = jrandom.split(keys.pop(0), len(self.sparse_sources))
         self.sparse_embedders = {}
         self.sparse_gain_nets = {}
         self.sparse_norms = {}
+        sparse_keys = jrandom.split(keys.pop(0), len(self.sparse_sources))
         for (name, size), k in zip(sparse_sizes.items(), sparse_keys):
-            k1, k2 = jrandom.split(k)
-            self.sparse_embedders[name] = StaticMLP(
-                dynamic_in_size=size,
-                static_in_size=static_size,
-                out_size=hidden_size,
-                width_size=hidden_size,
-                depth=1,
-                key=k1,
-            )
-            self.sparse_gain_nets[name] = eqx.nn.MLP(
-                in_size=2 * hidden_size + 1,  # observation + innovation + staleness
-                out_size=hidden_size,
-                width_size=hidden_size,
-                depth=1,
-                key=k2,
-            )
-            self.sparse_norms[name] = eqx.nn.LayerNorm(hidden_size)
-
-        self.fusion_norm = eqx.nn.LayerNorm(hidden_size)
+            self.add_assimilator(name, size, k)
 
         # The combined GAT-LSTM cell
         self.spat_temp_lstm = SpatioTemporalLSTMCell(
@@ -104,6 +87,27 @@ class ST_GATransformer(BaseModel):
             dropout_p=dropout,
             key=keys.pop(0),
         )
+
+    def add_assimilator(self, name: str, n_features: int, key: PRNGKeyArray):
+        self.sparse_sources.append(name)
+
+        k1, k2 = jrandom.split(key)
+        self.sparse_embedders[name] = StaticMLP(
+            dynamic_in_size=n_features,
+            static_in_size=self.static_size,
+            out_size=self.hidden_size,
+            width_size=self.hidden_size,
+            depth=1,
+            key=k1,
+        )
+        self.sparse_gain_nets[name] = eqx.nn.MLP(
+            in_size=2 * self.hidden_size + 1,  # observation + innovation + staleness
+            out_size=self.hidden_size,
+            width_size=self.hidden_size,
+            depth=1,
+            key=k2,
+        )
+        self.sparse_norms[name] = eqx.nn.LayerNorm(self.hidden_size)
 
     def __call__(self, data: GraphBatch, key: PRNGKeyArray) -> Array:
         num_locations = data.static.shape[0]  # including padding
@@ -235,13 +239,21 @@ class ST_GATransformer(BaseModel):
         final_h, final_c = final_state
         all_h, fwd_w, rev_w, z, r, assim = accumulated_outputs
 
-        # --- 3. Aggregation and Prediction ---
-        # The final hidden state at each location is used for prediction
+        # Use states for predictions
         if self.seq2seq:
-            predictions = jax.vmap(jax.vmap(self.head))(all_h)
+            #vmap over each time AND each location
+            predictions = {
+                target: jax.vmap(jax.vmap(head))(all_h)
+                for target, head in self.head.items()
+            }
         else:
-            predictions = jax.vmap(self.head)(final_h)
+            #vmap over each location
+            predictions = {
+                target: jax.vmap(head)(final_h)
+                for target, head in self.head.items()
+            }
 
+        # With jax JIT, the returns have no impact on performance unless the model is compiled with this branch. 
         if self.return_weights:
             weights = {"fwd": fwd_w, "rev": rev_w, "z": z, "r": r, "assim": assim}
             return predictions, weights

@@ -72,15 +72,12 @@ def set_model_data_args(cfg: Config, dataset: CachedBasinGraphDataset):
             if not has_gaps
         }
         cfg.model_args.sparse_sizes = {
-            k: len(dataset.features.dynamic[k])
-            for k, has_gaps in cfg.time_gaps.items()
-            if has_gaps
+            k: len(dataset.features.dynamic[k]) for k, has_gaps in cfg.time_gaps.items() if has_gaps
         }
         if dataset.features.static is not None:
             cfg.model_args.static_size = len(dataset.features.static)
         else:
             cfg.model_args.static_size = 0
-        
 
     elif isinstance(cfg.model_args, StackArgs):
         cfg.model_args.dynamic_size = len(list(dyn_feat.values())[0])
