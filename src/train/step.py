@@ -1,82 +1,21 @@
 import equinox as eqx
-import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
-from jaxtyping import Array, PRNGKeyArray, PyTree
+from jaxtyping import PRNGKeyArray, PyTree
 from typing import Callable
 
 from data import GraphBatch
+from .loss import get_loss_fn
 
 
-def mse_loss(y: Array, y_pred: Array, mask: Array):
-    """Calculates Mean Squared Error (MSE) loss."""
-    mse = jnp.mean(jnp.square(y - y_pred), where=mask)
-    return mse
-
-
-def mae_loss(y: Array, y_pred: Array, mask: Array):
-    """Calculates Mean Absolute Error (MAE) loss."""
-    mae = jnp.mean(jnp.abs(y - y_pred), where=mask)
-    return mae
-
-
-def huber_loss(y: Array, y_pred: Array, mask: Array, *, huber_delta: float = 1.0):
-    """Calculates Huber loss."""
-    # Passing delta through make_step is not yet implemented.
-    residual = y - y_pred
-    condition = jnp.abs(residual) <= huber_delta
-    squared_loss = 0.5 * jnp.square(residual)
-    linear_loss = huber_delta * (jnp.abs(residual) - 0.5 * huber_delta)
-    return jnp.mean(jnp.where(condition, squared_loss, linear_loss), where=mask)
-
-
-def nse_loss(y: Array, y_pred: Array, mask: Array):
-    """
-    Calculates the smooth-joint NSE from Kratzert et al., 2019
-    https://doi.org/10.5194/hess-23-5089-2019
-    """
-    # Arrays can be either [batch, time, basins] or [basins, time] depending on model config.
-    # Graph models use the former because they need to predict over multiple basins for each step.
-    sq_error = jnp.square(y - y_pred) * mask
-    std_y = jnp.std(y, axis=1, where=mask.astype(bool))  # Per-basin standard deviation
-    mse = jnp.mean(sq_error, axis=1)  # mean squared errors per basin
-    denom = jnp.square(
-        jnp.nan_to_num(std_y) + 0.1
-    )  # Denominator with smoothing and epsilon for stability
-    return jnp.mean(mse / denom)
-
-
-def spin_up_nse_loss(y: Array, y_pred: Array, mask: Array):
-    """Equivalent to nse_loss but with weights that favor the final ~1/3 of the sequence"""
-    seq_len = y.shape[0]
-    weights = jax.nn.sigmoid(jnp.linspace(-10, 10, seq_len))
-
-    sq_error = jnp.square(y - y_pred) * mask * weights[:, None]
-    std_y = jnp.std(y, axis=0, where=mask.astype(bool))  # Per-basin standard deviation
-    mse = jnp.mean(sq_error, axis=0)  # Sum of squared errors per basin
-    denom = jnp.square(
-        jnp.nan_to_num(std_y) + 0.1
-    )  # Denominator with smoothing and epsilon for stability
-    return jnp.mean(mse / denom)
-
-
-LOSS_FN_MAP = {
-    "mse": mse_loss,
-    "mae": mae_loss,
-    "huber": huber_loss,
-    "nse": nse_loss,
-    "spin_up_nse": spin_up_nse_loss,
-}
-
-
-def compute_loss_fn(
+def compute_loss(
     diff_model: PyTree,
     static_model: PyTree,
     data: GraphBatch,
     key: PRNGKeyArray,
     *,
+    target_weights: dict,
     loss_name: str = "mse",
-    target_weights: float | list[float] = 1,
     **kwargs,
 ) -> float:
     """Compute the loss between the predicted and true values.
@@ -95,10 +34,8 @@ def compute_loss_fn(
         Batch of keys to use for the random dropout in the model.
     loss_name: str, optional
         Name of the loss function to use.
-    target_weights: float | list[float], optional
+    target_weights: dict[str: float]
         Weights to use for the target variables.
-    agreement_weight: float, optional
-        Agreement regularization weight. Currently, only applicable when predicting SSC, SSF, and Q.
     **kwargs
         Additional keyword arguments.
 
@@ -107,33 +44,38 @@ def compute_loss_fn(
     loss : float
     """
     model = eqx.combine(diff_model, static_model)
-    y_pred = model(data, key)
+    y_hat = model(data, key)
 
     if loss_name in ["nse", "spin_up_nse"]:
-        # NSE calc requires the full time series, not just the final value.
-        y = data.y
-        node_padding_mask = data.node_mask[jnp.newaxis, :, jnp.newaxis]
-
+        # Expand the mask with a time dimension for broadcasting.
+        node_mask = data.node_mask[jnp.newaxis, :]
     else:
-        y = data.y[-1, ...]  # End of time dimension
-        node_padding_mask = data.node_mask[:, jnp.newaxis]
+        node_mask = data.node_mask
 
-    valid_mask = ~jnp.isnan(y) & node_padding_mask
-    masked_y = jnp.where(valid_mask, y, 0)
-    masked_y_pred = jnp.where(valid_mask, y_pred, 0)
+    # Loop through the targets and calculate loss
+    losses = []
+    loss_fn = get_loss_fn(loss_name)
+    for target_name in y_hat.keys():
+        y_target = data.y[target_name][..., 0]
+        y_hat_target = y_hat[target_name]
 
-    try:
-        loss_fn = LOSS_FN_MAP[loss_name]
-    except KeyError:
-        raise ValueError("loss name not recognized by LOSS_FN_MAP in step.py")
+        valid_mask = ~jnp.isnan(y_target) & node_mask
+        masked_y = jnp.where(valid_mask, y_target, 0)
 
-    vectorized_loss_fn = jax.vmap(loss_fn, in_axes=(-1, -1, -1))  # Features dimension
-    raw_losses = vectorized_loss_fn(masked_y, masked_y_pred, valid_mask)
-    # Exclude any nan target losses from average.
-    valid_loss = ~jnp.isnan(raw_losses)
-    target_losses = jnp.where(valid_loss, raw_losses, 0)
-    target_weights = valid_loss * jnp.array(target_weights)
-    loss = jnp.average(target_losses, weights=target_weights)
+        if isinstance(y_hat_target, dict):
+            expanded_mask = jnp.expand_dims(valid_mask, axis=-1)
+            masked_y_hat = {
+                p_name: jnp.where(expanded_mask, p_arr, 0) for p_name, p_arr in y_hat_target.items()
+            }
+        else:
+            masked_y_hat = jnp.where(valid_mask, y_hat_target[..., 0], 0)
+
+        # Calculate masked loss, safeguard against NaN's, and apply target weights
+        loss = loss_fn(masked_y, masked_y_hat, valid_mask)
+        loss = jnp.nan_to_num(loss, 0) * target_weights[target_name]
+        losses.append(loss)
+
+    loss = jnp.mean(jnp.stack(losses))
 
     return loss
 
@@ -199,7 +141,7 @@ def make_step(
         The updated optimizer state.
     """
     diff_model, static_model = eqx.partition(model, filter_spec)
-    loss_fn_with_grad = eqx.filter_value_and_grad(compute_loss_fn)
+    loss_fn_with_grad = eqx.filter_value_and_grad(compute_loss)
     loss, grads = loss_fn_with_grad(diff_model, static_model, data, key, **kwargs)
     if kwargs.get("max_grad_norm"):
         grads = clip_gradients(grads, kwargs.get("max_grad_norm"))

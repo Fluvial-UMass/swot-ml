@@ -17,7 +17,7 @@ class Linear(eqx.Module):
 class MLP(eqx.Module):
     mlp: eqx.nn.MLP
 
-    def __init__(self, latent_size:int, hidden_size:int, n_layers:int=2, *key: PRNGKeyArray):
+    def __init__(self, latent_size: int, hidden_size: int, n_layers: int = 2, *key: PRNGKeyArray):
         self.mlp = eqx.nn.MLP(
             in_size=latent_size, out_size=1, width_size=hidden_size, depth=n_layers, key=key
         )
@@ -127,7 +127,7 @@ class CMAL(eqx.Module):
         return {"mu": m, "b": b, "tau": t, "pi": p}
 
 
-class UMAL(eqx.nn.Module):
+class UMAL(eqx.Module):
     """Uncountable Mixture of Asymmetric Laplacians.
 
     An implicit approximation to the mixture density network with Laplace distributions which does not require to

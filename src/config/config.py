@@ -23,7 +23,7 @@ from .model_args import ModelArgs
 class Features(BaseModel):
     dynamic: dict[str, list[str]]
     static: list[str] | None = None
-    target: dict[str, list[str]]
+    target: list[str]
 
 
 class Encoding(BaseModel):
@@ -32,8 +32,8 @@ class Encoding(BaseModel):
 
 
 class StepKwargs(BaseModel):
-    loss_name: Literal["mse", "mae", "huber", "nse", "spin_up_nse"] = "mse"
-    target_weights: list[float] | None = None
+    loss_name: Literal["mse", "mae", "huber", "nse", "spin_up_nse", "gmm_nll"] = "mse"
+    target_weights: dict[str, float] = None
     max_grad_norm: float | None = None
     agreement_weight: float = 0.0
 
@@ -306,24 +306,16 @@ class Config(BaseModel):
                     "Must predict at least ssc, flux, and usgs_q when using flux agreement regularization."
                 )
         # Convert target_weights dict to list based on features.target order
-        if v.target_weights is not None:
-            if isinstance(v.target_weights, dict):
-                v.target_weights = [
-                    v.target_weights.get(target, 1) for target in cfg["features"].target
-                ]
-            elif isinstance(v.target_weights, list):
-                # Just need to check that it is the right length.
-                if len(v.target_weights) != len(cfg["features"].target):
-                    raise ValueError(
-                        f"Length of target_weights list ({len(v.target_weights)}) does not match number of targets ({len(cfg['features'].target)})."
-                    )
-            else:
-                raise TypeError(
-                    f"target_weights must be a dict or a list, got {type(v.target_weights)}."
-                )
+        if v.target_weights is None:
+            v.target_weights = {}
+
+        if isinstance(v.target_weights, dict):
+            v.target_weights = {
+                target: v.target_weights.get(target, 1) for target in cfg["features"].target
+            }
         else:
-            # Default all to 1 if not specified
-            v.target_weights = [1] * len(cfg["features"].target)
+            raise TypeError(f"target_weights must be a dict or None, got {type(v.target_weights)}.")
+
         return v
 
     # CONFIG MANIPULATION

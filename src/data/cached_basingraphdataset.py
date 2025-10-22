@@ -29,7 +29,7 @@ class GraphBatch(NamedTuple):
     node_mask: Array = None
     edge_mask: Array = None
     static: Array = None
-    y: Array = None
+    y: dict[str, Array] = {}
 
     def __getitem__(self, key):
         warnings.warn(
@@ -211,6 +211,8 @@ def _calculate_scale_from_data(cfg: Config, df: pd.DataFrame, encoding: dict):
     return scale
 
 
+# TODO Allow different sets of features, but check what is already in cache and append as needed. 
+# Each var is normalized separately, so there is no conflict with extra vars. 
 def config_hash(cfg: Config) -> str:
     """Return a unique hash based on a subset of fields from a Pydantic config object."""
     fields_to_hash = [
@@ -220,7 +222,7 @@ def config_hash(cfg: Config) -> str:
         "train_basin_file",
         "test_basin_file",
         "graph_network_file",
-        "features ",
+        "features",
         "time_gaps",
         "dynamic_encoding",
         "static_encoding",
@@ -272,8 +274,7 @@ class DynamicCacheManager:
                 encoding = self.train_stats["d_encoding"]
                 scale = self.train_stats["d_scale"]
                 dynamic_columns = set([vv for v in features.dynamic.values() for vv in v])
-                target_columns = set([vv for v in features.target.values() for vv in v])
-                all_config_columns = dynamic_columns.union(target_columns)
+                all_config_columns = dynamic_columns.union(set(features.target))
 
             # Find and track missing columns
             available_columns = all_config_columns.intersection(set(ds.data_vars))
@@ -574,7 +575,7 @@ class CachedBasinGraphDataset(Dataset):
         self.x_s, self.basin_subbasin_map = self._load_attributes()
         self.graphs = self._load_basin_graphs()
 
-        self.target = [v for v_lists in self.features.target.values() for v in v_lists]
+        self.target = self.features.target
         self.sample_list, self.basin_index_map = self._create_indices()
 
         # print("Loading sample indices from cache...", end="")
@@ -738,15 +739,18 @@ class CachedBasinGraphDataset(Dataset):
                 )
                 dynamic[source] = np.asarray(source_arr)  # Ensure numpy, not dask
 
-        target = None
-        if self.target:
-            target_arr = (
-                ds[self.target]
-                .to_array(dim="variable")
-                .transpose("date", "subbasin", "variable")
-                .compute()
-            )
-            target = np.asarray(target_arr)
+            target = {}
+            if not self.cfg.model_args.seq2seq:
+                ds = ds.sel(date=[end_date])
+
+            for t_name in self.target:
+                target_arr = (
+                    ds[self.target]
+                    .to_array(dim="variable")
+                    .transpose("date", "subbasin", "variable")
+                    .compute()
+                )
+                target[t_name] = np.asarray(target_arr)
 
         static = None
         if self.x_s is not None and self.features.static:
@@ -766,7 +770,7 @@ class CachedBasinGraphDataset(Dataset):
 
         return basin, end_date, sample
 
-    def denormalize(self, x: Array, name: str) -> Array:
+    def denormalize(self, x: Array, name: str, scale_only = False) -> Array:
         """
         Denormalizes a feature or target by its name.
 
@@ -781,22 +785,22 @@ class CachedBasinGraphDataset(Dataset):
         scale = self.d_scale[name]["scale"]
         log_norm = self.d_scale[name]["log_norm"]
 
+        if scale_only:
+            offset = 0
+
         if log_norm:
             return np.exp(x + offset) - _LOG_PAD
         else:
             return x * scale + offset
 
-    def denormalize_target(self, y_normalized: Array) -> Array:
+    def denormalize_targets(self, y_normalized: dict[str, Array]) -> dict[str, Array]:
         """
         Denormalizes the target variable(s).
         Returns:
-            Array: Denormalized target data.
+            dict[str, Array]: Denormalized target data.
         """
-        y = np.empty_like(y_normalized)
-
-        for i in range(len(self.target)):
-            target_name = self.target[i]
-            denorm = self.denormalize(y_normalized[..., i], name=target_name)
-            y[..., i] = denorm
-
-        return y
+        y_denorm = {}
+        for t_name, t_norm in y_normalized.items():
+            y_denorm[t_name] = self.denormalize(t_norm, name=t_name)
+        
+        return y_denorm

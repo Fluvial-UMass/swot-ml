@@ -46,9 +46,8 @@ def make(cfg: Config, dl: CachedBasinGraphDataLoader = None):
 
     model_fn = MODEL_MAP[cfg.model_args.name]
     model = model_fn(**cfg.model_args.as_kwargs())
-    num_params, memory_bytes = count_parameters(model)
-    size, unit = human_readable_size(memory_bytes)
-    print(f"Model contains {num_params:,} parameters, using {size:.2f}{unit} memory.")
+    num_params = count_parameters(model)
+    print(f"Model contains {num_params:,} parameters")
     return cfg, model
 
 
@@ -106,23 +105,10 @@ def count_parameters(model: BaseModel):
     -------
     num_params: int
         Total number of trainable parameters in the model.
-    memory_bytes: int
-        Estimated memory usage of the model in bytes, assuming each parameter is a
-        32-bit float.
     """
     # Use tree_flatten to get a list of arrays and ensure is_leaf treats arrays as leaves
     params, _ = jax.tree_util.tree_flatten(model)
     # Count the total number of parameters
     num_params = sum(param.size for param in params if eqx.is_inexact_array(param))
     # Calculate memory usage assuming 4 bytes per parameter (32-bit float)
-    memory_bytes = num_params * 4
-    return num_params, memory_bytes
-
-
-# Convert bytes to a human-readable format
-def human_readable_size(size):
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024.0 or unit == "TB":
-            break
-        size /= 1024.0
-    return size, unit
+    return num_params

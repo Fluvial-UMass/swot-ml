@@ -21,7 +21,7 @@ from tqdm import tqdm
 import models
 from config import Config
 from data import CachedBasinGraphDataLoader
-from .step import make_step, compute_loss_fn
+from .step import make_step, compute_loss
 from .early_stop import EarlyStopper
 
 
@@ -321,7 +321,7 @@ class Trainer:
             self.validation_dl, disable=self.cfg.quiet, desc=f"Validating Step:{self.step:06d}"
         )
         for _, _, batch in pbar:
-            loss = compute_loss_fn(
+            loss = compute_loss(
                 self.model,
                 batch,
                 batch_keys,

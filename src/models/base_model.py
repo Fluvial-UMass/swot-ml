@@ -6,7 +6,7 @@ from .layers import heads
 
 
 class BaseModel(eqx.Module):
-    head: eqx.nn.Linear
+    head: dict[str, eqx.Module]
     target: list[str]
 
     def __init__(self, hidden_size: int, target: list, head: str, *, key: PRNGKeyArray):
@@ -20,23 +20,21 @@ class BaseModel(eqx.Module):
         self.target = target
 
         match head.lower():
-            case 'linear':
+            case "linear":
                 single_head = heads.Linear(hidden_size, key=key)
-            case 'mlp':
+            case "mlp":
                 single_head = heads.MLP(hidden_size, hidden_size * 2, key=key)
-            case 'gmm': 
+            case "gmm":
                 single_head = heads.GMM(hidden_size, hidden_size * 2, 100, key=key)
-            case 'cmal': 
+            case "cmal":
                 single_head = heads.CMAL(hidden_size, hidden_size * 2, 100, key=key)
-            case 'umal': 
+            case "umal":
                 single_head = heads.UMAL(hidden_size, hidden_size * 2, 100, key=key)
             case _:
                 raise NotImplementedError(f"{head} not implemented or not linked in `get_head()`")
-            
-        # All heads are initialized as the same but will diverge during training. 
-        self.head = {t:single_head for t in target}
 
-        
+        # All heads are initialized as the same but will diverge during training.
+        self.head = {t: single_head for t in target}
 
     def __call__(self, data: GraphBatch, key: PRNGKeyArray | None) -> Array:
         raise NotImplementedError

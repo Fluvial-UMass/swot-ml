@@ -43,6 +43,7 @@ class ST_GATransformer(BaseModel):
         num_heads: int,
         seed: int,
         dropout: float,
+        head: str,
         seq2seq: bool,
         return_weights: bool,
     ):
@@ -50,7 +51,7 @@ class ST_GATransformer(BaseModel):
         keys = list(jrandom.split(key, 10))
 
         # initializes linear head and target list
-        super().__init__(hidden_size, target, key=keys.pop(0))
+        super().__init__(hidden_size, target, head, key=keys.pop(0))
 
         self.hidden_size = hidden_size
         self.seq_length = seq_length
@@ -241,19 +242,15 @@ class ST_GATransformer(BaseModel):
 
         # Use states for predictions
         if self.seq2seq:
-            #vmap over each time AND each location
+            # vmap over each time AND each location
             predictions = {
-                target: jax.vmap(jax.vmap(head))(all_h)
-                for target, head in self.head.items()
+                target: jax.vmap(jax.vmap(head))(all_h) for target, head in self.head.items()
             }
         else:
-            #vmap over each location
-            predictions = {
-                target: jax.vmap(head)(final_h)
-                for target, head in self.head.items()
-            }
+            # vmap over each location
+            predictions = {target: jax.vmap(head)(final_h) for target, head in self.head.items()}
 
-        # With jax JIT, the returns have no impact on performance unless the model is compiled with this branch. 
+        # With jax JIT, the returns have no impact on performance unless the model is compiled with this branch.
         if self.return_weights:
             weights = {"fwd": fwd_w, "rev": rev_w, "z": z, "r": r, "assim": assim}
             return predictions, weights

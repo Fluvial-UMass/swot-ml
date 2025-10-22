@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field
 class BaseModelArgs(BaseModel):
     hidden_size: int = Field(..., gt=0)
     dropout: float = Field(..., ge=0, lt=1.0)
+    head: str = "linear"
+    seq2seq: bool = False
     seed: int = 0
 
     def as_kwargs(self) -> dict:
@@ -15,7 +17,6 @@ class STGATArgs(BaseModelArgs):
     name: Literal["st_gat"]
     k_hops: int = Field(..., gt=0)
     num_heads: int = Field(..., gt=0)
-    seq2seq: bool = False
     return_weights: bool = False
     target: list[str] = None
     seq_length: int = None
@@ -41,7 +42,6 @@ class StackArgs(BaseModelArgs):
     out_targets: list[str]
     dynamic_size: int = None
     static_size: int = None
-    seq2seq: bool = True
 
 
 class GraphLSTMArgs(BaseModelArgs):

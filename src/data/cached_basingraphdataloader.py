@@ -137,14 +137,21 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
     for sample in samples:
         for source, data in sample.dynamic.items():
             packed_dynamic[source].append(data)
-
     unpadded_dynamic = {
         source: np.concatenate(data_list, axis=1) for source, data_list in packed_dynamic.items()
     }
 
+    # Targets
+    packed_targets = defaultdict(list)
+    for sample in samples:
+        for target, data in sample.y.items():
+            packed_targets[target].append(data)
+    unpadded_targets = {
+        target: np.concatenate(data_list, axis=1) for target, data_list in packed_targets.items()
+    }
+
     # Static features and Targets
     unpadded_static = np.concatenate([s.static for s in samples if s.static is not None], axis=0)
-    unpadded_y = np.concatenate([s.y for s in samples if s.y is not None], axis=1)
     unpadded_graph_idx = np.repeat(np.arange(len(samples)), repeats=np.array(num_nodes_per_graph))
 
     node_offset = 0
@@ -162,19 +169,14 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
     # --- Step 3: Pad All Tensors to Target Size ---
     # Pad node features
     padded_static = np.pad(unpadded_static, ((0, num_padding_nodes), (0, 0)))
-    padded_y = np.pad(unpadded_y, ((0, 0), (0, num_padding_nodes), (0, 0)))
+    # padded_target = np.pad(unpadded_y, ((0, 0), (0, num_padding_nodes), (0, 0)))
     padded_graph_idx = np.pad(unpadded_graph_idx, (0, num_padding_nodes))
-    # ... (Pad dynamic features similarly) ...
-    # This example assumes you have the logic for dynamic features already
-    packed_dynamic = defaultdict(list)
-    for sample in samples:
-        for source, data in sample.dynamic.items():
-            packed_dynamic[source].append(data)
-    unpadded_dynamic = {
-        source: np.concatenate(data_list, axis=1) for source, data_list in packed_dynamic.items()
-    }
+
     padded_dynamic = {
         s: np.pad(d, ((0, 0), (0, num_padding_nodes), (0, 0))) for s, d in unpadded_dynamic.items()
+    }
+    padded_targets = {
+        t: np.pad(d, ((0, 0), (0, num_padding_nodes), (0, 0))) for t, d in unpadded_targets.items()
     }
 
     # Pad with the index of the FIRST PADDED NODE (num_real_nodes).
@@ -187,12 +189,9 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
     node_mask = np.concatenate(
         [np.ones(num_real_nodes, dtype=np.bool_), np.zeros(num_padding_nodes, dtype=np.bool_)]
     )
-
     edge_mask = np.concatenate(
         [np.ones(num_real_edges, dtype=np.bool_), np.zeros(num_padding_edges, dtype=np.bool_)]
     )
-    # # Unmask the FIRST padding edge to prevent NaN during the softmax edge calculations
-    # edge_mask = edge_mask.at[num_real_edges].set(True)
 
     # --- Step 5: Assemble Final Batch ---
     final_batch = GraphBatch(
@@ -202,7 +201,7 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
         graph_idx=padded_graph_idx,
         node_mask=node_mask,
         edge_mask=edge_mask,
-        y=padded_y,
+        y=padded_targets,
     )
 
     return list(basins), list(dates), final_batch
@@ -242,8 +241,8 @@ class CachedBasinGraphDataLoader(DataLoader):
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 
     # Expose these dataset methods for convenience.
-    def denormalize(self, x: Array, name: str):
-        return self.dataset.denormalize(x, name)
+    def denormalize(self, x: Array, name: str, scale_only:bool=False):
+        return self.dataset.denormalize(x, name, scale_only)
 
     def denormalize_target(self, y_normalized: Array):
         return self.dataset.denormalize_target(y_normalized)

@@ -1,5 +1,7 @@
-from typing import Iterator
+from typing import Callable, Iterator
 from pathlib import Path
+from functools import partial
+from collections import defaultdict
 
 import equinox as eqx
 import jax
@@ -10,20 +12,49 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-from jaxtyping import PRNGKeyArray
+from jaxtyping import Array, PRNGKeyArray
 
 from data import CachedBasinGraphDataLoader, GraphBatch
-
+from models import BaseModel
+from models.layers.heads import GMM
 
 @eqx.filter_jit
-def _model_map(model, batch: GraphBatch, key: PRNGKeyArray):
+def _model_map(model, batch: GraphBatch, key: PRNGKeyArray) -> dict[str, Array | dict[str, Array]]:
     """Applies the model to a batch of data using jax.vmap."""
     y_pred = model(batch, key)
     return y_pred
 
 
+def _direct_values(pred: Array, node_mask: Array, denorm_fn: Callable | None) -> tuple[Array, Array]:
+    # TODO Do we want to save anything more than the final prediction?
+    if len(pred.shape) == 3:
+        pred = pred[-1, ...]  # Grab the final prediction for now.
+    pred = pred[node_mask] # Drop padded nodes
+    pred = denorm_fn(pred) if denorm_fn else pred
+
+    return np.asarray(pred), None  # np to detach from jax
+
+def _gmm_expected_values(dist_pred: dict[str, Array], node_mask:Array, denorm_fn: Callable | None) -> tuple[Array, Array]:
+    mu = np.asarray(dist_pred['mu'][node_mask])
+    sigma = np.asarray(dist_pred['sigma'][node_mask])
+    pi = np.asarray(dist_pred['pi'][node_mask])
+
+    mu_exp = np.sum(pi * mu, axis=-1)
+
+    # Expected variance
+    var_exp = np.sum(
+        pi * (sigma**2 + (mu - mu_exp[..., None])**2),
+        axis=-1
+    )
+    std_exp = np.sqrt(var_exp)
+
+    mu_exp = denorm_fn(mu_exp) if denorm_fn else mu_exp
+    std_exp = denorm_fn(std_exp, scale_only=True) if denorm_fn else std_exp
+    
+    return mu_exp, std_exp
+
 def model_iterate(
-    model: eqx.Module,
+    model: BaseModel,
     dataloader: CachedBasinGraphDataLoader,
     quiet: bool = False,
     denormalize: bool = True,
@@ -56,30 +87,39 @@ def model_iterate(
     # Dummy key (only used for dropout, which we just turned off).
     key = jax.random.PRNGKey(0)
 
+    
+
     for basin, date, batch in tqdm(dataloader, disable=quiet):
         batch = batch.to_jax()
         y_pred = _model_map(model, batch, key)
 
-        # TODO Do we want to save anything more than the final prediction?
-        if len(y_pred.shape) == 3:
-            y_pred = y_pred[-1, ...]  # Grab the final prediction for now.
-        y_pred = y_pred[batch.node_mask, :]  # Drop padded nodes
-        y_pred = np.asarray(y_pred)  # detach from jax
+        out_dict = {"basin": basin, "date": date, "y_pred": {}}
+        for target_name, target_pred in y_pred.items():
+            denorm_fn = partial(dataloader.denormalize, name=target_name) if denormalize else None
 
-        if denormalize:
-            y_pred = dataloader.denormalize_target(y_pred)
+            # Check the type of this target's head. Changes how we create predictions. 
+            if isinstance(model.head[target_name], GMM):
+                t_exp, t_std = _gmm_expected_values(target_pred, batch.node_mask, denorm_fn) 
+            else:
+                t_exp, t_std = _direct_values(target_pred, batch.node_mask, denorm_fn)
 
-        out_dict = {"basin": basin, "date": date, "y_pred": y_pred}
 
-        if batch.y is not None:
-            # TODO Do we want to save anything more than the final prediction?
-            y = batch.y[-1, ...][batch.node_mask, :]
+            out_dict['y_pred'][target_name] = t_exp
+            if t_std is not None:
+                out_dict['y_pred'][target_name + '_std'] = t_std
 
-            if denormalize:
-                y = dataloader.denormalize_target(y)
-            out_dict["y"] = np.asarray(y)
+
+            if batch.y is not None:
+                if 'y' not in out_dict.keys():
+                    out_dict['y'] = {}
+                    
+                # TODO Do we want to save anything more than the final prediction?
+                y = batch.y[target_name][-1, ..., 0][batch.node_mask]
+                y = denorm_fn(y) if denorm_fn else y
+                out_dict["y"][target_name] = np.asarray(y)
 
         yield out_dict
+
 
 
 def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: bool = True):
@@ -111,28 +151,23 @@ def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: 
     # inference_mode = dataloader.dataset.inference_mode
     basins = []
     dates = []
-    y_hat_list = []
-    y_list = []
+    y_preds = defaultdict(list)
+    ys = defaultdict(list)
 
     # Iterate through the dataset, make predictions and collect data in lists.
     for result_dict in model_iterate(model, dataloader, quiet, denormalize):
         basins.extend(result_dict["basin"])
         dates.extend(result_dict["date"])
-        y_hat_list.append(result_dict["y_pred"])
 
-        if "y" in result_dict.keys():
-            y_list.append(result_dict.get("y"))
+        for name, arr in result_dict['y_pred'].items():
+            y_preds[name].append(arr)
 
-    # Concatenate all the data lists into arrays.
-    y_hat_arr = np.concatenate(y_hat_list)
+        for name, arr in result_dict.get('y', {}).items():
+            ys[name].append(arr)
 
-    if len(y_list) > 0:
-        y_arr = np.concatenate(y_list)
-        data = np.concatenate((y_arr, y_hat_arr), axis=-1)
-        cols = ["obs", "pred"]
-    else:
-        data = y_hat_arr
-        cols = ["pred"]
+    y_pred_arrs = {name: np.concatenate(arr_list) for name, arr_list in y_preds.items()}
+    y_arrs = {name: np.concatenate(arr_list) for name, arr_list in ys.items()}
+    data = {'obs': y_arrs, 'pred': y_pred_arrs}
 
     subbasin_map = dataloader.dataset.basin_subbasin_map  # dict[str: list[str]]
     rows = [
@@ -140,20 +175,13 @@ def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: 
         for basin, date in zip(basins, dates)
         for subbasin in subbasin_map[basin]
     ]
-
-    # Place the data arrays into a dataframe with multilevel indices.
     row_index = pd.MultiIndex.from_tuples(rows, names=["basin", "subbasin", "date"])
-    column_index = pd.MultiIndex.from_product(
-        [cols, dataloader.dataset.target],
-        names=["Type", "Feature"],
-    )
-    results = pd.DataFrame(
-        data,
-        index=row_index,
-        columns=column_index,
-    )
 
-    return results
+    # Concat the pred and obs dicts to create multindex columns
+    df = pd.concat({outer: pd.DataFrame(inner) for outer, inner in data.items()}, axis=1)
+    df.index = row_index
+
+    return df
 
 
 def predict_to_parquet(
@@ -188,46 +216,33 @@ def predict_to_parquet(
     writer = None  # Initialize the Parquet writer
 
     try:
+        subbasin_map = dataloader.dataset.basin_subbasin_map
+
         # Iterate through batches from the dataloader
         for batch_results in model_iterate(model, dataloader, quiet=quiet, denormalize=denormalize):
-            # --- 1. Combine prediction and observation data for the batch ---
-            y_pred_batch = batch_results["y_pred"]
+            y_pred_dict = batch_results["y_pred"]
+            y_obs_dict = batch_results.get("y", {})
 
-            if "y" in batch_results:
-                y_obs_batch = batch_results["y"]
-                # Combine observations and predictions side-by-side
-                data_for_df = np.concatenate((y_obs_batch, y_pred_batch), axis=-1)
-                col_types = ["obs", "pred"]
-            else:
-                data_for_df = y_pred_batch
-                col_types = ["pred"]
+            df_parts = {}
+            df_parts["pred"] = pd.DataFrame({k: v for k, v in y_pred_dict.items()})
+            if y_obs_dict:
+                df_parts["obs"] = pd.DataFrame({k: v for k, v in y_obs_dict.items()})
+            
+            df = pd.concat(df_parts, axis=1)
 
-            # --- 2. Construct the row index for the batch ---
-            basins_in_batch = batch_results["basin"]
-            dates_in_batch = batch_results["date"]
-            subbasin_map = dataloader.dataset.basin_subbasin_map
             rows = [
                 (basin, subbasin, date)
-                for basin, date in zip(basins_in_batch, dates_in_batch)
+                for basin, date in zip( batch_results["basin"], batch_results["date"])
                 for subbasin in subbasin_map[basin]
             ]
             row_index = pd.MultiIndex.from_tuples(rows, names=["basin", "subbasin", "date"])
+            df.index = row_index
 
-            # --- 3. Construct the column index ---
-            column_index = pd.MultiIndex.from_product(
-                [col_types, dataloader.dataset.target],
-                names=["Type", "Feature"],
-            )
+            #  Clean NaNs (unobserved subbasins)
+            df = df.dropna(how='any')
 
-            # --- 4. Create a DataFrame for the current batch ---
-            batch_df = pd.DataFrame(
-                data_for_df,
-                index=row_index,
-                columns=column_index,
-            ).dropna()  # unobserved subbasins
-
-            # --- 5. Write the batch DataFrame to the Parquet file ---
-            table = pa.Table.from_pandas(batch_df)
+            # Write the batch DataFrame to the Parquet file
+            table = pa.Table.from_pandas(df)
 
             if writer is None:
                 # For the first batch, create the writer with the table's schema
