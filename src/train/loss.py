@@ -1,6 +1,78 @@
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array
+from jaxtyping import Array, PRNGKeyArray, PyTree
+
+from data import GraphBatch
+
+
+def compute_loss(
+    diff_model: PyTree,
+    static_model: PyTree | None,
+    data: GraphBatch,
+    key: PRNGKeyArray,
+    *,
+    target_weights: dict[str, int],
+    loss_name: str = "mse",
+) -> float:
+    """Compute the loss between the predicted and true values.
+
+    Parameters
+    ----------
+    diff_model: PyTree
+        Differential components of the model.
+    static_model: PyTree
+        Static components of the model.
+    data: GraphBatch
+        GraphBatch of data to use for training.
+    keys: list[PRNGKeyArray]
+        Batch of keys to use for the random dropout in the model.
+    loss_name: str, optional
+        Name of the loss function to use.
+    target_weights: dict[str: float]
+        Weights to use for the target variables.
+    **kwargs
+        Additional keyword arguments.
+
+    Returns
+    -------
+    loss : float
+    """
+    model = eqx.combine(diff_model, static_model) if static_model is not None else diff_model
+    y_hat = model(data, key)
+
+    if loss_name in ["nse", "spin_up_nse"]:
+        # Expand the mask with a time dimension for broadcasting.
+        node_mask = data.node_mask[jnp.newaxis, :]
+    else:
+        node_mask = data.node_mask
+
+    # Loop through the targets and calculate loss
+    losses = []
+    loss_fn = get_loss_fn(loss_name)
+    for target_name in y_hat.keys():
+        y_target = data.y[target_name][..., 0]
+        y_hat_target = y_hat[target_name]
+
+        valid_mask = ~jnp.isnan(y_target) & node_mask
+        masked_y = jnp.where(valid_mask, y_target, 0)
+
+        if isinstance(y_hat_target, dict):
+            expanded_mask = jnp.expand_dims(valid_mask, axis=-1)
+            masked_y_hat = {
+                p_name: jnp.where(expanded_mask, p_arr, 0) for p_name, p_arr in y_hat_target.items()
+            }
+        else:
+            masked_y_hat = jnp.where(valid_mask, y_hat_target[..., 0], 0)
+
+        # Calculate masked loss, safeguard against NaN's, and apply target weights
+        loss = loss_fn(masked_y, masked_y_hat, valid_mask)
+        loss = jnp.nan_to_num(loss, 0) * target_weights[target_name]
+        losses.append(loss)
+
+    loss = jnp.mean(jnp.stack(losses))
+
+    return loss
 
 
 def get_loss_fn(loss_name):
@@ -76,18 +148,18 @@ def spin_up_nse_loss(y: Array, y_hat: Array, mask: Array):
 def gmm_nll(y: Array, y_hat: dict[str, Array], mask: Array) -> Array:
     """
     Calculates the average negative log-likelihood for a Gaussian Mixture Model (GMM).
-    """    
-    y_unsqueezed = jnp.expand_dims(y, axis=-1) # Allow broadcasting to each error model
+    """
+    y_unsqueezed = jnp.expand_dims(y, axis=-1)  # Allow broadcasting to each error model
 
     # Calculate the probability density of y for each Gaussian component.
     one_over_sqrt_2pi = 1.0 / jnp.sqrt(2.0 * jnp.pi)
-    exponent = -0.5 * jnp.square((y_unsqueezed - y_hat['mu']) / y_hat['sigma'])
-    pdf_values = one_over_sqrt_2pi * jnp.exp(exponent) / y_hat['sigma']
+    exponent = -0.5 * jnp.square((y_unsqueezed - y_hat["mu"]) / y_hat["sigma"])
+    pdf_values = one_over_sqrt_2pi * jnp.exp(exponent) / y_hat["sigma"]
 
     # Weight the PDFs by the mixture weights (pi) and sum them up
-    weighted_likelihoods = jnp.sum(y_hat['pi'] * pdf_values, axis=-1)
+    weighted_likelihoods = jnp.sum(y_hat["pi"] * pdf_values, axis=-1)
 
     # negative log likelihood
-    nll = -jnp.log(weighted_likelihoods + 1E-6)
-    
+    nll = -jnp.log(weighted_likelihoods + 1e-6)
+
     return jnp.mean(nll, where=mask)

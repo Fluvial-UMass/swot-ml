@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, PRNGKeyArray
-
 from lstm import LSTM
 
 

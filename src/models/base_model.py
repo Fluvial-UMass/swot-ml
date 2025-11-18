@@ -2,6 +2,7 @@ import equinox as eqx
 from jaxtyping import Array, PRNGKeyArray
 
 from data import GraphBatch
+
 from .layers import heads
 
 

@@ -1,8 +1,8 @@
+import equinox as eqx
 import jax.lax as lax
 import jax.numpy as jnp
 import jax.random as jrandom
 from jaxtyping import Array, PRNGKeyArray
-import equinox as eqx
 
 
 class NaN_Dropout(eqx.Module):

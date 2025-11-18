@@ -4,9 +4,10 @@ import jax.random as jrandom
 from jaxtyping import PRNGKeyArray
 
 from data import GraphBatch
+
 from .base_model import BaseModel
-from .layers.static_mlp import StaticMLP
 from .layers.ealstm import EALSTM
+from .layers.static_mlp import StaticMLP
 from .layers.transformer import CrossAttnDecoder
 
 

@@ -1,28 +1,29 @@
+import json
 import logging
 import pickle
-import json
-import os
-import sys
 import re
-import traceback
+import shutil
+import sys
 import time
-from pathlib import Path
+import traceback
 from datetime import datetime
+from pathlib import Path
 
-import numpy as np
 import equinox as eqx
-import optax
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
-from jaxtyping import PyTree
+import numpy as np
+import optax
+from jaxtyping import PRNGKeyArray, PyTree
 from tqdm import tqdm
 
 import models
 from config import Config
-from data import CachedBasinGraphDataLoader
-from .step import make_step, compute_loss
+from data import CachedBasinGraphDataLoader, GraphBatch
+
 from .early_stop import EarlyStopper
+from .loss import compute_loss
 
 
 class Trainer:
@@ -53,7 +54,6 @@ class Trainer:
     training_dl: CachedBasinGraphDataLoader
     validation_dl: CachedBasinGraphDataLoader
     log_dir: Path
-    lr_schedule: optax.Schedule
     model: eqx.Module
     losses: list
     step: int
@@ -70,6 +70,7 @@ class Trainer:
         training_dl: CachedBasinGraphDataLoader = None,
         validation_dl: CachedBasinGraphDataLoader = None,
         *,
+        model: models.BaseModel | None = None,
         log_dir: Path | None = None,
         checkpoint: dict | None = None,
     ):
@@ -95,8 +96,6 @@ class Trainer:
         self.training_dl = training_dl
         self.validation_dl = validation_dl
 
-        self.lr_schedule = _create_lr_schedule(cfg)
-        self.log_dir = self._setup_logging(log_dir)
         self.train_key = jax.random.PRNGKey(cfg.model_args.seed)
 
         if checkpoint:
@@ -108,15 +107,22 @@ class Trainer:
             self.opt_state = checkpoint["opt_state"]
             self.early_stopper = checkpoint["early_stopper"]
         else:
+            if model is not None:
+                self.model = model
+            else:
+                self.cfg, self.model = models.make(cfg, training_dl)
+
             self.step = 0
             self.losses = []
-            self.cfg, self.model = models.make(cfg, training_dl)
-            self.optim = optax.adam(self.lr_schedule)
+            self.optim = create_optimizer(cfg)
             self.opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
             if cfg.early_stop_kwargs is not None:
                 self.early_stopper = EarlyStopper(**cfg.early_stop_kwargs.model_dump())
             else:
                 self.early_stopper = None
+
+        # Setup logging towards the end so the modified cfg is saved.
+        self.log_dir = self._setup_logging(log_dir)
 
         # Initialize the filterspec. Defaults to training all components of the model.
         self.freeze_components([])
@@ -177,6 +183,23 @@ class Trainer:
                     self.logger.removeHandler(handler)
         self.logger = None
 
+    def new_logger(self, new_log_dir: Path):
+        # Copy the old log into the new file
+        old_log_file = self.log_dir / "training.log"
+        if old_log_file and old_log_file.exists():
+            new_log_dir.mkdir(parents=True, exist_ok=True)
+            new_log_file = new_log_dir / "training.log"
+            shutil.copy(old_log_file, new_log_file)
+
+        self._cleanup_logger()
+        self.log_dir = self._setup_logging(new_log_dir)
+
+    def replace_model(self, model: models.BaseModel):
+        self.model = model
+        # Now recreate the optimizer and opt states
+        self.optim = create_optimizer(self.cfg)
+        self.opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
+
     def start_training(self, stop_at=np.inf):
         """Starts or continues training the model.
 
@@ -197,7 +220,7 @@ class Trainer:
             raise ValueError("Trainer was created without training dataloader.")
 
         max_steps = min(self.cfg.max_training_steps, stop_at)
-        max_hours = self.cfg.max_training_hours
+        max_hours = self.cfg.max_training_hours if self.cfg.max_training_hours else np.inf
 
         self.logger.info(f"~~~ Starting training ({max_steps=}, {max_hours=}) ~~~")
         start_time = time.time()
@@ -211,7 +234,7 @@ class Trainer:
 
         # Logging intervals and states
         log_steps = self.cfg.log_every_n_steps
-        log_minutes = self.cfg.log_every_n_minutes
+        log_minutes = self.cfg.log_every_n_minutes if self.cfg.log_every_n_minutes else np.inf
         last_log_step = self.step
         last_log_time = time.time()
 
@@ -224,11 +247,22 @@ class Trainer:
             pbar.update(1)
 
             # Validation
-            if self.step % self.cfg.validate_every_n_steps == 0:
+            val_steps = self.cfg.validate_every_n_steps
+            if val_steps and (self.step % val_steps == 0):
                 v_loss = self.get_validation_loss()
                 if v_loss and self.early_stopper and self.early_stopper(v_loss):
                     self.logger.info("Training stopped by EarlyStopper.")
                     break
+
+            # log if EITHER step or time condition is met, then reset both trackers=
+            time_since_log_min = (time.time() - last_log_time) / 60.0
+            log_by_time = time_since_log_min >= log_minutes
+            log_by_step = (self.step - last_log_step) >= log_steps
+            if log_by_time or log_by_step:
+                self.check_grads(grads)
+                self.save_state()
+                last_log_step = self.step
+                last_log_time = time.time()
 
             # Check stopping conditions
             if self.step >= self.cfg.max_training_steps:
@@ -239,18 +273,9 @@ class Trainer:
                 self.logger.info("Max training hours reached.")
                 break
 
-            # log if EITHER step or time condition is met, then reset both trackers=
-            time_since_log_min = (time.time() - last_log_time) / 60.0
-            log_by_time = time_since_log_min >= log_minutes
-            log_by_step = (self.step - last_log_step) >= log_steps
+        if len(self.checkpoint_losses) > 0:
+            self.save_state()  # Final save
 
-            if log_by_time or log_by_step:
-                self.check_grads(grads)
-                self.save_state()
-                last_log_step = self.step
-                last_log_time = time.time()
-
-        self.save_state()  # Final save
         self.logger.info("~~~ Training done ~~~")
         self._cleanup_logger()
 
@@ -315,7 +340,6 @@ class Trainer:
     def get_validation_loss(self) -> float:
         # Set model and dataloader for inference
         self.model = eqx.nn.inference_mode(self.model, True)
-        batch_keys = jax.random.split(self.train_key, self.cfg.batch_size)
         losses = []
         pbar = tqdm(
             self.validation_dl, disable=self.cfg.quiet, desc=f"Validating Step:{self.step:06d}"
@@ -323,8 +347,9 @@ class Trainer:
         for _, _, batch in pbar:
             loss = compute_loss(
                 self.model,
+                None,
                 batch,
-                batch_keys,
+                self.train_key,
                 **self.cfg.step_kwargs.model_dump(),
             )
             losses.append(loss)
@@ -381,8 +406,8 @@ class Trainer:
         if not self.cfg.log:
             return
         if save_dir is None:
-            save_dir = self.log_dir / f"step_{self.step:06d}"
-        os.makedirs(save_dir, exist_ok=True)
+            save_dir = self.log_dir / "checkpoints" / f"step_{self.step:06d}"
+        save_dir.mkdir(parents=True, exist_ok=True)
 
         self.logger.info(
             f"Saving model checkpoint at step {self.step:06d}. "
@@ -392,8 +417,10 @@ class Trainer:
         self.losses.extend(self.checkpoint_losses)
         self.checkpoint_losses = []
 
-        with open(save_dir / "model_and_opt.eqx", "wb") as f:
+        with open(save_dir / "model.eqx", "wb") as f:
             eqx.tree_serialise_leaves(f, self.model)
+
+        with open(save_dir / "opt.eqx", "wb") as f:
             eqx.tree_serialise_leaves(f, self.opt_state)
 
         with open(save_dir / "trainer_state.json", "w") as f:
@@ -407,10 +434,10 @@ class Trainer:
     @classmethod
     def load_checkpoint(cls, checkpoint_dir: Path):
         """Loads the trainer state from a checkpoint directory and returns a new Trainer instance."""
+        print(f"Loading model from {checkpoint_dir}")
 
         # --- Load Config ---
         cfg = Config.from_file(checkpoint_dir / "config.json")
-        lr_schedule = _create_lr_schedule(cfg)
 
         # --- Load Trainer State (JSON) ---
         with open(checkpoint_dir / "trainer_state.json", "r") as f:
@@ -426,27 +453,41 @@ class Trainer:
             early_stopper = None
 
         # --- Load Model and Optimizer State ---
-        with open(checkpoint_dir / "model_and_opt.eqx", "rb") as f:
+        with open(checkpoint_dir / "model.eqx", "rb") as f:
             _, serialized_model = models.make(cfg)
 
-            # Ensure all leaves are jnp float 32s.
-            # Bandaid for some poorly specified graph adjacency matrices
-            serialized_model = jax.tree_util.tree_map(
-                lambda x: (jnp.array(x) if isinstance(x, np.ndarray) else x),
-                serialized_model,
-            )
+            # print(f"{'&'*20} load checkpoint {'&'*20}")
+            # print(f"{'&'*20} load checkpoint {'&'*20}")
+            # print(f"{'+'*20} model {'+'*20}")
+            # print(serialized_model)
+
             model = eqx.tree_deserialise_leaves(f, serialized_model)
 
-            optim = optax.adam(lr_schedule(step))
-            serialized_opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
-            opt_state = eqx.tree_deserialise_leaves(f, serialized_opt_state)
+        try:
+            with open(checkpoint_dir / "opt.eqx", "rb") as f:
+                optim = create_optimizer(cfg)
+                serialized_opt_state = optim.init(eqx.filter(model, eqx.is_inexact_array))
+
+                # print(f"{'+'*20} opt state {'+'*20}")
+                # print(serialized_opt_state)
+                # print(f"{'&'*20} load checkpoint {'&'*20}")
+                # print(f"{'&'*20} load checkpoint {'&'*20}")
+
+                opt_state = eqx.tree_deserialise_leaves(f, serialized_opt_state)
+        except:
+            opt_state = serialized_opt_state
+            print(f"{'!=' * 20} WARNING {'!=' * 20}")
+            print(f"{'!=' * 20} WARNING {'!=' * 20}")
+            print("Failed to deserialize optimizer state. Continuing with new opt state")
+            print(f"{'!=' * 20} WARNING {'!=' * 20}")
+            print(f"{'!=' * 20} WARNING {'!=' * 20}")
 
         # --- Create and Populate New Trainer Instance ---
         print(f"Loading trainer from checkpoint {checkpoint_dir.stem}")
         # Call class constructor with loaded/recreated components
         trainer = cls(
             cfg=cfg,
-            log_dir=checkpoint_dir.parent,
+            log_dir=checkpoint_dir.parents[1],
             checkpoint={
                 "step": step,
                 "losses": losses,
@@ -461,14 +502,16 @@ class Trainer:
 
     @classmethod
     def load_last_checkpoint(cls, log_dir: Path):
-        # --- CHANGE: Regex now looks for 'step_...' directories ---
         step_regex = re.compile(r"step_(\d+)")
-        dirs = [d for d in os.listdir(log_dir) if os.path.isdir(log_dir / d)]
-        matches = [step_regex.match(d) for d in dirs]
-        step_strs = [m.group(1) for m in matches if isinstance(m, re.Match)]
+        step_strs = [
+            match.group(1)
+            for d in (log_dir / "checkpoints").iterdir()
+            if d.is_dir() and (match := step_regex.match(d.stem))
+        ]
+
         if step_strs:
             last_step_idx = np.argmax([int(s) for s in step_strs])
-            checkpoint_dir = log_dir / f"step_{step_strs[last_step_idx]}"
+            checkpoint_dir = log_dir / "checkpoints" / f"step_{step_strs[last_step_idx]}"
             return cls.load_checkpoint(checkpoint_dir)
         else:
             config_path = log_dir / "config.json"
@@ -479,12 +522,108 @@ class Trainer:
             else:
                 raise FileNotFoundError(f"No checkpoints or config.json found in {log_dir}")
 
+    @classmethod
+    def load_from_run_or_state(cls, run_or_state_dir: Path):
+        """If passed a specific state dir, loads that, otherwise loads the latest checkpoint in the dir."""
+        is_state_dir = (run_or_state_dir / "model.eqx").is_file()
+        if is_state_dir:
+            trainer = cls.load_checkpoint(run_or_state_dir)
+        else:
+            trainer = cls.load_last_checkpoint(run_or_state_dir)
 
-def _create_lr_schedule(cfg: Config):
-    """Helper to create LR schedule from config based on total training steps."""
-    return optax.exponential_decay(
-        cfg.initial_lr,
-        cfg.max_training_steps,  # Total steps for the decay
-        cfg.decay_rate,
-        cfg.transition_begin,
+        return trainer
+
+
+@eqx.filter_jit
+def make_step(
+    model: models.BaseModel,
+    data: GraphBatch,
+    key: PRNGKeyArray,
+    opt_state: PyTree,
+    optim: optax.GradientTransformation,
+    filter_spec: PyTree,
+    **kwargs,
+) -> tuple[float, PyTree, eqx.Module, PyTree]:
+    """Performs a single optimization step, updating the model parameters.
+
+    Parameters
+    ----------
+    model: eqx.Module
+        Equinox model to train. Must take in a dict of data and PRNGKey.
+    data: GraphBatch
+        The batch of training data.
+    keys: list[PRNGKeyArray]
+        The PRNG keys for this batch, used by the model for dropout regularization.
+    opt_state: PyTree
+    optim: Callable
+    filter_spec: PyTree
+        The filter specification. True values indicate which parameters will be updated.
+    max_grad_norm: float, optional
+        The maximum gradient norm.
+
+    Returns
+    -------
+    loss: float
+        The loss value.
+    grads: PyTree
+        The update gradients.
+    model: eqx.Module
+        The updated model.
+    opt_state: PyTree
+        The updated optimizer state.
+    """
+    diff_model, static_model = eqx.partition(model, filter_spec)
+    loss_fn_with_grad = eqx.filter_value_and_grad(compute_loss)
+    loss, grads = loss_fn_with_grad(diff_model, static_model, data, key, **kwargs)
+
+    updates, opt_state = optim.update(grads, opt_state, params=model)
+    model = eqx.apply_updates(model, updates)
+    return loss, grads, model, opt_state
+
+
+def create_lr_schedule(cfg: Config):
+    """ "
+    Creates an LR schedule.
+
+    Exposed here so that I can easily generate and visualize LR outside the trainer.
+    """
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=cfg.initial_lr * 0.01,
+        peak_value=cfg.initial_lr,
+        warmup_steps=cfg.warmup_steps,
+        decay_steps=cfg.max_training_steps - cfg.warmup_steps,
+        end_value=cfg.final_lr,
     )
+    return schedule
+
+
+def create_optimizer(cfg: Config):
+    """
+    Creates a robust optimizer with gradient clipping, warmup, and decay.
+
+    Parameters
+    ----------
+    cfg : Config
+        Configuration object with optimizer parameters
+
+    Returns
+    -------
+    optax.GradientTransformation
+        Composed optimizer with all transformations
+    """
+    gradient_transforms = []
+
+    if cfg.max_grad_norm is not None:
+        norm_clipper = optax.clip_by_global_norm(cfg.max_grad_norm)
+        gradient_transforms.append(norm_clipper)
+
+    schedule = create_lr_schedule(cfg)
+
+    if cfg.optimizer_name == "adamw":
+        optimizer = optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay)
+    else:
+        optimizer = optax.adam(learning_rate=schedule)
+    gradient_transforms.append(optimizer)
+
+    # Chain the transformations together
+    return optax.chain(*gradient_transforms)

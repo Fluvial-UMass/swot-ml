@@ -1,20 +1,22 @@
-from pathlib import Path
-from typing import Literal, Any
-from enum import Enum
-import yaml
 import functools
+import json
 import warnings
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, Literal
 
 import numpy as np
-import json
+import yaml
 from pydantic import (
     BaseModel,
     Field,
-    model_validator,
     field_validator,
+    model_validator,
 )
 from pydantic.types import DirectoryPath, FilePath
-from datetime import datetime
+
+from .add_assimilator import AssimConfig
 
 # Import model argument classes from model_args.py
 from .model_args import ModelArgs
@@ -34,8 +36,6 @@ class Encoding(BaseModel):
 class StepKwargs(BaseModel):
     loss_name: Literal["mse", "mae", "huber", "nse", "spin_up_nse", "gmm_nll"] = "mse"
     target_weights: dict[str, float] = None
-    max_grad_norm: float | None = None
-    agreement_weight: float = 0.0
 
     @model_validator(mode="before")
     @classmethod
@@ -79,11 +79,11 @@ class DataSubset(str, Enum):
 
 
 class Config(BaseModel):
-    def to_json(self, path: str | Path, exclude_none: bool = True, exclude_unset: bool = True):
+    def to_json(self, path: str | Path, exclude_none: bool = True):
         """Dump the config to a JSON file."""
         cfg_out = self.model_copy(deep=True)
         json_str = cfg_out.model_dump_json(
-            indent=4, exclude_none=exclude_none, exclude_unset=exclude_unset
+            indent=4, exclude_none=exclude_none, exclude_unset=False, exclude={"cfg_path"}
         )
         with open(path, "w") as f:
             f.write(json_str)
@@ -161,16 +161,19 @@ class Config(BaseModel):
 
     # Trainer
     max_training_steps: int = Field(..., gt=0)  # Required
-    max_training_hours: int = Field(np.inf, gt=0)
-    log_every_n_steps: int = Field(np.inf, gt=0)
-    log_every_n_minutes: int = Field(np.inf, gt=0)
+    max_training_hours: int | None = Field(None, gt=0)
+    log_every_n_steps: int = Field(..., gt=0)
+    log_every_n_minutes: int | None = Field(None, gt=0)
+    validate_every_n_steps: int | None = Field(None, gt=0)
 
-    validate_every_n_steps: int = Field(np.inf, gt=0)
+    warmup_steps: int = Field(0, ge=0)
     initial_lr: float = Field(..., gt=0, lt=1.0)
-    decay_rate: float = Field(..., gt=0, lt=1.0)
-    transition_begin: int = Field(0, ge=0)
+    final_lr: float = Field(..., gt=0.0, lt=1.0)
+    max_grad_norm: float | None = None
     step_kwargs: StepKwargs
     early_stop_kwargs: EarlyStopKwargs = None
+    optimizer_name: Literal["adam", "adamw"] = "adam"
+    weight_decay: float = Field(0.00001, gt=0.0, lt=1.0)
 
     # Meta
     parameter_search_grid: dict = Field(default_factory=dict)
@@ -189,7 +192,9 @@ class Config(BaseModel):
         def resolve_path(attr_str):
             str_path = values.get(attr_str)
             if str_path:
-                return Path(str_path).resolve()
+                path = Path(str_path)
+                # If already absolute, use as-is; otherwise resolve
+                return path if path.is_absolute() else path.resolve()
             else:
                 return None
 
@@ -299,12 +304,7 @@ class Config(BaseModel):
     @field_validator("step_kwargs", mode="after")
     def validate_step_kwargs(cls, v: StepKwargs, info):
         cfg = info.data  # Access the entire config data
-        if v.agreement_weight != 0:
-            required_targets = {"ssc", "flux", "usgs_q"}
-            if not required_targets.issubset(set(cfg["features"].target)):
-                raise ValueError(
-                    "Must predict at least ssc, flux, and usgs_q when using flux agreement regularization."
-                )
+
         # Convert target_weights dict to list based on features.target order
         if v.target_weights is None:
             v.target_weights = {}
@@ -319,6 +319,23 @@ class Config(BaseModel):
         return v
 
     # CONFIG MANIPULATION
+    def add_assimilation(self, assim: AssimConfig):
+        """
+        Inserts new feature groups, encodings, time gaps, etc. based on the assimilation target
+        """
+        self.features.dynamic.update(assim.new_features)
+        self.dynamic_encoding.categorical.update(assim.categorical_encoding)
+        self.dynamic_encoding.bitmask.update(assim.bitmask_encoding)
+        for new_group in assim.new_features.keys():
+            self.time_gaps[new_group] = True
+
+        self.model_args.assim_sizes.update(assim.model_args)
+
+        self.max_training_steps += assim.additional_steps
+        self.max_training_hours = (
+            assim.additional_hours
+        )  # Hours do not accumulate from saved states.
+
     def rgetattr(self, attr: str, *args):
         """
         Recursively get attribute from the instance using dot notation.

@@ -11,6 +11,7 @@ dependencies = [
     "deltalake>=1.1.4",
     "equinox>=0.12.2",
     "geopandas>=1.1.0",
+    "global-gauges",
     "h5netcdf>=1.6.4",
     "h5py>=3.14.0",
     "jax[cuda12]<0.6.0",
@@ -33,6 +34,9 @@ dependencies = [
 
 [tool.uv]
 package = true
+
+[tool.uv.sources]
+global-gauges = { path = "../global_gauges" }
 
 [tool.ruff]
 exclude = [

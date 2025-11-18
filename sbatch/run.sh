@@ -17,13 +17,13 @@ method="${python_args[0]}"
 path_arg="${python_args[1]}"
 
 case "$method" in
-    train|train_ensemble|grid_search|smac_optimize)
+    train|train-ensemble|grid_search|smac-optimize)
         if [[ ! -f "$path_arg" ]]; then
             echo "Error: Expected a file path for '$method', but got: $path_arg"
             exit 1
         fi
         ;;
-    test|predict|attribute)
+    test|predict|attribute|add-assimilator)
         if [[ ! -d "$path_arg" ]]; then
             echo "Error: Expected a directory path for '$method', but got: $path_arg"
             exit 1
@@ -107,9 +107,9 @@ mkdir -p "$output_dir"
 sbatch_script=$(mktemp)
 cat << EOF > "$sbatch_script"
 #!/bin/bash
-#SBATCH --job-name="${experiment_name}_${config_name}"
+#SBATCH --job-name="${method}_${experiment_name}_${config_name}"
 #SBATCH --mem=64G  # Requested Memory
-#SBATCH -o ${output_dir}/${config_name}.out
+#SBATCH -o ${output_dir}/${config_name}_%j.out
 $(echo -e "$SBATCH_DIRECTIVES")
 
 source .venv/bin/activate

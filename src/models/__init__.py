@@ -1,21 +1,19 @@
-import jax
 import equinox as eqx
+import jax
 
 from config import Config
 from config.model_args import (
+    MSAttnArgs,
     SeqAttnArgs,
     StackArgs,
-    MSAttnArgs,
     STGATArgs,
 )
-from data import CachedBasinGraphDataset, CachedBasinGraphDataLoader
-
+from data import CachedBasinGraphDataLoader, CachedBasinGraphDataset
 from models.base_model import BaseModel
-from models.lstm_mlp_attn import LSTM_MLP_ATTN
-from models.stacked_lstm import STACKED_LSTM
-from models.ms_attention import MS_ATTN
 from models.graph_transformer import ST_GATransformer
-
+from models.lstm_mlp_attn import LSTM_MLP_ATTN
+from models.ms_attention import MS_ATTN
+from models.stacked_lstm import STACKED_LSTM
 
 # Dictionary of valid model names and their constructors
 MODEL_MAP = {

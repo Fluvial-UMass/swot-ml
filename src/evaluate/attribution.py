@@ -1,11 +1,12 @@
-import pandas as pd
-import numpy as np
+import pickle
+import warnings
+
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
-import pickle
+import numpy as np
+import pandas as pd
 from tqdm.auto import tqdm
-import warnings
 
 from config import Config
 

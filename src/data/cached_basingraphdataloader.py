@@ -1,21 +1,22 @@
-from collections import deque, defaultdict
-from functools import partial
 import random
+from collections import defaultdict, deque
+from functools import partial
 from typing import Iterator
 
-import numpy as np
 import jax
-from jaxtyping import Array
+import numpy as np
 import torch
-from torch.utils.data import Sampler, DataLoader
+from jaxtyping import Array
+from torch.utils.data import DataLoader, Sampler
 
 from config.config import Config
-from .cached_basingraphdataset import GraphBatch, CachedBasinGraphDataset
+
+from .cached_basingraphdataset import CachedBasinGraphDataset, GraphBatch
 
 
 class GraphPackingSampler(Sampler[list[int]]):
     """
-    An infinite sampler that intelligently packs graphs to a target node count.
+    A sampler that intelligently packs graphs to a target node count.
 
     This sampler continuously yields batches and re-shuffles the data
     when one pass is complete. It uses a "best-fit" heuristic to fill batches,
@@ -27,16 +28,14 @@ class GraphPackingSampler(Sampler[list[int]]):
         basin_index_map: dict[str, list[int]],
         basin_node_counts: dict[str, int],
         target_nodes_per_batch: int,
-        shuffle: bool,
         candidate_pool_size: int,
-        infinite_sampling: bool,
+        infinite_shuffle: bool,
     ):
         self.basin_index_map = basin_index_map
         self.basin_node_counts = basin_node_counts
         self.target_nodes = target_nodes_per_batch
-        self.shuffle = shuffle
         self.candidate_pool_size = candidate_pool_size
-        self.infinite_sampling = infinite_sampling
+        self.infinite_shuffle = infinite_shuffle
 
         # Ensure there is room for at least one padding node per batch.
         # Otherwise, the padded edges will have to point at real nodes, which even if
@@ -68,19 +67,14 @@ class GraphPackingSampler(Sampler[list[int]]):
     def __len__(self) -> int:
         # This sampler is infinite, so __len__ is not well-defined.
         # Returning a very large number can help with some utilities, but it's not strictly necessary.
-        if self.infinite_sampling:
-            return int(1e12)
-        else:
-            return self.estimated_len
+        return int(1e12) if self.infinite_shuffle else self.estimated_len
 
     def __iter__(self) -> Iterator[list[int]]:
-        """
-        Yields batches indefinitely.
-        """
-        # --- CHANGE: Main loop is now wrapped in `while True` to make the iterator infinite ---
+        # Yields a list of basin/date indices that will make up a batch
         while True:
+            # Runs indefinitely if self.infinite_shuffle is true.
             samples_for_epoch = self.samples[:]
-            if self.shuffle:
+            if self.infinite_shuffle:
                 random.shuffle(samples_for_epoch)
 
             samples_deque = deque(samples_for_epoch)
@@ -115,7 +109,7 @@ class GraphPackingSampler(Sampler[list[int]]):
 
                 yield current_batch_indices
 
-            if not self.infinite_sampling:
+            if not self.infinite_shuffle:
                 break
 
 
@@ -208,20 +202,20 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
 
 
 class CachedBasinGraphDataLoader(DataLoader):
-    def __init__(self, cfg: Config, dataset: CachedBasinGraphDataset):
+    def __init__(
+        self, cfg: Config, dataset: CachedBasinGraphDataset, infinite_shuffle: bool = True
+    ):
         torch.manual_seed(cfg.model_args.seed)
 
         collate_fn = partial(padding_collate_fn, target_nodes_per_batch=cfg.target_nodes_per_batch)
-        is_training = dataset.data_subset == "train"
         basin_subbasin_counts = {k: len(v) for k, v in dataset.basin_subbasin_map.items()}
 
         batch_sampler = GraphPackingSampler(
             dataset.basin_index_map,
             basin_subbasin_counts,
             cfg.target_nodes_per_batch,
-            cfg.shuffle,
             cfg.candidate_pool_size,
-            infinite_sampling=is_training,
+            infinite_shuffle,
         )
 
         threading = cfg.num_workers > 0
@@ -241,8 +235,11 @@ class CachedBasinGraphDataLoader(DataLoader):
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 
     # Expose these dataset methods for convenience.
-    def denormalize(self, x: Array, name: str, scale_only:bool=False):
-        return self.dataset.denormalize(x, name, scale_only)
+    def denormalize(self, x: Array, name: str):
+        return self.dataset.denormalize(x, name)
+
+    def denormalize_std(self, mu_norm: Array, sigma_norm: Array, name: str):
+        return self.dataset.denormalize_std(mu_norm, sigma_norm, name)
 
     def denormalize_target(self, y_normalized: Array):
         return self.dataset.denormalize_target(y_normalized)

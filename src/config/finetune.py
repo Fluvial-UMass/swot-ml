@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field
 import yaml
+from pydantic import BaseModel, Field
 
 
 class FinetuneConfig(BaseModel):

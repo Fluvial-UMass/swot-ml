@@ -5,6 +5,7 @@ import jax.random as jrandom
 from jaxtyping import PRNGKeyArray
 
 from data import GraphBatch
+
 from .base_model import BaseModel
 from .layers.transformer import CrossAttnDecoder
 

@@ -1,8 +1,8 @@
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, PRNGKeyArray
 import jax.random as jrandom
+from jaxtyping import Array, PRNGKeyArray
 
 
 class StaticContextHeadBias(eqx.Module):

@@ -1,6 +1,6 @@
 from .basindatalake import BasinDataLake
-from .cached_basingraphdataset import GraphBatch, DynamicCacheManager, CachedBasinGraphDataset
 from .cached_basingraphdataloader import CachedBasinGraphDataLoader
+from .cached_basingraphdataset import CachedBasinGraphDataset, DynamicCacheManager, GraphBatch
 
 __all__ = [
     GraphBatch,

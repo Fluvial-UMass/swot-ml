@@ -1,23 +1,23 @@
-import warnings
-import json
-import hashlib
 import copy
-from typing import NamedTuple
-from pathlib import Path
+import hashlib
+import json
+import warnings
 from collections import defaultdict
+from pathlib import Path
+from typing import NamedTuple
 
-from tqdm import tqdm
-import pandas as pd
-import xarray as xr
-import dask.dataframe as dd
 import dask.array as da
-import zarr
+import dask.dataframe as dd
+import jax.numpy as jnp
 import networkx as nx
 import numpy as np
-import jax.numpy as jnp
+import pandas as pd
+import xarray as xr
+import zarr
 from jax.tree import map as jt_map
-from torch.utils.data import Dataset
 from jaxtyping import Array
+from torch.utils.data import Dataset
+from tqdm import tqdm
 
 from config import Config, DataSubset, Features
 
@@ -69,7 +69,7 @@ def get_train_ds_stats(cfg: Config, *, dynamic: bool = True, static: bool = True
 
 
 def _get_prescribed_encoding(encoding):
-    new_cols = []
+    new_cols = {}
     # Handle categorical columns
     if encoding["categorical"]:
         for col, categories in encoding["categorical"].items():
@@ -78,7 +78,7 @@ def _get_prescribed_encoding(encoding):
                     f"Dynamic categorical variable '{col}' must either be excluded or have "
                     "its categories prescribed in the config."
                 )
-            new_cols.extend([f"{col}_{cat}" for cat in categories])
+            new_cols[col] = [f"{col}_{cat}" for cat in categories]
     # Handle bitmask columns
     if encoding["bitmask"]:
         for col, bits in encoding["bitmask"].items():
@@ -87,7 +87,7 @@ def _get_prescribed_encoding(encoding):
                     f"Dynamic bitmask variable '{col}' must either be excluded or have "
                     "its bits prescribed in the config."
                 )
-            new_cols.extend([f"{col}_bit_{bit}" for bit in bits])
+            new_cols[col] = [f"{col}_bit_{bit}" for bit in bits]
 
     encoding["encoded_columns"] = new_cols
     return encoding
@@ -156,14 +156,13 @@ def _get_scale_from_precomp_stats(cfg: Config, basins: list[str], encoding: dict
 
 
 def _get_static_encoding(df: pd.DataFrame, encoding: dict):
-    old_cols = []
-    new_cols = []
+    new_cols = {}
     # Handle categorical columns
     for col, categories in encoding["categorical"].items():
         if not categories:
             categories = df[col].astype("category").unique()
-        new_cols.extend([f"{col}_{cat}" for cat in categories])
-        old_cols.append(col)
+            encoding["categorical"][col] = categories  # Add inferred categories to encoding
+        new_cols[col] = [f"{col}_{cat}" for cat in categories]
     # Handle bitmask columns
     for col, bits in encoding["bitmask"].items():
         if not bits:
@@ -172,11 +171,11 @@ def _get_static_encoding(df: pd.DataFrame, encoding: dict):
             nbits = int(np.ceil(np.log2(max_val + 1))) if max_val > 0 else 0
             # Check which bits are active across the dataset
             bits = [n for n in range(nbits) if ((bit_data // 2**n) % 2).any()]
-        new_cols.extend([f"{col}_bit_{bit}" for bit in bits])
-        old_cols.append(col)
+            encoding["bitmask"][col] = bits  # Add inferred bits to encoding
+        new_cols[col] = [f"{col}_bit_{bit}" for bit in bits]
 
     encoding["encoded_columns"] = new_cols
-    encoding["removed_columns"] = old_cols
+    encoding["removed_columns"] = list(new_cols.keys())
     return encoding
 
 
@@ -184,14 +183,14 @@ def _calculate_scale_from_data(cfg: Config, df: pd.DataFrame, encoding: dict):
     """
     Calculate normalization directly from dataset values.
     """
-    new_cols = set(encoding["encoded_columns"])
-    old_cols = set(encoding["removed_columns"])
-    all_cols = set(df.columns).union(new_cols) - old_cols
+    encoded_cols = set([c for cl in encoding["encoded_columns"] for c in cl])
+    removed_cols = set(encoding["removed_columns"])
+    all_cols = set(df.columns).union(encoded_cols) - removed_cols
     scale = {
         k: {"encoded": False, "log_norm": False, "offset": 0.0, "scale": 1.0} for k in all_cols
     }
     for var in all_cols:
-        if var in new_cols:
+        if var in encoded_cols:
             scale[var]["encoded"] = True
             continue
         if var in cfg.log_norm_cols:
@@ -211,8 +210,8 @@ def _calculate_scale_from_data(cfg: Config, df: pd.DataFrame, encoding: dict):
     return scale
 
 
-# TODO Allow different sets of features, but check what is already in cache and append as needed. 
-# Each var is normalized separately, so there is no conflict with extra vars. 
+# TODO Allow different sets of features, but check what is already in cache and append as needed.
+# Each var is normalized separately, so there is no conflict with extra vars.
 def config_hash(cfg: Config) -> str:
     """Return a unique hash based on a subset of fields from a Pydantic config object."""
     fields_to_hash = [
@@ -247,7 +246,7 @@ def config_hash(cfg: Config) -> str:
 class DynamicCacheManager:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.cache_dir = cfg.zarr_dir / "_cache" / config_hash(cfg)
+        self.cache_dir = cfg.zarr_dir / "_cache2" / config_hash(cfg)
         self.train_stats = None  # lazy
         print(f"Caches will be stored at: {self.cache_dir}/<subset>")
 
@@ -448,9 +447,11 @@ def _encode_data(ds: xr.Dataset, feat_group: str, features: Features, encoding: 
 def _one_hot_encoding(
     ds: xr.Dataset, feat_group: str, features: Features, cat_enc: dict[str, list[str]]
 ):
-    for col, prescribed in cat_enc.items():
+    for col, prescribed_cats in cat_enc.items():
         if col not in ds.data_vars:
             continue
+
+        prescribed_cols = [f"{col}_{cat}" for cat in prescribed_cats]
 
         # Convert to a lazy Dask DataFrame
         ddf = ds[[col]].to_dask_dataframe(set_index=True).categorize(columns=[col])
@@ -458,12 +459,12 @@ def _one_hot_encoding(
         encoded_ddf = dd.get_dummies(ddf, prefix=col, columns=[col])
 
         # Add missing prescribed columns
-        for c in prescribed:
+        for c in prescribed_cols:
             if c not in encoded_ddf.columns:
                 encoded_ddf[c] = 0
 
         # Ensure order and presence of prescribed columns
-        encoded_ddf = encoded_ddf[prescribed]
+        encoded_ddf = encoded_ddf[prescribed_cols]
 
         # Convert the lazy Dask DataFrame back to a lazy xarray.Dataset
         encoded_ds = xr.Dataset.from_dataframe(encoded_ddf)
@@ -473,6 +474,7 @@ def _one_hot_encoding(
 
         # Update the feature dicts (logic remains the same)
         encoded_columns = list(encoded_ds.data_vars)
+        # print(f"OHE: Removing {col}, adding {encoded_columns}")
         if feat_group == "dynamic":
             # Loop through the sources
             for src, columns in features.dynamic.items():
@@ -515,6 +517,7 @@ def _bitmask_expansion(
 
         # Update the feature dicts (logic remains the same)
         encoded_columns = list(encoded_ds.data_vars)
+        # print(f"BME: Removing {col}, adding {encoded_columns}")
         if feat_group == "dynamic":
             # Loop through the sources
             for src, columns in features.dynamic.items():
@@ -571,6 +574,7 @@ class CachedBasinGraphDataset(Dataset):
         self.s_scale = train_stats["s_scale"]
         self.d_encoding = train_stats["d_encoding"]
         self.d_scale = train_stats["d_scale"]
+        self._update_encoded_features()
 
         self.x_s, self.basin_subbasin_map = self._load_attributes()
         self.graphs = self._load_basin_graphs()
@@ -596,6 +600,19 @@ class CachedBasinGraphDataset(Dataset):
         Returns the number of valid sequences in the dataset.
         """
         return len(self.sample_list)
+
+    def _update_encoded_features(self):
+        for old_col, new_cols in self.d_encoding["encoded_columns"].items():
+            # Have to comb through the sources
+            for source, source_cols in self.features.dynamic.items():
+                if old_col in source_cols:
+                    self.features.dynamic[source].remove(old_col)
+                    self.features.dynamic[source].extend(new_cols)
+                    break
+
+        # for old_col, new_cols in self.s_encoding['encoded_columns'].items():
+        #     self.features.static.remove(old_col)
+        #     self.features.static.extend(new_cols)
 
     def _load_basin_graphs(self) -> dict[str, np.ndarray]:
         """Loads all basin-specific graphs."""
@@ -770,7 +787,7 @@ class CachedBasinGraphDataset(Dataset):
 
         return basin, end_date, sample
 
-    def denormalize(self, x: Array, name: str, scale_only = False) -> Array:
+    def denormalize(self, x: Array, name: str) -> Array:
         """
         Denormalizes a feature or target by its name.
 
@@ -785,13 +802,31 @@ class CachedBasinGraphDataset(Dataset):
         scale = self.d_scale[name]["scale"]
         log_norm = self.d_scale[name]["log_norm"]
 
-        if scale_only:
-            offset = 0
-
         if log_norm:
             return np.exp(x + offset) - _LOG_PAD
         else:
             return x * scale + offset
+
+    def denormalize_std(self, mu_normalized: Array, sigma_normalized: Array, name: str) -> Array:
+        """
+        Denormalizes standard deviation. For log-normal, requires both mu and sigma.
+        """
+        offset = self.d_scale[name]["offset"]
+        log_norm = self.d_scale[name]["log_norm"]
+
+        if log_norm:
+            # mu and sigma are in log-space (normalized)
+            mu_log = mu_normalized + offset
+            sigma_log = sigma_normalized
+
+            # Log-normal variance in original space
+            # https://en.wikipedia.org/wiki/Log-normal_distribution
+            var_original = (np.exp(sigma_log**2) - 1) * np.exp(2 * mu_log + sigma_log**2)
+            return np.sqrt(var_original)
+        else:
+            # Z-score and range-norm case
+            scale = self.d_scale[name]["scale"]
+            return sigma_normalized * scale
 
     def denormalize_targets(self, y_normalized: dict[str, Array]) -> dict[str, Array]:
         """
@@ -802,5 +837,21 @@ class CachedBasinGraphDataset(Dataset):
         y_denorm = {}
         for t_name, t_norm in y_normalized.items():
             y_denorm[t_name] = self.denormalize(t_norm, name=t_name)
-        
+
         return y_denorm
+
+    def normalize(self, x: Array, name: str) -> Array:
+        offset = self.d_scale[name]["offset"]
+        scale = self.d_scale[name]["scale"]
+        log_norm = self.d_scale[name]["log_norm"]
+        encoded = self.d_scale[name]["encoded"]
+
+        if encoded:
+            raise ValueError(f"Cannot normalize an encoded column: {name}")
+
+        if log_norm:
+            return np.log(x + _LOG_PAD) - offset
+        elif scale == 0:
+            return (x - offset) / scale
+        else:
+            return x - offset

@@ -1,10 +1,11 @@
-from pathlib import Path
 import pickle
+from pathlib import Path
+
+import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import matplotlib.colors as mcolors
 
 
 def mosaic_scatter(results: pd.DataFrame, metrics: pd.DataFrame, title: str):

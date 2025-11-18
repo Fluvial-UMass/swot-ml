@@ -1,7 +1,6 @@
 import equinox as eqx
-from jaxtyping import Array, PRNGKeyArray
-
 import jax.random as jrandom
+from jaxtyping import Array, PRNGKeyArray
 
 # from .gates import GatedResidualNetwork
 

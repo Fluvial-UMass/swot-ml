@@ -1,2 +1,4 @@
-from .trainer import Trainer as Trainer
-from .bayesian_search import update_smac_config, manual_smac_optimize
+from .bayesian_search import manual_smac_optimize, update_smac_config
+from .trainer import Trainer
+
+__all__ = [Trainer, update_smac_config, manual_smac_optimize]

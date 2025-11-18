@@ -1,6 +1,7 @@
-import pandas as pd
 import numpy as np
-import sklearn.metrics as skm
+import pandas as pd
+from scipy.stats import spearmanr
+from sklearn.metrics import mean_absolute_percentage_error, r2_score
 
 log_pad = 0.001
 
@@ -83,12 +84,13 @@ def get_all_metrics(df: pd.DataFrame, disp: bool = False):
 
         metrics[feature] = {
             "num_obs": np.sum(~np.isnan(y)),
-            "R2": mask_nan(skm.r2_score)(y, y_hat),
+            "R2": mask_nan(r2_score)(y, y_hat),
+            "r": calc_r(y, y_hat),
             "NSE": calc_nse(y, y_hat),
             "KGE": calc_kge(y, y_hat),
             "sigE": calc_sigE(y, y_hat),
             "rRMSE": calc_rrmse(y, y_hat),
-            "MAPE": calc_mape(y, y_hat),
+            "MAPE": mask_nan(mean_absolute_percentage_error)(y, y_hat),
             "nBias": calc_nbias(y, y_hat),
             "RE": calc_rel_err(y, y_hat),
             "RB": calc_rel_bias(y, y_hat),
@@ -127,6 +129,11 @@ def mask_nan(func):
 
 
 @mask_nan
+def calc_r(y, y_hat):
+    return spearmanr(y, y_hat).statistic
+
+
+@mask_nan
 def calc_nse(y, y_hat):
     denominator = ((y - y.mean()) ** 2).sum()
     numerator = ((y - y_hat) ** 2).sum()
@@ -153,20 +160,15 @@ def calc_kge(y, y_hat):
 
 @mask_nan
 def calc_sigE(y, y_hat):
-    abs_norm_res = np.abs((y_hat - y) / np.mean(y))
-    return np.quantile(abs_norm_res, 0.67)
-
-
-@mask_nan
-def calc_mape(y, y_hat):
-    skm_mape = skm.mean_absolute_percentage_error(y, y_hat)
-    return skm_mape * 100
+    rel_err = (y_hat - y) / np.mean(y)
+    rel_err = rel_err - np.mean(rel_err)  # debias
+    return np.quantile(np.abs(rel_err), 0.67)
 
 
 @mask_nan
 def calc_nbias(y, y_hat):
     nBias = np.median((y_hat - y) / y)
-    return nBias * 100
+    return nBias
 
 
 @mask_nan

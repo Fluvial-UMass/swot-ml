@@ -17,7 +17,7 @@ class Linear(eqx.Module):
 class MLP(eqx.Module):
     mlp: eqx.nn.MLP
 
-    def __init__(self, latent_size: int, hidden_size: int, n_layers: int = 2, *key: PRNGKeyArray):
+    def __init__(self, latent_size: int, hidden_size: int, n_layers: int = 2, *, key: PRNGKeyArray):
         self.mlp = eqx.nn.MLP(
             in_size=latent_size, out_size=1, width_size=hidden_size, depth=n_layers, key=key
         )
@@ -65,7 +65,7 @@ class GMM(eqx.Module):
 
         # split output into mu, sigma and weights
         mu, s_latent, p_latent = jnp.split(h, 3, axis=-1)
-        sigma = jnp.exp(s_latent) + self._eps
+        sigma = jnp.clip(jnp.exp(s_latent), 1e-5, 1e2)
         pi = jax.nn.softmax(p_latent, axis=-1)
 
         return {"mu": mu, "sigma": sigma, "pi": pi}

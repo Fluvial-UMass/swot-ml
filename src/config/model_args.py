@@ -1,4 +1,5 @@
 from typing import Literal, TypeAlias
+
 from pydantic import BaseModel, Field
 
 
@@ -23,6 +24,8 @@ class STGATArgs(BaseModelArgs):
     dense_sizes: dict[str, int] = None
     sparse_sizes: dict[str, int] = None
     static_size: int = None
+    assim_sizes: dict[str, dict] = Field(default_factory=dict)
+    use_obs_memory: bool = True
 
 
 class SeqAttnArgs(BaseModelArgs):

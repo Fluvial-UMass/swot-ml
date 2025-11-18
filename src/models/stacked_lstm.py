@@ -5,9 +5,10 @@ import jax.random as jrandom
 from jaxtyping import PRNGKeyArray
 
 from data import GraphBatch
+
 from .base_model import BaseModel
-from .layers.lstm import LSTM
 from .layers.bi_lstm import BiLSTM
+from .layers.lstm import LSTM
 
 
 class STACKED_LSTM(BaseModel):

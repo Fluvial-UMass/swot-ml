@@ -1,13 +1,14 @@
 # ruff: noqa: E402
 import warnings
-from zarr.errors import ZarrUserWarning, UnstableSpecificationWarning
+
+from zarr.errors import UnstableSpecificationWarning, ZarrUserWarning
 
 warnings.filterwarnings("ignore", category=ZarrUserWarning)
 warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 
 import os
-from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 
 # Suppress 'warn' and 'info' messages from the Rust backend.
 # deltalake is receiving deprecation warnings about future updates to DataFusion.
@@ -16,7 +17,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 # Has to be set before deltalakes is imported
 os.environ["RUST_LOG"] = "warn,datafusion_datasource_parquet=error"
 
-from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -25,6 +25,7 @@ import zarr
 from dask.distributed import Client
 from deltalake import DeltaTable, write_deltalake
 from deltalake.exceptions import TableNotFoundError
+from tqdm import tqdm
 
 LOG_PAD = 1e-6  # IMPORTANT: This must match the log_pad value the dataloader class
 

@@ -12,17 +12,17 @@ except RuntimeError as e:
     else:
         raise
 
+import pickle
 import sys
 import traceback
 from pathlib import Path
-import pickle
 
-import typer
 import pandas as pd
+import typer
 
 # import config, data, train, evaluate
-from config import Config, DataSubset
-from data import DynamicCacheManager, CachedBasinGraphDataset, CachedBasinGraphDataLoader
+from config import AssimConfig, Config, DataSubset
+from data import CachedBasinGraphDataLoader, CachedBasinGraphDataset, DynamicCacheManager
 from train import Trainer
 
 
@@ -71,7 +71,7 @@ def train_from_config(cfg: Config, log_dir: Path | None = None):
     trainer.start_training()
     cleanup_dl(dataloader)
 
-    return cfg, trainer, dataset
+    return cfg, trainer
 
 
 def train_from_config_ensemble(config_path: Path, ensemble_seed: int):
@@ -102,7 +102,50 @@ def train_from_config_ensemble(config_path: Path, ensemble_seed: int):
     log_dir = config_path.parent / "base_models" / f"seed_{ensemble_seed:02d}"
     cfg, trainer, dataset = train_from_config(cfg, log_dir)
 
-    return cfg, trainer.model, trainer.log_dir, dataset
+    return cfg, trainer.model, trainer.log_dir
+
+
+def train_new_assimilator(run_or_state_dir: Path, assim_path: Path):
+    # Get the pre-trained model and trainer
+    trainer = Trainer.load_from_run_or_state(run_or_state_dir)
+
+    # Update the config
+    assim_cfg = AssimConfig.from_file(assim_path)
+    trainer.cfg.add_assimilation(assim_cfg)
+    cfg = trainer.cfg
+
+    # Update the logging
+    now_str = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    assim_log_dir = trainer.log_dir / f"{assim_path.stem}_{now_str}"
+    trainer.new_logger(assim_log_dir)
+    # Separates the copied training log from the new messages.
+    new_feats = list(assim_cfg.new_features.keys())
+    log_msg = f"{'=' * 10} Starting new assimilation: {new_feats} {'=' * 10}"
+    trainer.logger.info("=" * len(log_msg))
+    trainer.logger.info(log_msg)
+    trainer.logger.info("=" * len(log_msg))
+
+    # Create a new dataloader and update in trainer
+    manager = DynamicCacheManager(cfg)
+    cache_dir = manager.create_cache("train")
+    dataset = CachedBasinGraphDataset(cfg, cache_dir, "train")
+    trainer.training_dl = CachedBasinGraphDataLoader(cfg, dataset)
+
+    # Update the model with the new assimilation modules
+    new_model = trainer.model
+    for new_group in assim_cfg.new_features.keys():
+        n_group_features = len(dataset.features.dynamic[new_group])
+        group_network_sizes = assim_cfg.model_args.get(new_group, {})
+        new_model.add_assimilator(new_group, n_group_features, group_network_sizes)
+        trainer.cfg.model_args.sparse_sizes[new_group] = n_group_features
+    trainer.replace_model(new_model)
+
+    if assim_cfg.freeze_base:
+        trainer.freeze_components(["dense_embedders", "fusion_norm", "spat_temp_lstm"])
+
+    trainer.start_training()
+
+    return cfg, trainer.model, assim_log_dir
 
 
 # def finetune(finetune_yml: Path):
@@ -339,7 +382,7 @@ def make_all_plots(
     -------
     None. Figures are saved to the specified directory.
     """
-    from evaluate import mosaic_scatter, basin_metric_histograms
+    from evaluate import basin_metric_histograms, mosaic_scatter
 
     fig_dir = log_dir / "figures" / data_subset.value
     fig_dir.mkdir(parents=True, exist_ok=True)
@@ -386,7 +429,7 @@ def eval_model(
     -----
     Pickled results, bulk metrics, and basin metrics for each data subset. Plots in the `log_dir` directory if `make_plots` is `True`.
     """
-    from evaluate import predict_to_parquet, get_all_metrics, get_basin_metrics
+    from evaluate import get_all_metrics, get_basin_metrics, predict_to_parquet
 
     results_dir = log_dir / "results"
     results_dir.mkdir(exist_ok=True)
@@ -407,7 +450,7 @@ def eval_model(
         manager = DynamicCacheManager(cfg)
         cache_dir = manager.create_cache(data_subset_str)
         dataset = CachedBasinGraphDataset(cfg, cache_dir, data_subset_str)
-        dataloader = CachedBasinGraphDataLoader(cfg, dataset)
+        dataloader = CachedBasinGraphDataLoader(cfg, dataset, infinite_shuffle=False)
 
         predict_to_parquet(model, dataloader, results_file, quiet=cfg.quiet)
         cleanup_dl(dataloader)
@@ -424,9 +467,9 @@ def eval_model(
         if make_plots:
             make_all_plots(results, bulk_metrics, basin_metrics, data_subset, log_dir)
 
-    eval_data_subset(DataSubset.test, run_test)
+    # eval_data_subset(DataSubset.test, run_test)
     # eval_data_subset(DataSubset.predict, run_predict)
-    # eval_data_subset(DataSubset.train, run_train)
+    eval_data_subset(DataSubset.train, run_train)
 
 
 # ┌────────────────────────────────┐ #
@@ -437,23 +480,28 @@ app = typer.Typer(help="Train, test, or run predictions with the hydrological mo
 
 @app.command()
 def train(config: Path):
-    config_path = config.resolve()
-    cfg = Config.from_file(config_path)
-    cfg, trainer, dataset = train_from_config(cfg)
-    eval_model(cfg, trainer.model, dataset, trainer.log_dir)
+    cfg = Config.from_file(config.resolve())
+    cfg, trainer = train_from_config(cfg)
+    eval_model(cfg, trainer.model, trainer.log_dir)
 
 
 @app.command()
 def train_ensemble(config_path: Path, ensemble_seed: int):
     config_path = config_path.resolve()
-    cfg, model, eval_dir, dataset = train_from_config_ensemble(config_path, ensemble_seed)
-    eval_model(cfg, model, dataset, eval_dir)
+    cfg, model, eval_dir = train_from_config_ensemble(config_path, ensemble_seed)
+    eval_model(cfg, model, eval_dir)
 
 
 # @app.command()
 # def finetune(config: Path = typer.Option(..., exists=True, help="Path to fine-tuning config file.")):
 #     cfg, model, eval_dir, dataset = finetune(config.resolve())
 #     eval_model(cfg, model, dataset, eval_dir)
+
+
+@app.command()
+def add_assimilator(run_or_state_dir: Path, config: Path):
+    cfg, model, eval_dir = train_new_assimilator(run_or_state_dir.resolve(), config.resolve())
+    eval_model(cfg, model, eval_dir)
 
 
 @app.command()
@@ -467,16 +515,9 @@ def grid_search(config_path: Path, grid_index: int):
 
 
 @app.command()
-def test(log_or_state_dir: Path):
-    is_state_dir = (log_or_state_dir / "model_and_opt.eqx").is_file()
-    if is_state_dir:
-        trainer = Trainer.load_checkpoint(log_or_state_dir)
-        log_dir = log_or_state_dir.parent
-    else:
-        trainer = Trainer.load_last_checkpoint(log_or_state_dir)
-        log_dir = log_or_state_dir
-
-    eval_model(trainer.cfg, trainer.model, log_dir)
+def test(run_or_state_dir: Path):
+    trainer = Trainer.load_from_run_or_state(run_or_state_dir)
+    eval_model(trainer.cfg, trainer.model, trainer.log_dir)
 
 
 # @app.command()
