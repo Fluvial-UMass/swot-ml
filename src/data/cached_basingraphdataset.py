@@ -51,9 +51,13 @@ _LOG_PAD = 0.001
 def get_train_ds_stats(cfg: Config, *, dynamic: bool = True, static: bool = True) -> dict:
     print("Calculating training statistics for encoding and normalization...")
 
-    train_basins = _get_basin_list(cfg, "train")
+    train_basin_dict = _get_basin_subbasin_dict(cfg, "train")
+    train_basins = list(train_basin_dict.keys())
+    train_subbasins = {x for s in train_basin_dict.values() for x in s}
+
     static_df = pd.read_parquet(cfg.attributes_file)
-    static_train_df = static_df[static_df.index.get_level_values("basin").isin(train_basins)]
+    subbasin_mask = static_df.index.get_level_values("subbasin").isin(train_subbasins)
+    static_train_df = static_df[subbasin_mask]
 
     stats = {}
     if static:
@@ -106,6 +110,8 @@ def _get_scale_from_precomp_stats(cfg: Config, basins: list[str], encoding: dict
             "min": np.inf,
             "max": -np.inf,
             "log_sum": 0.0,
+            "log_sum_sq": 0.0,
+            "positive_count": 0,
         }
     )
 
@@ -123,6 +129,8 @@ def _get_scale_from_precomp_stats(cfg: Config, basins: list[str], encoding: dict
                 agg["min"] = min(agg["min"], stats["min"])
                 agg["max"] = max(agg["max"], stats["max"])
                 agg["log_sum"] += stats["log_sum"]
+                agg["log_sum_sq"] += stats["log_sum_sq"]
+                agg["positive_count"] += stats["positive_count"]
         except Exception:
             raise KeyError(f"Failed to load normalization stats for {basin_path}")
 
@@ -137,18 +145,21 @@ def _get_scale_from_precomp_stats(cfg: Config, basins: list[str], encoding: dict
             continue
 
         stats = aggregated_stats[var]
-        total_count = stats["count"]
 
         if var in cfg.log_norm_cols:
+            log_mean = stats["log_sum"] / stats["positive_count"]
+            log_var = (stats["log_sum_sq"] / stats["positive_count"]) - log_mean**2
+            log_std = np.sqrt(max(log_var, 1e-12))
             scale[var]["log_norm"] = True
-            scale[var]["offset"] = stats["log_sum"] / total_count
+            scale[var]["offset"] = log_mean
+            scale[var]["scale"] = log_std
         elif var in cfg.range_norm_cols:
             min_val, max_val = stats["min"], stats["max"]
             scale[var]["offset"] = min_val
             scale[var]["scale"] = max_val - min_val if max_val > min_val else 1.0
         else:  # z-score
-            mean = stats["sum"] / total_count
-            variance = (stats["sum_sq"] / total_count) - (mean**2)
+            mean = stats["sum"] / stats["count"]
+            variance = (stats["sum_sq"] / stats["count"]) - (mean**2)
             std = np.sqrt(max(variance, 0))
             scale[var]["offset"] = mean
             scale[var]["scale"] = std if std > 1e-9 else 1.0
@@ -230,7 +241,6 @@ def config_hash(cfg: Config) -> str:
         "train_date_range",
         "validate_date_range",
         "test_date_range",
-        "predict_date_range",
         "add_rolling_means",
         "clip_feature_range",
         "value_filter",
@@ -246,16 +256,18 @@ def config_hash(cfg: Config) -> str:
 class DynamicCacheManager:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.cache_dir = cfg.zarr_dir / "_cache2" / config_hash(cfg)
-        self.train_stats = None  # lazy
-        print(f"Caches will be stored at: {self.cache_dir}/<subset>")
+        self.cache_dir = cfg.zarr_dir / "_cache" / config_hash(cfg)
+        self.train_stats = None  # only calc if we create a new cache
+        print(f"Caches will be stored at: {self.cache_dir}")
 
-    def create_cache(self, subset: str, overwrite: bool = False):
-        sub_cache_dir = self.cache_dir / subset
+    def create_cache(self, overwrite: bool = False):
+        sub_cache_dir = self.cache_dir
         sub_cache_dir.mkdir(exist_ok=True, parents=True)
 
-        basins = _get_basin_list(self.cfg, subset)
-        time_slice = _get_time_slice(self.cfg, subset)
+        basin_dict = _get_basin_subbasin_dict(self.cfg, DataSubset.predict)
+        basins = list(basin_dict.keys())
+
+        time_slice = _get_time_slice(self.cfg, DataSubset.predict)
         features = copy.deepcopy(self.cfg.features)
 
         globally_found_columns = set()
@@ -361,25 +373,31 @@ class DynamicCacheManager:
 
 # --- Helper functions moved outside the class or made static ---
 # These are called by initialize_dataset_globals to do the actual I/O.
-def _get_basin_list(cfg: Config, subset: DataSubset):
-    def read_file(fp):
-        with open(fp, "r") as file:
-            basin_list = [line.strip() for line in file.readlines()]
-        return basin_list
 
+def _get_basin_subbasin_dict(cfg: Config, subset: DataSubset):
+    def read_file(fp) -> dict:
+        df = pd.read_csv(fp, dtype=str)
+        if "basin" not in df.columns or "subbasin" not in df.columns:
+            raise ValueError(f"Subbasin file {fp} must contain 'basin' and 'subbasin' columns.")
+            
+        return df.groupby("basin")["subbasin"].apply(set).to_dict()
+    
     match subset:
         case DataSubset.train:
-            basins = read_file(cfg.train_basin_file)
+            basin_dict = read_file(cfg.train_basin_file)
         case DataSubset.test:
-            basins = read_file(cfg.test_basin_file)
+            basin_dict = read_file(cfg.test_basin_file)
         case DataSubset.predict:
             train = read_file(cfg.train_basin_file)
             test = read_file(cfg.test_basin_file)
-            basins = list(set(train + test))
+            basin_dict = {
+                b: train.get(b, set()) | test.get(b, set())
+                for b in train.keys() | test.keys()
+            }
         case _:
             raise ValueError(f"This data_subset ({subset}) is not implemented.")
-
-    return basins
+        
+    return basin_dict
 
 
 def _get_time_slice(cfg: Config, subset: DataSubset):
@@ -391,7 +409,14 @@ def _get_time_slice(cfg: Config, subset: DataSubset):
         case DataSubset.test:
             start, end = tuple(cfg.test_date_range)
         case DataSubset.predict:
-            start, end = tuple(cfg.predict_date_range)
+            ranges = [
+                cfg.train_date_range,
+                cfg.validate_date_range,
+                cfg.test_date_range,
+            ]
+            start = min(r[0] for r in ranges)
+            end = max(r[1] for r in ranges)
+        
         case _:
             raise ValueError(f"This data_subset ({subset}) is not implemented.")
     return slice(start, end)
@@ -544,7 +569,7 @@ def _normalize_data(ds: xr.Dataset, scale=None):
         if scl["encoded"]:
             continue
         elif scl["log_norm"]:
-            ds[var] = np.log(ds[var] + _LOG_PAD) - scl["offset"]
+            ds[var] = (np.log1p(ds[var]) - scl["offset"]) / scl['scale']
         else:
             if scl["scale"] == 0:
                 ds[var] = ds[var] - scl["offset"]
@@ -567,7 +592,10 @@ class CachedBasinGraphDataset(Dataset):
 
         self.features = copy.deepcopy(self.cfg.features)
         self.time_slice = _get_time_slice(cfg, subset)
-        self.basins = _get_basin_list(cfg, subset)
+
+        self.basin_dict = _get_basin_subbasin_dict(cfg, subset)
+        self.basins = list(self.basin_dict.keys())
+        self.subbasins = list(self.basin_dict.values())
 
         train_stats = get_train_ds_stats(cfg)
         self.s_encoding = train_stats["s_encoding"]
@@ -581,6 +609,8 @@ class CachedBasinGraphDataset(Dataset):
 
         self.target = self.features.target
         self.sample_list, self.basin_index_map = self._create_indices()
+
+
 
         # print("Loading sample indices from cache...", end="")
         # try:
@@ -609,10 +639,6 @@ class CachedBasinGraphDataset(Dataset):
                     self.features.dynamic[source].remove(old_col)
                     self.features.dynamic[source].extend(new_cols)
                     break
-
-        # for old_col, new_cols in self.s_encoding['encoded_columns'].items():
-        #     self.features.static.remove(old_col)
-        #     self.features.static.extend(new_cols)
 
     def _load_basin_graphs(self) -> dict[str, np.ndarray]:
         """Loads all basin-specific graphs."""
@@ -803,7 +829,7 @@ class CachedBasinGraphDataset(Dataset):
         log_norm = self.d_scale[name]["log_norm"]
 
         if log_norm:
-            return np.exp(x + offset) - _LOG_PAD
+            return np.expm1(x * scale + offset)
         else:
             return x * scale + offset
 

@@ -1,5 +1,8 @@
 # ruff: noqa: E402
 import warnings
+import time
+import random
+from functools import wraps
 
 from zarr.errors import UnstableSpecificationWarning, ZarrUserWarning
 
@@ -7,6 +10,7 @@ warnings.filterwarnings("ignore", category=ZarrUserWarning)
 warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 
 import os
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -39,6 +43,45 @@ def validate_list_or_str(arg: list[str] | str | None) -> list[str]:
         return arg
     else:
         raise TypeError(f"Argument must be list, str, or None. Received {type(arg)=} ({arg=}).")
+    
+def retry_on_concurrent_write(func=None, *, max_retries=15, base_delay=0.5):
+    """
+    Decorator for retrying on concurrent write conflicts.
+    Can be used as @retry_on_concurrent_write or @retry_on_concurrent_write(max_retries=20)
+    """
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            
+            for attempt in range(max_retries):
+                try:
+                    return f(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    error_msg = str(e).lower()
+                    
+                    if "concurrent transaction" in error_msg or "conflicting concurrent" in error_msg:
+                        if attempt < max_retries - 1:
+                            delay = base_delay * (1.5 ** attempt) + random.uniform(0, 2)
+                            delay = min(delay, 30)
+                            
+                            print(f"Concurrent write conflict (attempt {attempt + 1}/{max_retries}). "
+                                  f"Retrying in {delay:.2f}s...")
+                            time.sleep(delay)
+                            continue
+                    raise
+            
+            raise Exception(f"Failed after {max_retries} retries. Last error: {last_exception}")
+        
+        return wrapper
+    
+    if func is None:
+        # Called with arguments: @retry_on_concurrent_write(max_retries=20)
+        return decorator
+    else:
+        # Called without arguments: @retry_on_concurrent_write
+        return decorator(func)
 
 
 class BasinDataLake:
@@ -129,6 +172,7 @@ class BasinDataLake:
         df["basin"] = basin
         return df
 
+    @retry_on_concurrent_write
     def write_dynamic(
         self,
         basin: str,
@@ -425,34 +469,34 @@ class BasinDataLake:
         """List all available data sources."""
         return self._discover_sources()
 
-    def list_processed_basins(self) -> list[str]:
+    def list_processed_basins(self, status: pd.DataFrame = None) -> list[str]:
         # Unprocessed subbasin/source combinations are left as NaN in 'has_data' field.
         def grp_not_na(grp):
             return (~grp["has_data"].isna()).all(axis=None)
 
-        status = self.get_processing_status()
+        status = self.get_processing_status() if status is None else status
         is_proc = status.groupby("basin").apply(grp_not_na)
         return is_proc[is_proc].index
 
-    def list_source_basin_data(self) -> pd.DataFrame:
+    def list_source_basin_data(self, status: pd.DataFrame = None) -> pd.DataFrame:
         def grp_is_true(grp):
             return (grp["has_data"] == 1).any(axis=0)
 
-        status = self.get_processing_status()
+        status = self.get_processing_status() if status is None else status
         has_data = status.groupby("basin").apply(grp_is_true)
         return has_data
 
-    def get_basin_subbasin_map(self) -> dict:
+    def get_basin_subbasin_map(self, status: pd.DataFrame = None) -> dict:
         def get_subbasin_list(row):
             return list(row.index.get_level_values("subbasin"))
 
-        status = self.get_processing_status()
+        status = self.get_processing_status() if status is None else status
         return status.groupby("basin").apply(get_subbasin_list).to_dict()
 
     # -------------------------------
     # Maintenance Operations
     # -------------------------------
-    def optimize(self, sources: list[str] = None):
+    def optimize(self, retention_hours: int = None, sources: list[str] = None):
         """
         Compact small files within partitions into larger ones for specified sources.
 
@@ -486,7 +530,7 @@ class BasinDataLake:
             stats = dt.optimize.z_order(["date"])
             print_stats(stats, source)
 
-        self.vacuum(sources=sources)
+        self.vacuum(retention_hours = retention_hours, sources=sources)
 
     def vacuum(self, retention_hours: int = None, sources: list[str] = None):
         """
@@ -540,12 +584,13 @@ class BasinDataLake:
         start_date = pd.Timestamp(start_date, tz="UTC") if start_date else None
         end_date = pd.Timestamp(end_date, tz="UTC") if end_date else None
 
-        basin_subbasin_map = self.get_basin_subbasin_map()
-        basin_source_df = self.list_source_basin_data()
+        status = self.get_processing_status()
+        basin_subbasin_map = self.get_basin_subbasin_map(status)
+        basin_source_df = self.list_source_basin_data(status)
         basin_source_map = {
             basin: list(row.index[row]) for basin, row in basin_source_df.iterrows()
         }
-        basins_w_data = set(basin_source_map.keys())
+        processed_basins = self.list_processed_basins(status).to_list()
 
         if sources is None:
             sources = self.list_sources()
@@ -558,23 +603,23 @@ class BasinDataLake:
             basins_to_export = basins
         elif overwrite:
             # Get all basins with data
-            basins_to_export = set(basins_w_data)
+            basins_to_export = set(processed_basins)
         else:
             # Filter the basins based on what has already been exported.
             if zarr_path.exists():
                 exported_basins = {d.name for d in zarr_path.iterdir() if d.is_dir()}
-                basins_to_export = set(basins_w_data) - exported_basins
+                basins_to_export = set(processed_basins) - exported_basins
             else:
-                basins_to_export = set(basins_w_data)
+                basins_to_export = set(processed_basins)
 
         if not basins_to_export:
             print("No new basins to process.")
             return
-        print(f"Processing {len(basins_to_export)} basins.")
 
         count = 0
         if workers > 1:
-            with ProcessPoolExecutor(max_workers=workers) as executor:
+            ctx = multiprocessing.get_context('spawn')
+            with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
                 futures = {
                     executor.submit(
                         self.export_basin_to_zarr,
@@ -645,10 +690,6 @@ class BasinDataLake:
             Optional date filters.
         chunk_days : int
             Chunk length along time dimension (e.g., 90 days).
-        overwrite : bool
-            If True, removes existing store.
-        dtype : numpy dtype
-            Storage type for Zarr.
         """
         # One of the offending basins = ABOM-213983010
 
@@ -828,3 +869,6 @@ class BasinDataLake:
                     # Ensure the xarray dataset is closed
                     if ds is not None:
                         ds.close()
+
+
+

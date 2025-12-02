@@ -23,6 +23,7 @@ dependencies = [
     "pandas>=2.3.0",
     "pyarrow>=20.0.0",
     "pydantic>=2.11.7",
+    "rasterio>=1.4.3",
     "scikit-learn>=1.7.0",
     "tables>=3.10.2",
     "torch>=2.0.1",

@@ -138,7 +138,6 @@ class Config(BaseModel):
     train_date_range: list[datetime] = Field(..., min_length=2, max_length=2)
     validate_date_range: list[datetime] = Field(..., min_length=2, max_length=2)
     test_date_range: list[datetime] = Field(..., min_length=2, max_length=2)
-    predict_date_range: list[datetime] = Field(..., min_length=2, max_length=2)
     add_rolling_means: list[int] | None = None
     clip_feature_range: dict[str, list[float | None]] = Field(default_factory=dict)
     value_filters: list[ValueFilter] = Field(default_factory=list)
@@ -276,7 +275,6 @@ class Config(BaseModel):
         "train_date_range",
         "validate_date_range",
         "test_date_range",
-        "predict_date_range",
         mode="before",
     )
     def parse_time_slice(cls, v):
