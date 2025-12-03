@@ -231,6 +231,7 @@ class CachedBasinGraphDataLoader(DataLoader):
             pin_memory=cfg.pin_memory,
             timeout=timeout,
             persistent_workers=persistent_workers,
+            prefetch_factor=1 if cfg.num_workers>0 else None,
         )
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 
