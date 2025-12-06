@@ -248,105 +248,190 @@ def config_hash(cfg: Config) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 
 
-
 class DynamicCacheManager:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.cache_dir = cfg.zarr_dir / "_cache3" / config_hash(cfg)
+        self.cache_dir = cfg.zarr_dir / "_cache4" / config_hash(cfg)
         self.train_stats = None
         print(f"Caches will be stored at: {self.cache_dir}")
 
-    def create_cache(self, overwrite: bool = False, num_workers: int = 16):
+    def create_cache(self, subset: str | DataSubset, overwrite: bool = False, num_workers: int = 16):
         """
-        Create cache with parallel processing and optimized I/O.
-        
-        Args:
-            overwrite: Whether to overwrite existing cache
-            num_workers: Number of parallel workers for processing
+        Create cache with parallel processing, combining normalization,
+        target identification, and index generation in one pass.
         """
-        sub_cache_dir = self.cache_dir
-        sub_cache_dir.mkdir(exist_ok=True, parents=True)
+        if isinstance(subset, str):
+            subset = DataSubset(subset)
 
-        basin_dict = _get_basin_subbasin_dict(self.cfg, DataSubset.predict)
-        basins = list(basin_dict.keys())
-
-        # Filter out already cached basins if not overwriting
-        if not overwrite:
-            basins = [b for b in basins if not (sub_cache_dir / b).is_dir()]
-        
-        if not basins:
-            print("All basins already cached. Skipping.")
-            return sub_cache_dir
+        subset_cache_dir = self.cache_dir / subset.name
+        subset_cache_dir.mkdir(exist_ok=True, parents=True)
 
         # Pre-compute normalization stats once
         if self.train_stats is None:
             self.train_stats = get_train_ds_stats(self.cfg, static=False)
 
-        time_slice = _get_time_slice(self.cfg, DataSubset.predict)
         features = copy.deepcopy(self.cfg.features)
-        
-        # Setup processing parameters
         encoding = self.train_stats["d_encoding"]
         scale = self.train_stats["d_scale"]
         dynamic_columns = set([vv for v in features.dynamic.values() for vv in v])
         all_config_columns = dynamic_columns.union(set(features.target))
 
-        # Process basins in parallel
-        globally_found_columns = set()
-        written = 0
+        self._process_subset(
+            subset=subset,
+            subset_cache_dir=subset_cache_dir,
+            overwrite=overwrite,
+            num_workers=num_workers,
+            features=features,
+            encoding=encoding,
+            scale=scale,
+            all_config_columns=all_config_columns,
+        )
+
+        print("✅ All caches created and indexed.")
+
+        return subset_cache_dir
         
+    def _process_subset(
+        self,
+        subset: DataSubset,
+        subset_cache_dir: Path,
+        overwrite: bool,
+        num_workers: int,
+        features,
+        encoding,
+        scale,
+        all_config_columns,
+    ):
+        """Process a single subset: cache data and generate indices in one pass."""
+
+        basin_dict = _get_basin_subbasin_dict(self.cfg, subset)
+        basins = sorted(list(basin_dict.keys()))
+
+        # Filter out already cached basins if not overwriting
+        if not overwrite:
+            basins_to_process = [b for b in basins if not (subset_cache_dir / b).is_dir()]
+        else:
+            basins_to_process = basins
+
+        if len(basins_to_process) == 0:
+            return
+
+        time_slice = _get_time_slice(self.cfg, subset)
+        seq_len = np.timedelta64(self.cfg.sequence_length, "D")
+        min_valid_date = np.datetime64(time_slice.start) + seq_len
+        target_vars = self.cfg.features.target
+
+        # Process basins in parallel, returning both cache status and index data
+        globally_found_columns = set()
+        all_basin_indices = {}  # basin -> list of (date_int,)
+        written = 0
+
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-            # Submit all basin processing tasks
             futures = {
                 executor.submit(
-                    self._process_single_basin,
-                    basin_id, 
-                    sub_cache_dir,
-                    time_slice,
-                    features,
-                    encoding,
-                    scale,
-                    all_config_columns
-                ): basin_id 
-                for basin_id in basins
+                    self._process_single_basin_with_indices,
+                    basin_id=basin_id,
+                    cache_dir=subset_cache_dir,
+                    time_slice=time_slice,
+                    features=features,
+                    encoding=encoding,
+                    scale=scale,
+                    all_config_columns=all_config_columns,
+                    min_valid_date=min_valid_date,
+                    target_vars=target_vars,
+                    subset=subset,
+                ): basin_id
+                for basin_id in basins_to_process
             }
-            
-            # Process results with progress bar
-            with tqdm(total=len(futures), desc="Processing basins", disable=self.cfg.quiet) as pbar:
+
+            with tqdm(
+                total=len(futures), desc=f"Processing {subset.name}", disable=self.cfg.quiet
+            ) as pbar:
                 for future in concurrent.futures.as_completed(futures):
                     basin_id = futures[future]
                     try:
-                        found_columns = future.result()
-                        if found_columns:
+                        result = future.result()
+                        if result is not None:
+                            found_columns, valid_date_ints = result
                             globally_found_columns.update(found_columns)
+                            if valid_date_ints is not None and len(valid_date_ints) > 0:
+                                all_basin_indices[basin_id] = valid_date_ints
                             written += 1
                     except Exception as e:
                         warnings.warn(f"Failed to process basin {basin_id}: {e}")
                     pbar.update(1)
 
-        print(f"Wrote {written} new basin files to cache.")
-        
+        print(f"Wrote {written} new basin files to {subset.name} cache.")
+
         if written > 0:
             never_found_columns = all_config_columns - globally_found_columns
             if never_found_columns:
-                warnings.warn(
-                    f"Columns not found in any basin: {sorted(never_found_columns)}"
-                )
+                warnings.warn(f"Columns not found in any basin: {sorted(never_found_columns)}")
 
-        print("✅ Cached resources are loaded and ready.")
-        return sub_cache_dir
+        # For basins that were already cached, load their index data
+        already_cached = set(basins) - set(basins_to_process)
+        if already_cached:
+            existing_indices = self._load_existing_indices(
+                already_cached, subset_cache_dir, min_valid_date, target_vars, subset, all_basin_indices
+            )
+            all_basin_indices.update(existing_indices)
 
-    def _process_single_basin(
+        # Save indices
+        self._save_indices(subset_cache_dir, basins, all_basin_indices)
+
+        return
+
+    def _process_single_basin_with_indices(
+        self,
+        basin_id: str,
+        cache_dir: Path,
+        time_slice,
+        features,
+        encoding,
+        scale,
+        all_config_columns,
+        min_valid_date,
+        target_vars,
+        subset: DataSubset,
+    ):
+        """
+        Process a single basin: normalize, cache, and identify valid sample dates.
+        Returns (found_columns, valid_date_ints) or None on failure.
+        """
+        try:
+            # Load and normalize data (your existing logic)
+            ds = self._load_and_normalize_basin(
+                basin_id, time_slice, features, encoding, scale, all_config_columns
+            )
+            if ds is None:
+                return None
+
+            found_columns = set(ds.data_vars)
+
+            # Write to cache
+            basin_cache_path = cache_dir / basin_id
+            ds.to_zarr(basin_cache_path, mode="w", consolidated=True)
+
+            # Identify valid dates for indexing (while data is still in memory)
+            valid_date_ints = self._extract_valid_dates(
+                ds, min_valid_date, target_vars, subset
+            )
+
+            return found_columns, valid_date_ints
+
+        except Exception as e:
+            warnings.warn(f"Error processing {basin_id}: {e}")
+            return None
+        
+
+    def _load_and_normalize_basin(
         self, 
         basin_id: str,
-        sub_cache_dir: Path,
         time_slice: slice,
         features: Features,
         encoding: dict,
         scale: dict,
-        all_config_columns: set
-    ) -> set:
-        """Process a single basin and return found columns."""
+        all_config_columns: set) -> xr.Dataset:
         
         # Open with consolidation for faster metadata reads
         ds = xr.open_zarr(
@@ -371,15 +456,8 @@ class DynamicCacheManager:
             "subbasin": -1  # Keep subbasin dimension in single chunk
         })
         
-        # Write with optimized settings
-        ds.to_zarr(
-            store=sub_cache_dir / basin_id,
-            mode="w",
-            consolidated=True,  # Enable consolidation for faster reads
-            compute=True
-        )
-        
-        return available_columns
+        return ds        
+
 
     def _encode_data_optimized(self, ds: xr.Dataset, features: Features, encoding: dict):
         """Optimized encoding without unnecessary conversions."""
@@ -447,6 +525,96 @@ class DynamicCacheManager:
                     features.dynamic[src].extend(encoded_columns)
         
         return ds, features
+
+    def _extract_valid_dates(
+        self,
+        ds: xr.Dataset,
+        min_valid_date: np.datetime64,
+        target_vars: list,
+        subset: DataSubset,
+    ) -> np.ndarray:
+        """Extract valid sample dates from an in-memory dataset."""
+        # Filter by minimum date
+        valid_seq_mask = ds["date"] >= min_valid_date
+        ds_filtered = ds.sel(date=valid_seq_mask)
+
+        if subset in [DataSubset.train, DataSubset.test]:
+            # Check target availability
+            missing = [t for t in target_vars if t not in ds_filtered]
+            if missing:
+                return np.array([], dtype=np.int32)
+
+            not_nan_arr = ~np.isnan(ds_filtered[target_vars]).to_array()
+            target_mask = not_nan_arr.any(dim=["subbasin", "variable"]).values
+            valid_dates = ds_filtered["date"][target_mask].values
+        else:
+            valid_dates = ds_filtered["date"].values
+
+        if len(valid_dates) == 0:
+            return np.array([], dtype=np.int32)
+
+        # Convert to integer days since epoch
+        return valid_dates.astype("datetime64[D]").astype(np.int32)
+
+    def _load_existing_indices(
+        self,
+        basins: set,
+        cache_dir: Path,
+        min_valid_date,
+        target_vars,
+        subset,
+    ) -> dict:
+        """Load index data for already-cached basins."""
+
+        loaded_indices = {}
+        for basin in tqdm(basins, desc="Loading existing indices", disable=self.cfg.quiet):
+            try:
+                ds = xr.open_zarr(cache_dir / basin, consolidated=True)
+                valid_date_ints = self._extract_valid_dates(
+                    ds, min_valid_date, target_vars, subset
+                )
+                if len(valid_date_ints) > 0:
+                    loaded_indices[basin] = valid_date_ints
+            except Exception:
+                continue
+        return loaded_indices
+
+    def _save_indices(self, subset_cache_dir: Path, basins: list, all_basin_indices: dict):
+        """Save the computed indices to disk."""
+        index_dir = subset_cache_dir / '_indices' / f"sequence={str(self.cfg.sequence_length)}"
+        index_dir.mkdir(exist_ok=True, parents=True)
+
+        out_list_path = index_dir / "sample_list.npy"
+        out_map_path = index_dir / "basin_index_map.json"
+        out_lookup_path = index_dir / "basin_lookup.json"
+
+        # Create basin -> int mapping
+        basin_to_int = {b: i for i, b in enumerate(basins)}
+
+        # Build flattened sample list and per-basin index map
+        sample_list_ints = []
+        basin_index_map = defaultdict(list)
+        global_idx = 0
+
+        for basin in basins:
+            if basin not in all_basin_indices:
+                continue
+            basin_int = basin_to_int[basin]
+            for d_int in all_basin_indices[basin]:
+                sample_list_ints.append([basin_int, d_int])
+                basin_index_map[basin].append(global_idx)
+                global_idx += 1
+
+        # Save files
+        with open(out_lookup_path, "w") as f:
+            json.dump(basins, f)
+
+        with open(out_map_path, "w") as f:
+            json.dump(basin_index_map, f)
+
+        np.save(out_list_path, np.array(sample_list_ints, dtype=np.int32))
+
+        print(f"  Saved {global_idx} samples to {subset_cache_dir}")
 
 
 # --- Helper functions moved outside the class or made static ---
@@ -666,10 +834,12 @@ class CachedBasinGraphDataset(Dataset):
     DataLoader class for loading and preprocessing hydrological time series data.
     """
 
-    def __init__(self, cfg: Config, cache_dir: Path, subset: DataSubset):
+    def __init__(self, cfg: Config, cache_dir: Path, subset: str | DataSubset):
         self.cfg = cfg
         self.cache_dir = cache_dir
 
+        if isinstance(subset, str):
+            subset = DataSubset(subset)
         self.data_subset = subset
 
         self.features = copy.deepcopy(self.cfg.features)
@@ -690,8 +860,7 @@ class CachedBasinGraphDataset(Dataset):
         self.graphs = self._load_basin_graphs()
 
         self.target = self.features.target
-        self.sample_list, self.basin_index_map = self._create_indices()
-
+        self.basin_lookup, self.sample_list, self.basin_index_map = self._load_indices()
 
 
         # print("Loading sample indices from cache...", end="")
@@ -706,6 +875,35 @@ class CachedBasinGraphDataset(Dataset):
         #         "Please run the cache creation process first."
         #     )
         # print("Done!")
+
+    def _load_indices(self):
+        subset_name = self.data_subset.name
+        index_dir = self.cache_dir / '_indices' / f"sequence={str(self.cfg.sequence_length)}"
+
+        lookup_path = index_dir / "basin_lookup.json"
+        list_path = index_dir / "sample_list.npy"
+        map_path = index_dir / "basin_index_map.json"
+
+        if not list_path.exists():
+            raise FileNotFoundError(f"Index cache not found for {subset_name}. Run DynamicCacheManager.")
+
+        print(f"Loading optimized indices for {subset_name}...", end="")
+        
+        # 1. Load Basin Lookup (List of strings)
+        with open(lookup_path, "r") as f:
+            basin_lookup = json.load(f)
+            
+        # 2. Load Sample List (Memory Mapped Integer Array)
+        # mmap_mode='r' means it stays on disk and loads pages into RAM only when accessed.
+        # This reduces initial RAM usage to near zero for this object.
+        sample_list = np.load(list_path, mmap_mode='r')
+        
+        # 3. Load Index Map (for Sampler)
+        with open(map_path, "r") as f:
+            basin_index_map = json.load(f)
+
+        print("Done!")
+        return basin_lookup, sample_list, basin_index_map
 
     def __len__(self):
         """
@@ -785,56 +983,23 @@ class CachedBasinGraphDataset(Dataset):
         print("Done!")
         return ds, basin_subbasin_map
 
-    def _create_indices(self):
-        # First get the dates that can build a complete sequence
-        seq_len = np.timedelta64(self.cfg.sequence_length, "D")
-        min_train_date = np.datetime64(self.time_slice.start) + seq_len
-
-        # For each basin, we will need to identify valid dates based on valid observations.
-        def valid_target(ds):
-            not_nan_arr = ~np.isnan(ds[self.target]).to_array()
-            return not_nan_arr.any(dim=["subbasin", "variable"]).values
-
-        # Loop through the basins and get a list of dates
-        basin_date_map = {}
-        for basin in tqdm(self.basins, disable=self.cfg.quiet, desc="Building sampling index"):
-            basin_ds = xr.open_zarr(self.cache_dir / basin, consolidated=True)
-
-            missing = [t for t in self.target if t not in basin_ds]
-            if missing:
-                # Skip basin or raise
-                print(f"Skipping basin {basin}, missing targets: {missing}")
-                continue
-
-            valid_seq_mask = basin_ds["date"] >= min_train_date
-            basin_ds = basin_ds.sel(date=valid_seq_mask)
-
-            # Mask out dates without valid data if we need it.
-            if self.data_subset in ["train", "test"]:
-                target_mask = valid_target(basin_ds)
-                basin_date_map[basin] = basin_ds["date"][target_mask].values
-            else:
-                basin_date_map[basin] = basin_ds["date"].values
-
-        # Now build unique indices for each pairing...
-        # Master list of (basin, date) tuples that we use during __getitem__
-        sample_list = []
-        # Keep track of which indices in the master list belong to which basins for the sampler
-        basin_index_map = {}
-        index = 0
-        for basin, dates in basin_date_map.items():
-            basin_index_map[basin] = []
-            for date in dates:
-                sample_list.append((basin, date))
-                basin_index_map[basin].append(index)
-                index += 1
-
-        return sample_list, basin_index_map
-
     def __getitem__(self, idx: int) -> dict:
         """Generate one batch of data."""
-        basin, end_date = self.sample_list[idx]
-        start_date = end_date - pd.Timedelta(days=self.cfg.sequence_length - 1)
+
+        # 1. Retrieve integers (returns numpy.int32 scalars)
+        basin_idx, date_int = self.sample_list[idx]
+
+        # 2. Decode Basin ID
+        basin = self.basin_lookup[basin_idx]
+
+        # 3. Decode Date
+        # FIXED: Cast date_int to native python int first
+        end_date = np.datetime64(int(date_int), 'D') 
+
+        start_date = end_date - np.timedelta64(self.cfg.sequence_length - 1, 'D')
+
+        # basin, end_date = self.sample_list[idx]
+        # start_date = end_date - pd.Timedelta(days=self.cfg.sequence_length - 1)
 
         # basin_ds = self.basin_ds[basin]
         with xr.open_zarr(self.cache_dir / basin, consolidated=True) as basin_ds:

@@ -55,7 +55,7 @@ def train_from_config(cfg: Config, log_dir: Path | None = None):
         The CachedBasinGraphDataset loaded for training.
     """
     manager = DynamicCacheManager(cfg)
-    cache_dir = manager.create_cache()
+    cache_dir = manager.create_cache('train')
     dataset = CachedBasinGraphDataset(cfg, cache_dir, "train")
     dataloader = CachedBasinGraphDataLoader(cfg, dataset)
 
@@ -127,7 +127,7 @@ def train_new_assimilator(run_or_state_dir: Path, assim_path: Path):
 
     # Create a new dataloader and update in trainer
     manager = DynamicCacheManager(cfg)
-    cache_dir = manager.create_cache()
+    cache_dir = manager.create_cache('train')
     dataset = CachedBasinGraphDataset(cfg, cache_dir, "train")
     trainer.training_dl = CachedBasinGraphDataLoader(cfg, dataset)
 
@@ -227,7 +227,7 @@ def hyperparam_grid_search(config_path: Path, idx: int):
         cfg.test_basin_file = f"metadata/site_lists/k_folds/test_{i}_{k}.txt"
         cfg.train_basin_file = f"metadata/site_lists/k_folds/train_{i}_{k}.txt"
         manager = DynamicCacheManager(cfg)
-        cache_dir = manager.create_cache()
+        cache_dir = manager.create_cache('train')
         dataset = CachedBasinGraphDataset(cfg, cache_dir, "train")
         dataloader = CachedBasinGraphDataLoader(cfg, dataset)
 
@@ -448,7 +448,7 @@ def eval_model(
         print(f"Evaluating {data_subset_str} subset and saving to: {results_file}")
 
         manager = DynamicCacheManager(cfg)
-        cache_dir = manager.create_cache()
+        cache_dir = manager.create_cache(data_subset)
         dataset = CachedBasinGraphDataset(cfg, cache_dir, data_subset_str)
         dataloader = CachedBasinGraphDataLoader(cfg, dataset, infinite_shuffle=False)
 
