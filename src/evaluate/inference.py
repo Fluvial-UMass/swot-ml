@@ -99,14 +99,15 @@ def model_iterate(
         for t in model.target
     }
 
-    for basin, date, batch in tqdm(dataloader, disable=quiet):
+    for basin, subbasin, date, batch in tqdm(dataloader, disable=quiet):
         batch = batch.to_jax()
         y_pred = _model_map(model, batch, key)
 
-        out_dict = {"basin": basin, "date": date, "y_pred": {}}
-        for target_name, target_pred in y_pred.items():
+        out_dict = {"basin": basin, "subbasin": subbasin, "date": date, "y_pred": {}}
+        for target_name in model.target:
             denorm_fn = denorm_fns[target_name]
             denorm_std_fn = denorm_std_fns[target_name]
+            target_pred = y_pred[target_name]
             # Check the type of this target's head. Changes how we create predictions.
             if isinstance(model.head[target_name], GMM):
                 t_exp, t_std = _gmm_expected_values(
@@ -137,8 +138,6 @@ def model_df_iterate(
     quiet: bool = False,
     denormalize: bool = True,
 ):
-    subbasin_map = dataloader.dataset.basin_subbasin_map
-
     # Iterate through batches from the dataloader
     for batch_results in model_iterate(model, dataloader, quiet=quiet, denormalize=denormalize):
         y_pred_dict = batch_results["y_pred"]
@@ -153,8 +152,7 @@ def model_df_iterate(
 
         rows = [
             (basin, subbasin, date)
-            for basin, date in zip(batch_results["basin"], batch_results["date"])
-            for subbasin in subbasin_map[basin]
+            for basin, subbasin, date in zip(batch_results["basin"], batch_results["subbasin"], batch_results["date"])
         ]
         row_index = pd.MultiIndex.from_tuples(rows, names=["basin", "subbasin", "date"])
         df.index = row_index

@@ -50,25 +50,39 @@ def compute_loss(
     # Loop through the targets and calculate loss
     losses = []
     loss_fn = get_loss_fn(loss_name)
-    for target_name in y_hat.keys():
-        y_target = data.y[target_name][..., 0]
+    for target_name, y_target in data.y.items():
+        # Skip targets the model didn't predict (or aren't in target_weights)
+        if target_name not in y_hat:
+            continue
+        if target_weights.get(target_name, 0.0) == 0.0:
+            continue
+
         y_hat_target = y_hat[target_name]
+        y_true = y_target[..., 0]
 
-        valid_mask = ~jnp.isnan(y_target) & node_mask
-        masked_y = jnp.where(valid_mask, y_target, 0)
+        valid_mask = ~jnp.isnan(y_true) & node_mask
+        masked_y = jnp.where(valid_mask, y_true, 0)
 
+        # Handle GMM (dict output) vs Standard (Array output)
         if isinstance(y_hat_target, dict):
             expanded_mask = jnp.expand_dims(valid_mask, axis=-1)
-            masked_y_hat = {
-                p_name: jnp.where(expanded_mask, p_arr, 0) for p_name, p_arr in y_hat_target.items()
-            }
+            masked_y_hat = {k: jnp.where(expanded_mask, v, 0) for k, v in y_hat_target.items()}
         else:
             masked_y_hat = jnp.where(valid_mask, y_hat_target[..., 0], 0)
 
-        # Calculate masked loss, safeguard against NaN's, and apply target weights
         loss = loss_fn(masked_y, masked_y_hat, valid_mask)
         loss = jnp.nan_to_num(loss, 0) * target_weights[target_name]
         losses.append(loss)
+
+    # Check for Attention Supervision
+    if "attention_weights" in y_hat:
+        # Re-use the node_mask for attention
+        attn_loss_val = attention_leakage_loss(
+            y_hat["attention_weights"],
+            y_hat["valid_obs"],
+            node_mask,
+        )
+        losses.append(attn_loss_val)
 
     loss = jnp.mean(jnp.stack(losses))
 
@@ -163,3 +177,15 @@ def gmm_nll(y: Array, y_hat: dict[str, Array], mask: Array) -> Array:
     nll = -jnp.log(weighted_likelihoods + 1e-6)
 
     return jnp.mean(nll, where=mask)
+
+
+def attention_leakage_loss(attn_weights: Array, obs_mask: Array, node_mask: Array) -> Array:
+    """
+    Penalizes any attention weight assigned to masked (invalid) time steps.
+    Does NOT penalize the distribution over valid time steps our sources.
+    """
+    real_data_exists = jnp.any(obs_mask[..., :-1], axis=-1)
+    null_attn_weights = attn_weights[..., -1]
+    penalty = null_attn_weights * real_data_exists
+
+    return jnp.mean(penalty, where=real_data_exists)

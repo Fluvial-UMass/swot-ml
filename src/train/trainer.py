@@ -54,7 +54,7 @@ class Trainer:
     training_dl: CachedBasinGraphDataLoader
     validation_dl: CachedBasinGraphDataLoader
     log_dir: Path
-    model: eqx.Module
+    model: models.BaseModel
     losses: list
     step: int
     optim: optax.GradientTransformation
@@ -238,7 +238,7 @@ class Trainer:
         last_log_step = self.step
         last_log_time = time.time()
 
-        for _, _, batch in pbar:
+        for _, _, _, batch in pbar:
             batch = batch.to_jax()
             # Perform one training step
             loss, grads = self._train_step(batch)
@@ -344,7 +344,7 @@ class Trainer:
         pbar = tqdm(
             self.validation_dl, disable=self.cfg.quiet, desc=f"Validating Step:{self.step:06d}"
         )
-        for _, _, batch in pbar:
+        for _, _, _, batch in pbar:
             loss = compute_loss(
                 self.model,
                 None,

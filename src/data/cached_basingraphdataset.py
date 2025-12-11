@@ -251,11 +251,13 @@ def config_hash(cfg: Config) -> str:
 class DynamicCacheManager:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.cache_dir = cfg.zarr_dir / "_cache4" / config_hash(cfg)
+        self.cache_dir = cfg.zarr_dir / "_cache2" / config_hash(cfg)
         self.train_stats = None
         print(f"Caches will be stored at: {self.cache_dir}")
 
-    def create_cache(self, subset: str | DataSubset, overwrite: bool = False, num_workers: int = 16):
+    def create_cache(
+        self, subset: str | DataSubset, overwrite: bool = False, num_workers: int = 16
+    ):
         """
         Create cache with parallel processing, combining normalization,
         target identification, and index generation in one pass.
@@ -290,7 +292,7 @@ class DynamicCacheManager:
         print("✅ All caches created and indexed.")
 
         return subset_cache_dir
-        
+
     def _process_subset(
         self,
         subset: DataSubset,
@@ -304,8 +306,8 @@ class DynamicCacheManager:
     ):
         """Process a single subset: cache data and generate indices in one pass."""
 
-        basin_dict = _get_basin_subbasin_dict(self.cfg, subset)
-        basins = sorted(list(basin_dict.keys()))
+        basin_subset_dict = _get_basin_subbasin_dict(self.cfg, subset)
+        basins = sorted(list(basin_subset_dict.keys()))
 
         # Filter out already cached basins if not overwriting
         if not overwrite:
@@ -372,7 +374,12 @@ class DynamicCacheManager:
         already_cached = set(basins) - set(basins_to_process)
         if already_cached:
             existing_indices = self._load_existing_indices(
-                already_cached, subset_cache_dir, min_valid_date, target_vars, subset, all_basin_indices
+                already_cached,
+                subset_cache_dir,
+                min_valid_date,
+                target_vars,
+                subset,
+                all_basin_indices,
             )
             all_basin_indices.update(existing_indices)
 
@@ -413,117 +420,113 @@ class DynamicCacheManager:
             ds.to_zarr(basin_cache_path, mode="w", consolidated=True)
 
             # Identify valid dates for indexing (while data is still in memory)
-            valid_date_ints = self._extract_valid_dates(
-                ds, min_valid_date, target_vars, subset
-            )
+            valid_date_ints = self._extract_valid_dates(ds, min_valid_date, target_vars, subset)
 
             return found_columns, valid_date_ints
 
         except Exception as e:
             warnings.warn(f"Error processing {basin_id}: {e}")
             return None
-        
 
     def _load_and_normalize_basin(
-        self, 
+        self,
         basin_id: str,
         time_slice: slice,
         features: Features,
         encoding: dict,
         scale: dict,
-        all_config_columns: set) -> xr.Dataset:
-        
+        all_config_columns: set,
+    ) -> xr.Dataset:
         # Open with consolidation for faster metadata reads
         ds = xr.open_zarr(
             self.cfg.zarr_dir / basin_id,
-            consolidated=True if (self.cfg.zarr_dir / basin_id / ".zmetadata").exists() else False
+            consolidated=True if (self.cfg.zarr_dir / basin_id / ".zmetadata").exists() else False,
         )
-        
+
         # Select time slice efficiently
         ds = ds.sel(date=time_slice)
-        
+
         # Find available columns
         available_columns = all_config_columns.intersection(set(ds.data_vars))
         ds = ds[list(available_columns)]
-        
+
         # Apply encoding and normalization
         ds, features = self._encode_data_optimized(ds, features, encoding)
         ds = _normalize_data(ds, scale)
-        
-        # Optimize chunking for the sequence length
-        ds = ds.chunk({
-            "date": self.cfg.sequence_length,
-            "subbasin": -1  # Keep subbasin dimension in single chunk
-        })
-        
-        return ds        
 
+        # Optimize chunking for the sequence length
+        ds = ds.chunk(
+            {
+                "date": self.cfg.sequence_length,
+                "subbasin": -1,  # Keep subbasin dimension in single chunk
+            }
+        )
+
+        return ds
 
     def _encode_data_optimized(self, ds: xr.Dataset, features: Features, encoding: dict):
         """Optimized encoding without unnecessary conversions."""
-        
+
         # Process categorical encodings
         for col, prescribed_cats in encoding["categorical"].items():
             if col not in ds.data_vars:
                 continue
-                
+
             prescribed_cols = [f"{col}_{cat}" for cat in prescribed_cats]
-            
+
             # Direct numpy operations instead of dask dataframe conversion
             col_data = ds[col].values
-            
+
             # Create one-hot encoded arrays directly
             encoded_arrays = {}
             for cat_col in prescribed_cols:
                 cat_name = cat_col.replace(f"{col}_", "")
                 encoded_arrays[cat_col] = xr.DataArray(
-                    (col_data == cat_name).astype(float),
-                    dims=ds[col].dims,
-                    coords=ds[col].coords
+                    (col_data == cat_name).astype(float), dims=ds[col].dims, coords=ds[col].coords
                 )
-            
+
             # Update dataset
             ds = ds.drop_vars(col)
             for name, arr in encoded_arrays.items():
                 ds[name] = arr
-            
+
             # Update features
             for src, columns in features.dynamic.items():
                 if col in columns:
                     features.dynamic[src].remove(col)
                     features.dynamic[src].extend(prescribed_cols)
-        
+
         # Process bitmask encodings (keeping your efficient implementation)
         for col, prescribed_bits in encoding["bitmask"].items():
             if col not in ds.data_vars:
                 continue
-                
+
             x = ds[col]
-            finite_mask = da.isfinite(x.data) if isinstance(x.data, da.Array) else np.isfinite(x.data)
+            finite_mask = (
+                da.isfinite(x.data) if isinstance(x.data, da.Array) else np.isfinite(x.data)
+            )
             x_int = np.where(finite_mask, x.data, 0).astype(int)
-            
+
             new_vars = {}
             for n in prescribed_bits:
                 bit_arr_data = ((x_int // 2**n) % 2).astype(float)
                 bit_arr_data = np.where(finite_mask, bit_arr_data, np.nan)
-                
+
                 new_var_name = f"{col}_bit_{n}"
                 new_vars[new_var_name] = xr.DataArray(
-                    bit_arr_data, 
-                    dims=ds[col].dims, 
-                    coords=ds[col].coords
+                    bit_arr_data, dims=ds[col].dims, coords=ds[col].coords
                 )
-            
+
             # Update dataset and features
             encoded_columns = list(new_vars.keys())
             ds = ds.drop_vars(col)
             ds = ds.assign(**new_vars)
-            
+
             for src, columns in features.dynamic.items():
                 if col in columns:
                     features.dynamic[src].remove(col)
                     features.dynamic[src].extend(encoded_columns)
-        
+
         return ds, features
 
     def _extract_valid_dates(
@@ -570,9 +573,7 @@ class DynamicCacheManager:
         for basin in tqdm(basins, desc="Loading existing indices", disable=self.cfg.quiet):
             try:
                 ds = xr.open_zarr(cache_dir / basin, consolidated=True)
-                valid_date_ints = self._extract_valid_dates(
-                    ds, min_valid_date, target_vars, subset
-                )
+                valid_date_ints = self._extract_valid_dates(ds, min_valid_date, target_vars, subset)
                 if len(valid_date_ints) > 0:
                     loaded_indices[basin] = valid_date_ints
             except Exception:
@@ -581,7 +582,7 @@ class DynamicCacheManager:
 
     def _save_indices(self, subset_cache_dir: Path, basins: list, all_basin_indices: dict):
         """Save the computed indices to disk."""
-        index_dir = subset_cache_dir / '_indices' / f"sequence={str(self.cfg.sequence_length)}"
+        index_dir = subset_cache_dir / "_indices" / f"sequence={str(self.cfg.sequence_length)}"
         index_dir.mkdir(exist_ok=True, parents=True)
 
         out_list_path = index_dir / "sample_list.npy"
@@ -617,33 +618,30 @@ class DynamicCacheManager:
         print(f"  Saved {global_idx} samples to {subset_cache_dir}")
 
 
-# --- Helper functions moved outside the class or made static ---
 # These are called by initialize_dataset_globals to do the actual I/O.
-
 def _get_basin_subbasin_dict(cfg: Config, subset: DataSubset):
     def read_file(fp) -> dict:
         df = pd.read_csv(fp, dtype=str)
         if "basin" not in df.columns or "subbasin" not in df.columns:
             raise ValueError(f"Subbasin file {fp} must contain 'basin' and 'subbasin' columns.")
-            
+
         return df.groupby("basin")["subbasin"].apply(set).to_dict()
-    
+
     match subset:
         case DataSubset.train:
-            basin_dict = read_file(cfg.train_basin_file)
+            basin_subset_dict = read_file(cfg.train_basin_file)
         case DataSubset.test:
-            basin_dict = read_file(cfg.test_basin_file)
+            basin_subset_dict = read_file(cfg.test_basin_file)
         case DataSubset.predict:
             train = read_file(cfg.train_basin_file)
             test = read_file(cfg.test_basin_file)
-            basin_dict = {
-                b: train.get(b, set()) | test.get(b, set())
-                for b in train.keys() | test.keys()
+            basin_subset_dict = {
+                b: train.get(b, set()) | test.get(b, set()) for b in train.keys() | test.keys()
             }
         case _:
             raise ValueError(f"This data_subset ({subset}) is not implemented.")
-        
-    return basin_dict
+
+    return basin_subset_dict
 
 
 def _get_time_slice(cfg: Config, subset: DataSubset):
@@ -662,7 +660,7 @@ def _get_time_slice(cfg: Config, subset: DataSubset):
             ]
             start = min(r[0] for r in ranges)
             end = max(r[1] for r in ranges)
-        
+
         case _:
             raise ValueError(f"This data_subset ({subset}) is not implemented.")
     return slice(start, end)
@@ -724,25 +722,23 @@ def _one_hot_encoding(
 
         # Get the underlying dask array
         da_col = ds[col].data
-        
+
         # Create a dictionary of new variables
         new_vars = {}
         for cat in prescribed_cats:
             # Broadcast comparison (lazy dask operation)
             # Use strict equality; assumes categories match exactly
             if isinstance(cat, str):
-                 # handle string categories if necessary, though usually encoded as int/float in zarr
-                 # Ideally, your input Zarr already has these as numerics or strict types
-                 pass 
-            
-            mask = (da_col == cat)
-            
+                # handle string categories if necessary, though usually encoded as int/float in zarr
+                # Ideally, your input Zarr already has these as numerics or strict types
+                pass
+
+            mask = da_col == cat
+
             # Convert boolean mask to float (or int)
             new_var_name = f"{col}_{cat}"
             new_vars[new_var_name] = xr.DataArray(
-                mask.astype(np.float32), 
-                dims=ds[col].dims, 
-                coords=ds[col].coords
+                mask.astype(np.float32), dims=ds[col].dims, coords=ds[col].coords
             )
 
         # Merge new variables
@@ -762,6 +758,7 @@ def _one_hot_encoding(
             features.static.extend(encoded_columns)
 
     return ds, features
+
 
 def _bitmask_expansion(
     ds: xr.Dataset, feat_group: str, features: Features, bitmask_enc: dict[str, list[int]]
@@ -819,7 +816,7 @@ def _normalize_data(ds: xr.Dataset, scale=None):
         if scl["encoded"]:
             continue
         elif scl["log_norm"]:
-            ds[var] = (np.log1p(ds[var]) - scl["offset"]) / scl['scale']
+            ds[var] = (np.log1p(ds[var]) - scl["offset"]) / scl["scale"]
         else:
             if scl["scale"] == 0:
                 ds[var] = ds[var] - scl["offset"]
@@ -845,9 +842,9 @@ class CachedBasinGraphDataset(Dataset):
         self.features = copy.deepcopy(self.cfg.features)
         self.time_slice = _get_time_slice(cfg, subset)
 
-        self.basin_dict = _get_basin_subbasin_dict(cfg, subset)
-        self.basins = list(self.basin_dict.keys())
-        self.subbasins = {x for s in self.basin_dict.values() for x in s}
+        self.basin_subset_dict = _get_basin_subbasin_dict(cfg, subset)
+        self.basins = list(self.basin_subset_dict.keys())
+        self.subbasins = {x for s in self.basin_subset_dict.values() for x in s}
 
         train_stats = get_train_ds_stats(cfg)
         self.s_encoding = train_stats["s_encoding"]
@@ -856,48 +853,37 @@ class CachedBasinGraphDataset(Dataset):
         self.d_scale = train_stats["d_scale"]
         self._update_encoded_features()
 
-        self.x_s, self.basin_subbasin_map = self._load_attributes()
+        self.x_s, self.basin_subbasin_counts = self._load_attributes()
         self.graphs = self._load_basin_graphs()
 
         self.target = self.features.target
         self.basin_lookup, self.sample_list, self.basin_index_map = self._load_indices()
 
 
-        # print("Loading sample indices from cache...", end="")
-        # try:
-        #     with open(self.cache_dir / "sample_list.json", "r") as f:
-        #         self.sample_list = json.load(f)
-        #     with open(self.cache_dir / "basin_index_map.json", "r") as f:
-        #         self.basin_index_map = json.load(f)
-        # except FileNotFoundError:
-        #     raise FileNotFoundError(
-        #         f"Index files not found in {self.cache_dir}. "
-        #         "Please run the cache creation process first."
-        #     )
-        # print("Done!")
-
     def _load_indices(self):
         subset_name = self.data_subset.name
-        index_dir = self.cache_dir / '_indices' / f"sequence={str(self.cfg.sequence_length)}"
+        index_dir = self.cache_dir / "_indices" / f"sequence={str(self.cfg.sequence_length)}"
 
         lookup_path = index_dir / "basin_lookup.json"
         list_path = index_dir / "sample_list.npy"
         map_path = index_dir / "basin_index_map.json"
 
         if not list_path.exists():
-            raise FileNotFoundError(f"Index cache not found for {subset_name}. Run DynamicCacheManager.")
+            raise FileNotFoundError(
+                f"Index cache not found for {subset_name}. Run DynamicCacheManager."
+            )
 
         print(f"Loading optimized indices for {subset_name}...", end="")
-        
+
         # 1. Load Basin Lookup (List of strings)
         with open(lookup_path, "r") as f:
             basin_lookup = json.load(f)
-            
+
         # 2. Load Sample List (Memory Mapped Integer Array)
         # mmap_mode='r' means it stays on disk and loads pages into RAM only when accessed.
         # This reduces initial RAM usage to near zero for this object.
-        sample_list = np.load(list_path, mmap_mode='r')
-        
+        sample_list = np.load(list_path, mmap_mode="r")
+
         # 3. Load Index Map (for Sampler)
         with open(map_path, "r") as f:
             basin_index_map = json.load(f)
@@ -964,14 +950,12 @@ class CachedBasinGraphDataset(Dataset):
         Returns:
             xr.Dataset: An xarray dataset of attribute data with basin coordinates.
         """
-        print("Loading static attributes...", end="")
         df = pd.read_parquet(self.cfg.attributes_file)
         # Trim to basin subset
         df = df[df.index.get_level_values("basin").isin(self.basins)]
 
-        basin_subbasin_map = {
-            basin: list(row["subbasin"]) for basin, row in df.reset_index().groupby("basin")
-        }
+        # Get the size of each basin (useful for graph packing later)
+        basin_subbasin_counts = df.groupby('basin').apply(len).to_dict()
 
         df = df.droplevel("basin")
 
@@ -980,31 +964,23 @@ class CachedBasinGraphDataset(Dataset):
         ds, self.features = _encode_data(ds, "static", self.features, self.s_encoding)
         ds = _normalize_data(ds, self.s_scale)
 
-        print("Done!")
-        return ds, basin_subbasin_map
+        return ds, basin_subbasin_counts
 
     def __getitem__(self, idx: int) -> dict:
         """Generate one batch of data."""
-
-        # 1. Retrieve integers (returns numpy.int32 scalars)
         basin_idx, date_int = self.sample_list[idx]
 
-        # 2. Decode Basin ID
         basin = self.basin_lookup[basin_idx]
+        subset_subbasins = self.basin_subset_dict[basin]
 
-        # 3. Decode Date
-        # FIXED: Cast date_int to native python int first
-        end_date = np.datetime64(int(date_int), 'D') 
+        end_date = np.datetime64(int(date_int), "D")
+        start_date = end_date - np.timedelta64(self.cfg.sequence_length - 1, "D")
 
-        start_date = end_date - np.timedelta64(self.cfg.sequence_length - 1, 'D')
-
-        # basin, end_date = self.sample_list[idx]
-        # start_date = end_date - pd.Timedelta(days=self.cfg.sequence_length - 1)
-
-        # basin_ds = self.basin_ds[basin]
         with xr.open_zarr(self.cache_dir / basin, consolidated=True) as basin_ds:
             date_slice = slice(start_date, end_date)
             ds = basin_ds.sel(date=date_slice)
+
+            subbasins = list(ds.coords["subbasin"].values)
 
             # NaN padding
             # Identify all dynamic and target columns that are required for this sample.
@@ -1035,23 +1011,26 @@ class CachedBasinGraphDataset(Dataset):
                 )
                 dynamic[source] = np.asarray(source_arr)  # Ensure numpy, not dask
 
-            target = {}
             if not self.cfg.model_args.seq2seq:
                 ds = ds.sel(date=[end_date])
 
-            for t_name in self.target:
-                target_arr = (
-                    ds[self.target]
-                    .to_array(dim="variable")
-                    .transpose("date", "subbasin", "variable")
-                    .compute()
-                )
-                target[t_name] = np.asarray(target_arr)
+            # Build an xarray condition along the "subbasin" coordinate
+            subbasin_mask = xr.DataArray(
+                [sb in subset_subbasins for sb in ds.subbasin.values],
+                coords={"subbasin": ds.subbasin},
+                dims=["subbasin"],
+            )
+            masked_ds = ds[self.target].where(subbasin_mask, other=np.nan)
+            target_arr = (
+                masked_ds.to_array(dim="variable")
+                .transpose("date", "subbasin", "variable")
+                .compute()
+            )
+            target = {t_name: np.asarray(target_arr) for t_name in self.target}
 
         static = None
         if self.x_s is not None and self.features.static:
-            subbasins = self.basin_subbasin_map[basin]
-            static_ds = self.x_s.sel(subbasin=subbasins)
+            static_ds = self.x_s.sel(subbasin=ds.subbasin)
             static_arr = (
                 static_ds[self.features.static]
                 .to_array(dim="variable")
@@ -1064,7 +1043,7 @@ class CachedBasinGraphDataset(Dataset):
             dynamic=dynamic, graph_edges=self.graphs[basin], static=static, y=target
         )
 
-        return basin, end_date, sample
+        return basin, subbasins, end_date, sample
 
     def denormalize(self, x: Array, name: str) -> Array:
         """

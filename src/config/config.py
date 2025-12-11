@@ -330,9 +330,9 @@ class Config(BaseModel):
         self.model_args.assim_sizes.update(assim.model_args)
 
         self.max_training_steps += assim.additional_steps
-        self.max_training_hours = (
-            assim.additional_hours
-        )  # Hours do not accumulate from saved states.
+
+        # Hours do not accumulate from saved states.
+        self.max_training_hours = assim.additional_hours
 
     def rgetattr(self, attr: str, *args):
         """

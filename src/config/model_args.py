@@ -28,6 +28,21 @@ class STGATArgs(BaseModelArgs):
     use_obs_memory: bool = True
 
 
+class SFGRNNArgs(BaseModelArgs):
+    name: Literal["sf_grnn"]
+    k_hops: int = Field(..., gt=0)
+    num_heads: int = Field(..., gt=0)
+    return_weights: bool = False
+    supervised_attn: bool = False
+    target: list[str] = None
+    seq_length: int = None
+    dense_sizes: dict[str, int] = None
+    sparse_sizes: dict[str, int] = None
+    static_size: int = None
+    assim_sizes: dict[str, dict] = Field(default_factory=dict)
+    use_obs_memory: bool = True
+
+
 class SeqAttnArgs(BaseModelArgs):
     name: Literal["lstm_mlp_attn", "flexible_hybrid"]
     num_layers: int = Field(..., gt=0)
@@ -67,4 +82,4 @@ class MSAttnArgs(BaseModelArgs):
     active_source: dict[str, bool] = Field(default_factory=dict)
 
 
-ModelArgs: TypeAlias = SeqAttnArgs | StackArgs | GraphLSTMArgs | MSAttnArgs | STGATArgs
+ModelArgs: TypeAlias = SeqAttnArgs | StackArgs | GraphLSTMArgs | MSAttnArgs | STGATArgs | SFGRNNArgs

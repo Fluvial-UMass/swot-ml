@@ -43,39 +43,46 @@ def validate_list_or_str(arg: list[str] | str | None) -> list[str]:
         return arg
     else:
         raise TypeError(f"Argument must be list, str, or None. Received {type(arg)=} ({arg=}).")
-    
+
+
 def retry_on_concurrent_write(func=None, *, max_retries=15, base_delay=0.5):
     """
     Decorator for retrying on concurrent write conflicts.
     Can be used as @retry_on_concurrent_write or @retry_on_concurrent_write(max_retries=20)
     """
+
     def decorator(f):
         @wraps(f)
         def wrapper(*args, **kwargs):
             last_exception = None
-            
+
             for attempt in range(max_retries):
                 try:
                     return f(*args, **kwargs)
                 except Exception as e:
                     last_exception = e
                     error_msg = str(e).lower()
-                    
-                    if "concurrent transaction" in error_msg or "conflicting concurrent" in error_msg:
+
+                    if (
+                        "concurrent transaction" in error_msg
+                        or "conflicting concurrent" in error_msg
+                    ):
                         if attempt < max_retries - 1:
-                            delay = base_delay * (1.5 ** attempt) + random.uniform(0, 2)
+                            delay = base_delay * (1.5**attempt) + random.uniform(0, 2)
                             delay = min(delay, 30)
-                            
-                            print(f"Concurrent write conflict (attempt {attempt + 1}/{max_retries}). "
-                                  f"Retrying in {delay:.2f}s...")
+
+                            print(
+                                f"Concurrent write conflict (attempt {attempt + 1}/{max_retries}). "
+                                f"Retrying in {delay:.2f}s..."
+                            )
                             time.sleep(delay)
                             continue
                     raise
-            
+
             raise Exception(f"Failed after {max_retries} retries. Last error: {last_exception}")
-        
+
         return wrapper
-    
+
     if func is None:
         # Called with arguments: @retry_on_concurrent_write(max_retries=20)
         return decorator
@@ -530,7 +537,7 @@ class BasinDataLake:
             stats = dt.optimize.z_order(["date"])
             print_stats(stats, source)
 
-        self.vacuum(retention_hours = retention_hours, sources=sources)
+        self.vacuum(retention_hours=retention_hours, sources=sources)
 
     def vacuum(self, retention_hours: int = None, sources: list[str] = None):
         """
@@ -618,7 +625,7 @@ class BasinDataLake:
 
         count = 0
         if workers > 1:
-            ctx = multiprocessing.get_context('spawn')
+            ctx = multiprocessing.get_context("spawn")
             with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
                 futures = {
                     executor.submit(
@@ -869,6 +876,3 @@ class BasinDataLake:
                     # Ensure the xarray dataset is closed
                     if ds is not None:
                         ds.close()
-
-
-

@@ -7,6 +7,7 @@ from config.model_args import (
     SeqAttnArgs,
     StackArgs,
     STGATArgs,
+    SFGRNNArgs,
 )
 from data import CachedBasinGraphDataLoader, CachedBasinGraphDataset
 from models.base_model import BaseModel
@@ -14,6 +15,7 @@ from models.graph_transformer import ST_GATransformer
 from models.lstm_mlp_attn import LSTM_MLP_ATTN
 from models.ms_attention import MS_ATTN
 from models.stacked_lstm import STACKED_LSTM
+from models.sparse_fusion_gann import SparseFusionGRNN
 
 # Dictionary of valid model names and their constructors
 MODEL_MAP = {
@@ -21,6 +23,7 @@ MODEL_MAP = {
     "stacked_lstm": STACKED_LSTM,
     "ms_attn": MS_ATTN,
     "st_gat": ST_GATransformer,
+    "sf_grnn": SparseFusionGRNN,
 }
 
 
@@ -60,7 +63,7 @@ def set_model_data_args(cfg: Config, dataset: CachedBasinGraphDataset):
         cfg.model_args.static_size = len(dataset.features.static)
         cfg.model_args.time_aware = cfg.time_gaps
 
-    elif isinstance(cfg.model_args, STGATArgs):
+    elif isinstance(cfg.model_args, (STGATArgs, SFGRNNArgs)):
         cfg.model_args.target = dataset.target
         cfg.model_args.seq_length = cfg.sequence_length
         cfg.model_args.dense_sizes = {

@@ -1,7 +1,7 @@
-
 # ruff: noqa: E402
 import warnings
 from zarr.errors import UnstableSpecificationWarning, ZarrUserWarning
+
 warnings.filterwarnings("ignore", category=ZarrUserWarning)
 warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 
@@ -15,53 +15,52 @@ import dask.array as da
 from tqdm import tqdm
 from dask.distributed import Client
 
+
 class ZarrBasinStore:
-    def __init__(self, store_path, start_date='1980-01-01', end_date='2024-12-31'):
+    def __init__(self, store_path, start_date="1980-01-01", end_date="2024-12-31"):
         self.store_path = Path(store_path)
         self.date_range = pd.date_range(start_date, end_date, freq="D").tz_localize(None)
-        
+
         if not self.store_path.is_dir():
             store_path.mkdir()
 
-
     def write_batch_data(self, basin_id, batch_df, all_basin_subs, batch_subs, init_vars=True):
         """
-            all_basin_subs: The full list of all subbasins in the Zarr store (for indexing).
-            batch_subs: The specific contiguous list of subbasins we are writing NOW.
+        all_basin_subs: The full list of all subbasins in the Zarr store (for indexing).
+        batch_subs: The specific contiguous list of subbasins we are writing NOW.
         """
         basin_path = self.store_path / basin_id
-        
+
         self.init_basin_coords(basin_path, all_basin_subs)
         if init_vars:
             self.init_missing_vars(basin_path, all_basin_subs, batch_df)
 
-        ds_write = batch_df.reset_index().set_index(['date', 'subbasin']).to_xarray()
+        ds_write = batch_df.reset_index().set_index(["date", "subbasin"]).to_xarray()
 
         # Strip timezone information to match the naive format of self.date_range
         # Otherwise the reindexing below will silently remove all data.
-        if ds_write.indexes['date'].tz is not None:
-            ds_write.coords['date'] = ds_write.indexes['date'].tz_localize(None)
+        if ds_write.indexes["date"].tz is not None:
+            ds_write.coords["date"] = ds_write.indexes["date"].tz_localize(None)
 
         # reindex to pad date and time
         ds_write = ds_write.reindex(subbasin=batch_subs)
         ds_write = ds_write.reindex(date=self.date_range)
-        
+
         # Transpose to match Zarr layout (date, subbasin)
         ds_write = ds_write.transpose("date", "subbasin")
 
         # Calculate subbasin indices
         start_idx = all_basin_subs.index(batch_subs[0])
         end_idx = all_basin_subs.index(batch_subs[-1])
-        
+
         # Sanity check: Ensure the slice length matches our dataset length
         expected_len = end_idx - start_idx + 1
         if len(ds_write.subbasin) != expected_len:
-            raise ValueError(f"Batch continuity error. Expected {expected_len} items, got {len(ds_write.subbasin)}")
+            raise ValueError(
+                f"Batch continuity error. Expected {expected_len} items, got {len(ds_write.subbasin)}"
+            )
 
-        region = {
-            "date": slice(0, len(self.date_range)), 
-            "subbasin": slice(start_idx, end_idx + 1)
-        }
+        region = {"date": slice(0, len(self.date_range)), "subbasin": slice(start_idx, end_idx + 1)}
 
         # --- Write ---
         ds_write.drop_vars(["date", "subbasin"]).to_zarr(
@@ -69,27 +68,27 @@ class ZarrBasinStore:
             region=region,
             mode="r+",
         )
-        
+
     def write_subbasin_data(self, basin_id, subbasin, all_basin_subs, data_df):
         """
         Writes a single subbasin df into the zarr store
         """
         basin_path = self.store_path / basin_id
-        
+
         self.init_basin_coords(basin_path, all_basin_subs)
         self.init_missing_vars(basin_path, all_basin_subs, data_df)
 
         # 3. Prepare Data for Region Write
         # Convert DataFrame to Xarray
         ds_write = data_df.to_xarray()
-        
+
         # CRITICAL: Expand dims to make it 2D (date, subbasin) to match Zarr shape
         # We select [subbasin] list to ensure the coordinate is preserved as a list/array
         ds_write = ds_write.expand_dims(subbasin=[subbasin])
-        
+
         # Ensure dimensions are in the correct order: (date, subbasin)
         ds_write = ds_write.transpose("date", "subbasin")
-        
+
         # Reindex time to ensure alignment with the store's master clock
         ds_write = ds_write.reindex(date=self.date_range, fill_value=np.nan)
 
@@ -103,8 +102,8 @@ class ZarrBasinStore:
         # Define the slice for the region write
         # region = {"dim_name": slice(start_index, end_index)}
         region = {
-            "date": slice(0, len(self.date_range)), # Write all dates
-            "subbasin": slice(subbasin_idx, subbasin_idx + 1) # Write specific subbasin index
+            "date": slice(0, len(self.date_range)),  # Write all dates
+            "subbasin": slice(subbasin_idx, subbasin_idx + 1),  # Write specific subbasin index
         }
 
         # 5. Write to Region
@@ -118,10 +117,7 @@ class ZarrBasinStore:
 
         return ds_write
 
-
-    def compute_and_store_stats(
-        self, var_names: str | list[str] = None, overwrite: bool = False
-    ):
+    def compute_and_store_stats(self, var_names: str | list[str] = None, overwrite: bool = False):
         """
         Iterates through all basin Zarr groups to compute and store normalization statistics.
         This is a standalone script to be run once after data is exported to Zarr.
@@ -171,7 +167,7 @@ class ZarrBasinStore:
                             "min": valid_values.min(),
                             "max": valid_values.max(),
                             "log_sum": np.log1p(positive_values).sum(),
-                            "log_sum_sq": (np.log1p(positive_values)**2).sum(),
+                            "log_sum_sq": (np.log1p(positive_values) ** 2).sum(),
                             "positive_count": positive_values.count(),
                         }
 
@@ -193,7 +189,7 @@ class ZarrBasinStore:
                             "max": stats["max"].item(),
                             "log_sum": stats["log_sum"].item(),
                             "log_sum_sq": stats["log_sum_sq"].item(),
-                            "positive_count": stats["positive_count"].item()
+                            "positive_count": stats["positive_count"].item(),
                         }
 
                     if stats_dict:
@@ -209,7 +205,6 @@ class ZarrBasinStore:
                     if ds is not None:
                         ds.close()
 
-
     def init_basin_coords(self, basin_path, subbasin_list):
         """Initializes basin zarr with coordinates if needed."""
         if basin_path.is_dir():
@@ -218,14 +213,13 @@ class ZarrBasinStore:
         coords = {"date": self.date_range, "subbasin": subbasin_list}
         # Create the template dataset (lazy)
         template_ds = xr.Dataset(coords=coords)
-        
+
         # Define chunks: Time is chunked, subbasin is one chunk (or -1 for all)
         # Note: Adjust chunking strategy based on typical read patterns
         template_ds = template_ds.chunk({"date": 365, "subbasin": -1})
-        
+
         # Compute nothing, just write metadata and coordinate arrays
         template_ds.to_zarr(basin_path, mode="w", compute=False, consolidated=True)
-
 
     def init_missing_vars(self, basin_path, subbasin_list, data_df):
         """If any variables are missing, we need to initiailize them for all subbasins with dummy data."""
@@ -234,7 +228,7 @@ class ZarrBasinStore:
             existing_vars = set(ds_ondisk.data_vars).union(set(ds_ondisk.coords))
 
         new_vars = [v for v in data_df.columns if v not in existing_vars]
-        
+
         if new_vars:
             # Create dummy variables filled with NaN for the new columns
             chunks = (365, len(subbasin_list))
@@ -245,16 +239,15 @@ class ZarrBasinStore:
                 # Create a lazy dask array filled with NaNs
                 darr = da.full(dummy_shape, np.nan, chunks=chunks)
                 new_vars_dict[var_name] = (["date", "subbasin"], darr)
-            
+
             dummy_ds = xr.Dataset(
-                data_vars=new_vars_dict,
-                coords={"date": self.date_range, "subbasin": subbasin_list}
+                data_vars=new_vars_dict, coords={"date": self.date_range, "subbasin": subbasin_list}
             )
 
             # Append new variables. Dask handles the streaming write.
             dummy_ds.to_zarr(basin_path, mode="a", consolidated=True)
 
-        
+
 def validate_list_or_str(arg: list[str] | str | None) -> list[str]:
     if arg is None:
         return []

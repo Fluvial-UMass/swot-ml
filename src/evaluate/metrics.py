@@ -82,12 +82,21 @@ def get_all_metrics(df: pd.DataFrame, disp: bool = False):
         y = df[("obs", feature)]
         y_hat = df[("pred", feature)]
 
+        kge_results = calc_kge(y, y_hat)
+        if isinstance(kge_results, tuple):
+            kge, corr, alpha, beta = kge_results
+        else:
+            kge = corr = alpha = beta = np.nan
+
         metrics[feature] = {
             "num_obs": np.sum(~np.isnan(y)),
             "R2": mask_nan(r2_score)(y, y_hat),
             "r": calc_r(y, y_hat),
             "NSE": calc_nse(y, y_hat),
-            "KGE": calc_kge(y, y_hat),
+            "KGE": kge,
+            "corr": corr,
+            "alpha": alpha,
+            "beta": beta,
             "sigE": calc_sigE(y, y_hat),
             "rRMSE": calc_rrmse(y, y_hat),
             "MAPE": mask_nan(mean_absolute_percentage_error)(y, y_hat),
@@ -145,7 +154,7 @@ def calc_nse(y, y_hat):
 
 @mask_nan
 def calc_kge(y, y_hat):
-    correlation = np.corrcoef(y, y_hat)[0, 1]
+    corr = np.corrcoef(y, y_hat)[0, 1]
     mean_y = np.mean(y)
     mean_y_hat = np.mean(y_hat)
     std_y = np.std(y)
@@ -153,9 +162,11 @@ def calc_kge(y, y_hat):
     if std_y == 0 or mean_y == 0:
         return np.nan
     else:
-        return 1 - np.sqrt(
-            (correlation - 1) ** 2 + (std_y_hat / std_y - 1) ** 2 + (mean_y_hat / mean_y - 1) ** 2
-        )
+        alpha = std_y_hat / std_y
+        beta = mean_y_hat / mean_y
+        kge = 1 - np.sqrt((corr - 1) ** 2 + (alpha - 1) ** 2 + (beta - 1) ** 2)
+
+    return kge, corr, alpha, beta
 
 
 @mask_nan

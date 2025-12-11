@@ -40,5 +40,8 @@ class BaseModel(eqx.Module):
     def __call__(self, data: GraphBatch, key: PRNGKeyArray | None) -> Array:
         raise NotImplementedError
 
+    def add_assimimlator(self, source_name, num_source_features, source_network_sizes):
+        raise NotImplementedError
+
     def finetune_update(self, **kwargs):
         raise NotImplementedError

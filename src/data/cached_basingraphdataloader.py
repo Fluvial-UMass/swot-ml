@@ -113,17 +113,30 @@ class GraphPackingSampler(Sampler[list[int]]):
                 break
 
 
-def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> GraphBatch:
+def padding_collate_fn(
+    batch: list[tuple[str, list[str], np.datetime64, GraphBatch]], target_nodes_per_batch: int
+) -> GraphBatch:
     """
     Collates (basin, time) samples and then pads them to a fixed size.
     """
-    basins, dates, samples = zip(*batch)  # List of tuples -> lists
+    basins, subbasins, dates, samples = zip(*batch)  # List of tuples -> lists
 
     # Step 1: Pre-calculate sizes from all samples in the batch
     num_nodes_per_graph = [s.static.shape[0] for s in samples]
     num_real_nodes = sum(num_nodes_per_graph)
     num_padding_nodes = target_nodes_per_batch - num_real_nodes
     assert num_padding_nodes >= 0, "batch was created with more nodes than target"
+
+    # We repeat the basin/date for every node in the graph so indices align with tensors.
+    # We are NOT padding them as that is only necessary for the tensors passed into the model.
+    # These are just metadata to track the IDs etc.
+    flat_basins = []
+    flat_dates = []
+    flat_subbasins = []
+    for i, n_nodes in enumerate(num_nodes_per_graph):
+        flat_basins.extend([basins[i]] * n_nodes)
+        flat_dates.extend([dates[i]] * n_nodes)
+        flat_subbasins.extend(subbasins[i])
 
     # Step 2: Pack the "real" data by concatenating
     # Dynamic features
@@ -198,7 +211,7 @@ def padding_collate_fn(batch: list[tuple], target_nodes_per_batch: int) -> Graph
         y=padded_targets,
     )
 
-    return list(basins), list(dates), final_batch
+    return flat_basins, flat_subbasins, flat_dates, final_batch
 
 
 class CachedBasinGraphDataLoader(DataLoader):
@@ -208,11 +221,10 @@ class CachedBasinGraphDataLoader(DataLoader):
         torch.manual_seed(cfg.model_args.seed)
 
         collate_fn = partial(padding_collate_fn, target_nodes_per_batch=cfg.target_nodes_per_batch)
-        basin_subbasin_counts = {k: len(v) for k, v in dataset.basin_subbasin_map.items()}
 
         batch_sampler = GraphPackingSampler(
             dataset.basin_index_map,
-            basin_subbasin_counts,
+            dataset.basin_subbasin_counts,
             cfg.target_nodes_per_batch,
             cfg.candidate_pool_size,
             infinite_shuffle,
@@ -231,7 +243,7 @@ class CachedBasinGraphDataLoader(DataLoader):
             pin_memory=cfg.pin_memory,
             timeout=timeout,
             persistent_workers=persistent_workers,
-            prefetch_factor=1 if cfg.num_workers>0 else None,
+            prefetch_factor=1 if cfg.num_workers > 0 else None,
         )
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 
