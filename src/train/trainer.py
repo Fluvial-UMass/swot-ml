@@ -6,6 +6,7 @@ import shutil
 import sys
 import time
 import traceback
+from typing import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -289,6 +290,7 @@ class Trainer:
             loss, grads, self.model, self.opt_state = make_step(
                 self.model,
                 batch,
+                self.training_dl.denormalize,
                 step_key,
                 self.opt_state,
                 self.optim,
@@ -349,6 +351,7 @@ class Trainer:
                 self.model,
                 None,
                 batch,
+                self.validation_dl.denormalize,
                 self.train_key,
                 **self.cfg.step_kwargs.model_dump(),
             )
@@ -538,6 +541,7 @@ class Trainer:
 def make_step(
     model: models.BaseModel,
     data: GraphBatch,
+    denorm_fn: Callable,
     key: PRNGKeyArray,
     opt_state: PyTree,
     optim: optax.GradientTransformation,
@@ -574,7 +578,7 @@ def make_step(
     """
     diff_model, static_model = eqx.partition(model, filter_spec)
     loss_fn_with_grad = eqx.filter_value_and_grad(compute_loss)
-    loss, grads = loss_fn_with_grad(diff_model, static_model, data, key, **kwargs)
+    loss, grads = loss_fn_with_grad(diff_model, static_model, data, denorm_fn, key, **kwargs)
 
     updates, opt_state = optim.update(grads, opt_state, params=model)
     model = eqx.apply_updates(model, updates)

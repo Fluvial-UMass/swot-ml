@@ -131,6 +131,7 @@ class Config(BaseModel):
     dynamic_encoding: Encoding = Field(default_factory=Encoding)
     static_encoding: Encoding = Field(default_factory=Encoding)
     log_norm_cols: list[str] = Field(default_factory=list)
+    no_norm_cols: list[str] = Field(default_factory=list)
     range_norm_cols: list[str] = Field(default_factory=list)
     in_memory: bool = False
 

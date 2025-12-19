@@ -1,4 +1,4 @@
-from typing import Literal, TypeAlias
+from typing import Literal, TypeAlias, Callable
 
 from pydantic import BaseModel, Field
 
@@ -16,7 +16,7 @@ class BaseModelArgs(BaseModel):
 
 class STGATArgs(BaseModelArgs):
     name: Literal["st_gat"]
-    k_hops: int = Field(..., gt=0)
+    k_hops: int = Field(..., gte=0)
     num_heads: int = Field(..., gt=0)
     return_weights: bool = False
     target: list[str] = None
@@ -30,8 +30,20 @@ class STGATArgs(BaseModelArgs):
 
 class SFGRNNArgs(BaseModelArgs):
     name: Literal["sf_grnn"]
-    k_hops: int = Field(..., gt=0)
+    k_hops: int = Field(..., gte=0)
     num_heads: int = Field(..., gt=0)
+    return_weights: bool = False
+    supervised_attn: bool = False
+    target: list[str] = None
+    seq_length: int = None
+    dense_sizes: dict[str, int] = None
+    sparse_sizes: dict[str, int] = None
+    static_size: int = None
+    assim_sizes: dict[str, dict] = Field(default_factory=dict)
+    use_obs_memory: bool = True
+
+class MCDALSTMArgs(BaseModelArgs):
+    name: Literal["mc_da_lstm"]
     return_weights: bool = False
     supervised_attn: bool = False
     target: list[str] = None
@@ -82,4 +94,4 @@ class MSAttnArgs(BaseModelArgs):
     active_source: dict[str, bool] = Field(default_factory=dict)
 
 
-ModelArgs: TypeAlias = SeqAttnArgs | StackArgs | GraphLSTMArgs | MSAttnArgs | STGATArgs | SFGRNNArgs
+ModelArgs: TypeAlias = SeqAttnArgs | StackArgs | GraphLSTMArgs | MSAttnArgs | STGATArgs | SFGRNNArgs | MCDALSTMArgs

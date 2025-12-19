@@ -109,7 +109,7 @@ def model_iterate(
             denorm_std_fn = denorm_std_fns[target_name]
             target_pred = y_pred[target_name]
             # Check the type of this target's head. Changes how we create predictions.
-            if isinstance(model.head[target_name], GMM):
+            if isinstance(model.head.get(target_name), GMM):
                 t_exp, t_std = _gmm_expected_values(
                     target_pred, batch.node_mask, denorm_fn, denorm_std_fn
                 )

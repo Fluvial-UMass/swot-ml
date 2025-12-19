@@ -117,13 +117,17 @@ class ZarrBasinStore:
 
         return ds_write
 
-    def compute_and_store_stats(self, var_names: str | list[str] = None, overwrite: bool = False):
+    def compute_and_store_stats(self, basins: str | list[str], var_names: str | list[str] = None, overwrite: bool = False):
         """
         Iterates through all basin Zarr groups to compute and store normalization statistics.
         This is a standalone script to be run once after data is exported to Zarr.
         """
+        basins = validate_list_or_str(basins)
         var_names = validate_list_or_str(var_names)
         basin_paths = [p for p in self.store_path.iterdir() if p.is_dir()]
+
+        if basins:
+            basin_paths = [p for p in basin_paths if p.stem in basins]
 
         with Client() as client:
             print(f"Dask client started. Dashboard at: {client.dashboard_link}")

@@ -153,6 +153,9 @@ def _get_scale_from_precomp_stats(cfg: Config, basins: list[str], encoding: dict
             scale[var]["log_norm"] = True
             scale[var]["offset"] = log_mean
             scale[var]["scale"] = log_std
+        elif var in cfg.no_norm_cols:
+            scale[var]['offset'] = 0
+            scale[var]['scale'] = 1
         elif var in cfg.range_norm_cols:
             min_val, max_val = stats["min"], stats["max"]
             scale[var]["offset"] = min_val
@@ -234,6 +237,7 @@ def config_hash(cfg: Config) -> str:
         "dynamic_encoding",
         "static_encoding",
         "log_norm_cols",
+        "no_norm_cols",
         "range_norm_cols",
         "train_date_range",
         "add_rolling_means",
@@ -251,7 +255,7 @@ def config_hash(cfg: Config) -> str:
 class DynamicCacheManager:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.cache_dir = cfg.zarr_dir / "_cache2" / config_hash(cfg)
+        self.cache_dir = cfg.zarr_dir / "_cache" / config_hash(cfg)
         self.train_stats = None
         print(f"Caches will be stored at: {self.cache_dir}")
 
@@ -927,14 +931,20 @@ class CachedBasinGraphDataset(Dataset):
             if basin_id not in self.basins:
                 continue
 
-            # Map subbasin IDs to consecutive indices
-            subbasin_map = {node: i for i, node in enumerate(subG.nodes())}
+            # Force deterministic sort (alphanumeric)
+            ordered_nodes = sorted(list(subG.nodes())) 
+            subbasin_map = {node: i for i, node in enumerate(ordered_nodes)}
 
             source_nodes, dest_nodes = [], []
             for source, dest in subG.edges:
                 source_nodes.append(subbasin_map[source])
                 dest_nodes.append(subbasin_map[dest])
-            graphs[basin_id] = np.array([source_nodes, dest_nodes], dtype=np.int32)
+
+            # Return BOTH the edges and the ordered node list to ensure safety
+            graphs[basin_id] = {
+                "edges": np.array([source_nodes, dest_nodes], dtype=np.int32),
+                "nodes": ordered_nodes
+            }
 
         missing_basins = set(self.basins) - set(graphs.keys())
         if missing_basins:
@@ -973,6 +983,11 @@ class CachedBasinGraphDataset(Dataset):
         basin = self.basin_lookup[basin_idx]
         subset_subbasins = self.basin_subset_dict[basin]
 
+        # Retrieve the authoritative order from the graph loader
+        graph_data = self.graphs[basin]
+        expected_order = graph_data["nodes"]
+        edges = graph_data["edges"]
+
         end_date = np.datetime64(int(date_int), "D")
         start_date = end_date - np.timedelta64(self.cfg.sequence_length - 1, "D")
 
@@ -980,6 +995,9 @@ class CachedBasinGraphDataset(Dataset):
             date_slice = slice(start_date, end_date)
             ds = basin_ds.sel(date=date_slice)
 
+            # Reindex the Zarr data to match the Graph indices
+            ds = ds.reindex(subbasin=expected_order)
+            # Now this list is guaranteed to match indices 0, 1, 2... of the edge
             subbasins = list(ds.coords["subbasin"].values)
 
             # NaN padding
@@ -1040,7 +1058,7 @@ class CachedBasinGraphDataset(Dataset):
             static = np.asarray(static_arr)
 
         sample = GraphBatch(
-            dynamic=dynamic, graph_edges=self.graphs[basin], static=static, y=target
+            dynamic=dynamic, graph_edges=edges, static=static, y=target
         )
 
         return basin, subbasins, end_date, sample
@@ -1061,7 +1079,7 @@ class CachedBasinGraphDataset(Dataset):
         log_norm = self.d_scale[name]["log_norm"]
 
         if log_norm:
-            return np.expm1(x * scale + offset)
+            return jnp.expm1(x * scale + offset)
         else:
             return x * scale + offset
 
@@ -1079,8 +1097,8 @@ class CachedBasinGraphDataset(Dataset):
 
             # Log-normal variance in original space
             # https://en.wikipedia.org/wiki/Log-normal_distribution
-            var_original = (np.exp(sigma_log**2) - 1) * np.exp(2 * mu_log + sigma_log**2)
-            return np.sqrt(var_original)
+            var_original = (jnp.exp(sigma_log**2) - 1) * jnp.exp(2 * mu_log + sigma_log**2)
+            return jnp.sqrt(var_original)
         else:
             # Z-score and range-norm case
             scale = self.d_scale[name]["scale"]

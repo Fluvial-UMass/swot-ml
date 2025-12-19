@@ -9,6 +9,7 @@ from jaxtyping import Array, PRNGKeyArray
 from data import GraphBatch
 from .base_model import BaseModel
 from .layers.static_mlp import StaticMLP
+# from .layers.graph_attn import SpatioTemporalLSTMCell
 
 
 def segment_softmax(logits: Array, segment_ids: Array, num_segments: int) -> Array:
@@ -258,12 +259,12 @@ class BidirectionalGraphLayer(eqx.Module):
         h_norm = jax.vmap(self.norm)(h)
 
         # Downstream: aggregate from tributaries
-        downstream_msg, downstream_weights = self.downstream_agg(
+        downstream_msg, downstream_weight = self.downstream_agg(
             h_norm, x_s, edge_index, node_mask, edge_mask, key=key
         )
 
         # Upstream: receive from downstream neighbor
-        upstream_msg, upstream_gates = self.upstream_prop(
+        upstream_msg, upstream_gate = self.upstream_prop(
             h_norm, x_s, edge_index, node_mask, edge_mask
         )
 
@@ -273,8 +274,8 @@ class BidirectionalGraphLayer(eqx.Module):
         output = h + message
 
         trace = {
-            "downstream_weights": downstream_weights,
-            "upstream_gates": upstream_gates,
+            "downstream_weight": downstream_weight,
+            "upstream_gate": upstream_gate,
         }
 
         return output, trace
@@ -334,6 +335,10 @@ class StackedGraphAttention(eqx.Module):
         *,
         key: PRNGKeyArray = None,
     ) -> tuple[Array, dict, Array, Array]:
+        
+        if len(self.layers)==0:
+            return x, {}, None, None
+
         keys = jax.random.split(key, self.k_hops) if key is not None else [None] * self.k_hops
 
         layer_traces = []
@@ -419,7 +424,7 @@ class SpatioTemporalLSTMCell(eqx.Module):
         h_temporal = h_temporal * node_mask[:, jnp.newaxis]
         c_new = c_new * node_mask[:, jnp.newaxis]
 
-        h_spatial, graph_traces, z, r = self.gat(
+        h_spatial, spatial_trace, z, r = self.gat(
             h_temporal,
             node_features,
             edge_index=edge_index,
@@ -431,9 +436,10 @@ class SpatioTemporalLSTMCell(eqx.Module):
         h_new = self.dropout(h_spatial, key=k2)
 
         new_state = (h_new, c_new)
-        trace_data = (graph_traces, z, r)
+        spatial_trace['z_gate'] = z
+        spatial_trace['r_gate'] = r
 
-        return new_state, trace_data
+        return new_state, spatial_trace
 
 
 class ObservationFusionModule(eqx.Module):
@@ -742,7 +748,7 @@ class SparseFusionGRNN(BaseModel):
         ):
             dense_input, step_obs_memory, step_key = scan_slice
 
-            (h_new, c_new), (graph_traces, z, r) = self.spat_temp_lstm(
+            (h_new, c_new), spatial_trace = self.spat_temp_lstm(
                 dense_input,
                 state_prev,
                 static_data,
@@ -758,7 +764,7 @@ class SparseFusionGRNN(BaseModel):
                 fusion_trace = {}
 
             new_state = (h_new, c_new)
-            accumulated_outputs = (h_new, graph_traces, z, r, fusion_trace)
+            accumulated_outputs = (h_new, spatial_trace, fusion_trace)
             return new_state, accumulated_outputs
 
         initial_h = jnp.zeros((num_locations, self.hidden_size))
@@ -778,7 +784,7 @@ class SparseFusionGRNN(BaseModel):
         final_state, accumulated = jax.lax.scan(partial_timestep, initial_state, scan_inputs)
 
         final_h, final_c = final_state
-        all_h, graph_traces, z, r, fusion_info = accumulated
+        all_h, spatial_trace, fusion_trace = accumulated
 
         # 5. Predictions
         if self.seq2seq:
@@ -789,16 +795,11 @@ class SparseFusionGRNN(BaseModel):
             predictions = {target: jax.vmap(head)(final_h) for target, head in self.head.items()}
 
         if self.supervised_attn:
-            predictions["attention_weights"] = fusion_info["weights"]
-            predictions["valid_obs"] = fusion_info["valid_obs"]
+            predictions["attention_weights"] = fusion_trace["weights"]
+            predictions["valid_obs"] = fusion_trace["valid_obs"]
 
         if self.return_weights:
-            weights = {
-                "graph": graph_traces,
-                "gru_z": z,
-                "gru_r": r,
-                "fusion": fusion_info,
-            }
+            weights = {"spatial": spatial_trace, "fusion": fusion_trace}
             return predictions, weights
         else:
             return predictions

@@ -469,7 +469,7 @@ def eval_model(
 
     eval_data_subset(DataSubset.test, run_test)
     # eval_data_subset(DataSubset.predict, run_predict)
-    # eval_data_subset(DataSubset.train, run_train)
+    eval_data_subset(DataSubset.train, run_train)
 
 
 # ┌────────────────────────────────┐ #

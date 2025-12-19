@@ -1,3 +1,6 @@
+from typing import Callable
+from functools import partial
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -10,6 +13,7 @@ def compute_loss(
     diff_model: PyTree,
     static_model: PyTree | None,
     data: GraphBatch,
+    denorm_fn: Callable,
     key: PRNGKeyArray,
     *,
     target_weights: dict[str, int],
@@ -70,9 +74,12 @@ def compute_loss(
         else:
             masked_y_hat = jnp.where(valid_mask, y_hat_target[..., 0], 0)
 
-        loss = loss_fn(masked_y, masked_y_hat, valid_mask)
+        target_denorm_fn = partial(denorm_fn, name=target_name)
+        loss = loss_fn(masked_y, masked_y_hat, valid_mask, target_denorm_fn)
         loss = jnp.nan_to_num(loss, 0) * target_weights[target_name]
         losses.append(loss)
+
+    loss = jnp.mean(jnp.stack(losses))
 
     # Check for Attention Supervision
     if "attention_weights" in y_hat:
@@ -82,9 +89,9 @@ def compute_loss(
             y_hat["valid_obs"],
             node_mask,
         )
-        losses.append(attn_loss_val)
+        losses + attn_loss_val
 
-    loss = jnp.mean(jnp.stack(losses))
+    
 
     return loss
 
@@ -107,19 +114,19 @@ def get_loss_fn(loss_name):
             raise ValueError(f"Config'd loss ({loss_name}) not found.")
 
 
-def mse_loss(y: Array, y_hat: Array, mask: Array):
+def mse_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
     """Calculates Mean Squared Error (MSE) loss."""
     mse = jnp.mean(jnp.square(y - y_hat), where=mask)
     return mse
 
 
-def mae_loss(y: Array, y_hat: Array, mask: Array):
+def mae_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
     """Calculates Mean Absolute Error (MAE) loss."""
     mae = jnp.mean(jnp.abs(y - y_hat), where=mask)
     return mae
 
 
-def huber_loss(y: Array, y_hat: Array, mask: Array, *, huber_delta: float = 1.0):
+def huber_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable, *, huber_delta: float = 1.0):
     """Calculates Huber loss."""
     # Passing delta through make_step is not yet implemented.
     residual = y - y_hat
@@ -129,37 +136,42 @@ def huber_loss(y: Array, y_hat: Array, mask: Array, *, huber_delta: float = 1.0)
     return jnp.mean(jnp.where(condition, squared_loss, linear_loss), where=mask)
 
 
-def nse_loss(y: Array, y_hat: Array, mask: Array):
+def nse_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
     """
     Calculates the smooth-joint NSE from Kratzert et al., 2019
     https://doi.org/10.5194/hess-23-5089-2019
     """
-    # Arrays can be either [batch, time, basins] or [basins, time] depending on model config.
-    # Graph models use the former because they need to predict over multiple basins for each step.
     sq_error = jnp.square(y - y_hat) * mask
-    std_y = jnp.std(y, axis=1, where=mask.astype(bool))  # Per-basin standard deviation
-    mse = jnp.mean(sq_error, axis=1)  # mean squared errors per basin
-    denom = jnp.square(
-        jnp.nan_to_num(std_y) + 0.1
-    )  # Denominator with smoothing and epsilon for stability
-    return jnp.mean(mse / denom)
+    mse = jnp.mean(sq_error, axis=0)  # mean squared errors per basin
+
+    std_y = jnp.std(y, axis=0, where=mask.astype(bool))  # Per-basin standard deviation
+    stable_std_y = jnp.nan_to_num(std_y) + 0.1
+    denom = jnp.square(stable_std_y) 
+
+    node_nse = mse / denom
+    jnp.mean(node_nse, where=node_nse!=0)
 
 
-def spin_up_nse_loss(y: Array, y_hat: Array, mask: Array):
+def spin_up_nse_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
     """Equivalent to nse_loss but with weights that favor the final ~1/3 of the sequence"""
+    y = denorm_fn(y)
+    y_hat = denorm_fn(y_hat)
+
     seq_len = y.shape[0]
     weights = jax.nn.sigmoid(jnp.linspace(-10, 10, seq_len))
 
-    sq_error = jnp.square(y - y_hat) * mask * weights[:, None]
+    sq_error = jnp.square(y - y_hat) * mask
+    mse = jnp.average(sq_error, axis=0, weights=weights)  # mean squared errors per basin
+
     std_y = jnp.std(y, axis=0, where=mask.astype(bool))  # Per-basin standard deviation
-    mse = jnp.mean(sq_error, axis=0)  # Sum of squared errors per basin
-    denom = jnp.square(
-        jnp.nan_to_num(std_y) + 0.1
-    )  # Denominator with smoothing and epsilon for stability
-    return jnp.mean(mse / denom)
+    stable_std_y = jnp.nan_to_num(std_y) + 0.1
+    denom = jnp.square(stable_std_y) 
+
+    node_nse = mse / denom
+    return jnp.mean(node_nse, where=node_nse!=0)
 
 
-def gmm_nll(y: Array, y_hat: dict[str, Array], mask: Array) -> Array:
+def gmm_nll(y: Array, y_hat: dict[str, Array], mask: Array, denorm_fn: Callable) -> Array:
     """
     Calculates the average negative log-likelihood for a Gaussian Mixture Model (GMM).
     """
