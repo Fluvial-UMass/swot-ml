@@ -94,8 +94,6 @@ def set_model_data_args(cfg: Config, dataset: CachedBasinGraphDataset):
 
     else:
         raise ValueError(f"Unknown model_args type: {type(cfg.model_args)}")
-    
-    
 
     return cfg
 

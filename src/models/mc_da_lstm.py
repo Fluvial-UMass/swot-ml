@@ -1,5 +1,4 @@
 from functools import partial
-from typing import Callable
 
 import equinox as eqx
 import jax
@@ -10,15 +9,14 @@ from jaxtyping import Array, PRNGKeyArray
 from data import GraphBatch
 from .base_model import BaseModel
 from .layers.static_mlp import StaticMLP
-from .layers.ealstm import EALSTMCell
-from .layers.muskingum_cunge import MuskingumCunge
+from .layers.ealstm import EALSTM
+from .layers.muskingum_cunge import LatentMuskingumCunge
 
 
 class ObservationFusionModule(eqx.Module):
     """Source-agnostic observation fusion using cross-attention."""
 
     hidden_size: int
-    null_obs_emb: Array
     obs_query_proj: eqx.nn.Linear
     obs_key_proj: eqx.nn.Linear
     obs_value_proj: eqx.nn.Linear
@@ -30,7 +28,6 @@ class ObservationFusionModule(eqx.Module):
         keys = jax.random.split(key, 6)
         self.hidden_size = hidden_size
 
-        self.null_obs_emb = jax.random.normal(keys[0], (hidden_size,))
         self.obs_query_proj = eqx.nn.Linear(hidden_size, hidden_size, key=keys[1])
         self.obs_key_proj = eqx.nn.Linear(hidden_size, hidden_size, key=keys[2])
         self.obs_value_proj = eqx.nn.Linear(hidden_size, hidden_size, key=keys[3])
@@ -42,12 +39,7 @@ class ObservationFusionModule(eqx.Module):
             depth=2,
             key=keys[4],
         )
-
         self.output_gate = eqx.nn.Linear(hidden_size * 2, hidden_size, key=keys[5])
-        # A bias of +2.0 makes sigmoid(x) ≈ 0.88.
-        # This forces the model to use the fusion update early in training.
-        new_bias = self.output_gate.bias + 2.0
-        self.output_gate = eqx.tree_at(lambda g: g.bias, self.output_gate, new_bias)
 
         self.norm = eqx.nn.LayerNorm(hidden_size)
 
@@ -72,27 +64,16 @@ class ObservationFusionModule(eqx.Module):
         staleness_emb = jax.vmap(jax.vmap(self.staleness_embedding))(log_staleness)
         modulated_obs = obs_stack + staleness_emb
 
-        # Null token
-        batch_size = h.shape[0]
-        null_emb = jnp.tile(self.null_obs_emb[None, None, :], (batch_size, 1, 1))
-        null_valid = jnp.ones((batch_size, 1), dtype=jnp.bool_)  # null is always valid
-
-        # concat obs with null
-        full_obs = jnp.concatenate([modulated_obs, null_emb], axis=1)
-        full_valid = jnp.concatenate([valid_stack, null_valid], axis=1)
-
         # sparse attention
         query = jax.vmap(self.obs_query_proj)(h)
-        keys = jax.vmap(jax.vmap(self.obs_key_proj))(full_obs)
-        values = jax.vmap(jax.vmap(self.obs_value_proj))(full_obs)
+        keys = jax.vmap(jax.vmap(self.obs_key_proj))(modulated_obs)
+        values = jax.vmap(jax.vmap(self.obs_value_proj))(modulated_obs)
 
         scale = jnp.sqrt(self.hidden_size)
-        scores = jnp.einsum("lh,lsh->ls", query, keys) / scale
+        scores = jnp.sum(query[:, jnp.newaxis, :] * keys, axis=-1) / scale
 
         # Mask invalid, leaving Null as the fallback
-        scores = jnp.where(full_valid, scores, -1e9)
-
-        # Never collapses to -inf because of the null obs
+        scores = jnp.where(valid_stack, scores, -1e9)
         weights = jax.nn.softmax(scores, axis=-1)
 
         fused_obs = jnp.einsum("ls,lsh->lh", weights, values)
@@ -100,16 +81,17 @@ class ObservationFusionModule(eqx.Module):
         gate_input = jnp.concatenate([h, fused_obs], axis=-1)
         gate = jax.nn.sigmoid(jax.vmap(self.output_gate)(gate_input))
 
-        # Only apply gate if we actually had REAL data 
-        # If we only attended to Null, we effectively want update=0.
+        # Determine if any observation was valid
         any_real_valid = jnp.any(valid_stack, axis=-1, keepdims=True)
+
+        # Zero out update if no valid observations exist
         effective_gate = jnp.where(any_real_valid, gate, 0.0)
 
         # residual update
         update = jax.vmap(self.norm)(fused_obs)
         h_new = h + (effective_gate * update)
 
-        return h_new, {"weights": weights, "valid_obs": full_valid, "gate": effective_gate}
+        return h_new, {"weights": weights, "valid_obs": valid_stack, "gate": effective_gate}
 
 
 class SourceEmbedderRegistry(eqx.Module):
@@ -177,15 +159,17 @@ class MCDALSTM(BaseModel):
     dense_embedders: dict[str, eqx.nn.MLP]
     fusion_norm: eqx.nn.LayerNorm
     source_registry: SourceEmbedderRegistry
-    lstm_cell: EALSTMCell
+    ealstm: EALSTM
     obs_fusion: ObservationFusionModule
-    routing: MuskingumCunge
+    routing_init_mlp: StaticMLP
+    latent_mc: LatentMuskingumCunge
 
     def __init__(
         self,
         *,
         target: list,
         seq_length: int,
+        num_substeps: int,
         dense_sizes: dict[str, int],
         sparse_sizes: dict[str, int],
         static_size: int,
@@ -203,9 +187,8 @@ class MCDALSTM(BaseModel):
         key = jrandom.PRNGKey(seed)
         keys = list(jrandom.split(key, 10))
 
-        super().__init__(hidden_size, ['runoff'], head, key=keys.pop(0))
+        super().__init__(hidden_size, target, head, key=keys.pop(0))
 
-        self.target = [target[0]]
         self.hidden_size = hidden_size
         self.seq_length = seq_length
         self.dense_sources = list(dense_sizes.keys())
@@ -229,7 +212,7 @@ class MCDALSTM(BaseModel):
             )
         self.fusion_norm = eqx.nn.LayerNorm(hidden_size)
 
-        # Sparse observation handling
+        # Sparse embedders
         self.source_registry = SourceEmbedderRegistry(hidden_size, static_size)
         sparse_keys = jrandom.split(keys.pop(0), len(sparse_sizes))
         for (name, in_size), k in zip(sparse_sizes.items(), sparse_keys):
@@ -242,16 +225,29 @@ class MCDALSTM(BaseModel):
                 key=k,
             )
 
-        self.lstm_cell = EALSTMCell(
+        # LSTM
+        self.ealstm = EALSTM(
             dynamic_in_size=hidden_size,
             static_in_size=static_size,
             hidden_size=hidden_size,
-            entity_aware=static_size > 0,
+            return_all=True,
+            dropout=dropout,
             key=keys.pop(0),
         )
-        self.obs_fusion = ObservationFusionModule(hidden_size, key=keys.pop(0))
 
-        self.routing = MuskingumCunge(static_size, hidden_size, key=keys.pop(0))
+        # Routing
+        self.routing_init_mlp = eqx.nn.MLP(
+            in_size=static_size,
+            out_size=hidden_size,
+            width_size=2*hidden_size,
+            depth=2,
+            key=keys.pop(0)
+        )
+        self.latent_mc = LatentMuskingumCunge(static_size, hidden_size, num_substeps, key=keys.pop(0))
+
+        # Assimilation
+        self.obs_fusion = ObservationFusionModule(hidden_size, key=keys.pop(0))
+        
 
     def add_assimilator(
         self,
@@ -295,45 +291,47 @@ class MCDALSTM(BaseModel):
             obs_emb[name] = (emb, mask)
         obs_memories = self._create_observational_memory(obs_emb, num_locations)
 
-        # 4. Recurrent loop
+        loc_keys = jrandom.split(key, num_locations)
+
+        all_h = jax.vmap(self.ealstm, in_axes=(1, 0, 0), out_axes=1)(dense_emb_norm, data.static, loc_keys)
+
         @jax.checkpoint
-        def process_one_timestep(state_prev, scan_slice, input_gate):
-            dense_input, step_obs_memory, step_key = scan_slice
-            
-            h_new, c_new = self.lstm_cell(state_prev, dense_input, input_gate)
+        def route_one_timestep(state_prev, scan_slice, static, edges, node_mask, edge_mask):
+            H_prev_out, H_prev_in = state_prev
+            H_runoff_t, step_obs_memory = scan_slice
 
-            h_new, fusion_trace = self._fuse_observations(h_new, step_obs_memory)
+            H_routed, H_in_sum = self.latent_mc(
+                static, H_runoff_t, H_prev_out, H_prev_in, edges, node_mask, edge_mask
+            )
+            H_fused, fusion_trace = self._fuse_observations(H_routed, step_obs_memory)
 
-            new_state = (h_new, c_new)
-            accumulated_outputs = (h_new, fusion_trace)
-            return new_state, accumulated_outputs
+            new_state = (H_fused, H_in_sum)
+            return new_state, (H_fused, fusion_trace)
 
-        zeros = jnp.zeros((num_locations, self.hidden_size))
-        initial_state = (zeros, zeros)
-
-        if self.lstm_cell.entity_aware:
-            input_gate = jax.nn.sigmoid(jax.vmap(self.lstm_cell.input_linear)(data.static))
-        else:
-            input_gate = None
-        partial_timestep = partial(
-            process_one_timestep,
-            input_gate=input_gate,
+        partial_route = partial(
+            route_one_timestep,
+            static=data.static,
+            edges=data.graph_edges,
+            node_mask=data.node_mask,
+            edge_mask=data.edge_mask,
         )
 
-        scan_keys = jrandom.split(key, self.seq_length)
-        scan_inputs = (dense_emb_norm, obs_memories, scan_keys)
-        _, accumulated = jax.lax.scan(partial_timestep, initial_state, scan_inputs)
+        # Initialize discharge Q and inflow I
+        initial_H = jax.vmap(self.routing_init_mlp)(data.static)
+        initial_state = (initial_H, initial_H)
 
-        all_h, fusion_trace = accumulated
+        _, (H_final_seq, fusion_trace) = jax.lax.scan(
+            partial_route, initial_state, (all_h, obs_memories)
+        )
 
-        # 5. Predictions
-        runoff = jax.vmap(jax.vmap(self.head['runoff']))(all_h)
-        Q = self.routing(data.static, runoff, data.graph_edges, data.node_mask, data.edge_mask)
+        # 3. Finally project to Discharge
+        # This head now learns to map the "assimilated latent state" to Q
+        Q = jax.vmap(jax.vmap(self.head["discharge"]))(H_final_seq)
 
         if not self.seq2seq:
             # original shape (time, locs, 1)
-            Q = Q[0,...]
-        
+            Q = Q[0, ...]
+
         predictions = {self.target[0]: Q}
         if self.supervised_attn:
             predictions["attention_weights"] = fusion_trace["weights"]

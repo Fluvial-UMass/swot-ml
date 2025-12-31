@@ -152,7 +152,9 @@ def model_df_iterate(
 
         rows = [
             (basin, subbasin, date)
-            for basin, subbasin, date in zip(batch_results["basin"], batch_results["subbasin"], batch_results["date"])
+            for basin, subbasin, date in zip(
+                batch_results["basin"], batch_results["subbasin"], batch_results["date"]
+            )
         ]
         row_index = pd.MultiIndex.from_tuples(rows, names=["basin", "subbasin", "date"])
         df.index = row_index

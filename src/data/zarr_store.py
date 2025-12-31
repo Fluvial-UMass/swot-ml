@@ -117,7 +117,9 @@ class ZarrBasinStore:
 
         return ds_write
 
-    def compute_and_store_stats(self, basins: str | list[str], var_names: str | list[str] = None, overwrite: bool = False):
+    def compute_and_store_stats(
+        self, basins: str | list[str], var_names: str | list[str] = None, overwrite: bool = False
+    ):
         """
         Iterates through all basin Zarr groups to compute and store normalization statistics.
         This is a standalone script to be run once after data is exported to Zarr.

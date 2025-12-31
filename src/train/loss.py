@@ -91,8 +91,6 @@ def compute_loss(
         )
         losses + attn_loss_val
 
-    
-
     return loss
 
 
@@ -126,7 +124,9 @@ def mae_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
     return mae
 
 
-def huber_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable, *, huber_delta: float = 1.0):
+def huber_loss(
+    y: Array, y_hat: Array, mask: Array, denorm_fn: Callable, *, huber_delta: float = 1.0
+):
     """Calculates Huber loss."""
     # Passing delta through make_step is not yet implemented.
     residual = y - y_hat
@@ -146,10 +146,10 @@ def nse_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
 
     std_y = jnp.std(y, axis=0, where=mask.astype(bool))  # Per-basin standard deviation
     stable_std_y = jnp.nan_to_num(std_y) + 0.1
-    denom = jnp.square(stable_std_y) 
+    denom = jnp.square(stable_std_y)
 
     node_nse = mse / denom
-    jnp.mean(node_nse, where=node_nse!=0)
+    jnp.mean(node_nse, where=node_nse != 0)
 
 
 def spin_up_nse_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
@@ -165,10 +165,10 @@ def spin_up_nse_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
 
     std_y = jnp.std(y, axis=0, where=mask.astype(bool))  # Per-basin standard deviation
     stable_std_y = jnp.nan_to_num(std_y) + 0.1
-    denom = jnp.square(stable_std_y) 
+    denom = jnp.square(stable_std_y)
 
     node_nse = mse / denom
-    return jnp.mean(node_nse, where=node_nse!=0)
+    return jnp.mean(node_nse, where=node_nse != 0)
 
 
 def gmm_nll(y: Array, y_hat: dict[str, Array], mask: Array, denorm_fn: Callable) -> Array:

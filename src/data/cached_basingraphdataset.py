@@ -154,8 +154,8 @@ def _get_scale_from_precomp_stats(cfg: Config, basins: list[str], encoding: dict
             scale[var]["offset"] = log_mean
             scale[var]["scale"] = log_std
         elif var in cfg.no_norm_cols:
-            scale[var]['offset'] = 0
-            scale[var]['scale'] = 1
+            scale[var]["offset"] = 0
+            scale[var]["scale"] = 1
         elif var in cfg.range_norm_cols:
             min_val, max_val = stats["min"], stats["max"]
             scale[var]["offset"] = min_val
@@ -272,6 +272,12 @@ class DynamicCacheManager:
         subset_cache_dir = self.cache_dir / subset.name
         subset_cache_dir.mkdir(exist_ok=True, parents=True)
 
+        # Check for existing index to avoid redundant work
+        index_dir = subset_cache_dir / "_indices" / f"sequence={self.cfg.sequence_length}"
+        if not overwrite and (index_dir / "sample_list.npy").exists():
+            print(f"Indices for {subset.name} already exist. Skipping.")
+            return subset_cache_dir
+
         # Pre-compute normalization stats once
         if self.train_stats is None:
             self.train_stats = get_train_ds_stats(self.cfg, static=False)
@@ -291,9 +297,10 @@ class DynamicCacheManager:
             encoding=encoding,
             scale=scale,
             all_config_columns=all_config_columns,
+            index_dir=index_dir,
         )
 
-        print("✅ All caches created and indexed.")
+        print("All caches created and indexed.")
 
         return subset_cache_dir
 
@@ -307,30 +314,21 @@ class DynamicCacheManager:
         encoding,
         scale,
         all_config_columns,
+        index_dir: Path,
     ):
         """Process a single subset: cache data and generate indices in one pass."""
 
         basin_subset_dict = _get_basin_subbasin_dict(self.cfg, subset)
         basins = sorted(list(basin_subset_dict.keys()))
 
-        # Filter out already cached basins if not overwriting
-        if not overwrite:
-            basins_to_process = [b for b in basins if not (subset_cache_dir / b).is_dir()]
-        else:
-            basins_to_process = basins
-
-        if len(basins_to_process) == 0:
-            return
-
         time_slice = _get_time_slice(self.cfg, subset)
         seq_len = np.timedelta64(self.cfg.sequence_length, "D")
         min_valid_date = np.datetime64(time_slice.start) + seq_len
         target_vars = self.cfg.features.target
 
-        # Process basins in parallel, returning both cache status and index data
         globally_found_columns = set()
-        all_basin_indices = {}  # basin -> list of (date_int,)
-        written = 0
+        all_basin_indices = {}
+        written_zarrs = 0
 
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = {
@@ -346,51 +344,31 @@ class DynamicCacheManager:
                     min_valid_date=min_valid_date,
                     target_vars=target_vars,
                     subset=subset,
+                    overwrite=overwrite,
                 ): basin_id
-                for basin_id in basins_to_process
+                for basin_id in basins
             }
 
-            with tqdm(
-                total=len(futures), desc=f"Processing {subset.name}", disable=self.cfg.quiet
-            ) as pbar:
+            with tqdm(total=len(futures), desc=f"Indexing {subset.name}") as pbar:
                 for future in concurrent.futures.as_completed(futures):
                     basin_id = futures[future]
                     try:
                         result = future.result()
                         if result is not None:
-                            found_columns, valid_date_ints = result
+                            found_columns, valid_date_ints, was_written = result
                             globally_found_columns.update(found_columns)
                             if valid_date_ints is not None and len(valid_date_ints) > 0:
                                 all_basin_indices[basin_id] = valid_date_ints
-                            written += 1
+                            if was_written:
+                                written_zarrs += 1
                     except Exception as e:
-                        warnings.warn(f"Failed to process basin {basin_id}: {e}")
+                        warnings.warn(f"Failed {basin_id}: {e}")
                     pbar.update(1)
 
-        print(f"Wrote {written} new basin files to {subset.name} cache.")
+        if written_zarrs > 0:
+            print(f"Wrote {written_zarrs} new Zarr files.")
 
-        if written > 0:
-            never_found_columns = all_config_columns - globally_found_columns
-            if never_found_columns:
-                warnings.warn(f"Columns not found in any basin: {sorted(never_found_columns)}")
-
-        # For basins that were already cached, load their index data
-        already_cached = set(basins) - set(basins_to_process)
-        if already_cached:
-            existing_indices = self._load_existing_indices(
-                already_cached,
-                subset_cache_dir,
-                min_valid_date,
-                target_vars,
-                subset,
-                all_basin_indices,
-            )
-            all_basin_indices.update(existing_indices)
-
-        # Save indices
-        self._save_indices(subset_cache_dir, basins, all_basin_indices)
-
-        return
+        self._save_indices(index_dir, basins, all_basin_indices)
 
     def _process_single_basin_with_indices(
         self,
@@ -404,33 +382,60 @@ class DynamicCacheManager:
         min_valid_date,
         target_vars,
         subset: DataSubset,
+        overwrite: bool,
     ):
-        """
-        Process a single basin: normalize, cache, and identify valid sample dates.
-        Returns (found_columns, valid_date_ints) or None on failure.
-        """
+        basin_cache_path = cache_dir / basin_id
+        was_written = False
+
         try:
-            # Load and normalize data (your existing logic)
-            ds = self._load_and_normalize_basin(
-                basin_id, time_slice, features, encoding, scale, all_config_columns
-            )
-            if ds is None:
-                return None
+            # Logic: If Zarr exists and not overwriting, load lazy metadata only
+            if basin_cache_path.exists() and not overwrite:
+                ds = xr.open_zarr(basin_cache_path, consolidated=True)
+            else:
+                # Full processing required
+                ds = self._load_and_normalize_basin(
+                    basin_id, time_slice, features, encoding, scale, all_config_columns
+                )
+                if ds is None:
+                    return None
+                ds.to_zarr(basin_cache_path, mode="w", consolidated=True)
+                was_written = True
 
             found_columns = set(ds.data_vars)
-
-            # Write to cache
-            basin_cache_path = cache_dir / basin_id
-            ds.to_zarr(basin_cache_path, mode="w", consolidated=True)
-
-            # Identify valid dates for indexing (while data is still in memory)
             valid_date_ints = self._extract_valid_dates(ds, min_valid_date, target_vars, subset)
 
-            return found_columns, valid_date_ints
+            return found_columns, valid_date_ints, was_written
 
         except Exception as e:
-            warnings.warn(f"Error processing {basin_id}: {e}")
+            warnings.warn(f"Error in {basin_id}: {e}")
             return None
+
+    def _save_indices(self, index_dir: Path, basins: list, all_basin_indices: dict):
+        index_dir.mkdir(exist_ok=True, parents=True)
+
+        basin_to_int = {b: i for i, b in enumerate(basins)}
+        sample_list_ints = []
+        basin_index_map = defaultdict(list)
+        global_idx = 0
+
+        for basin in basins:
+            if basin not in all_basin_indices:
+                continue
+            b_idx = basin_to_int[basin]
+            for d_int in all_basin_indices[basin]:
+                sample_list_ints.append([b_idx, d_int])
+                basin_index_map[basin].append(global_idx)
+                global_idx += 1
+
+        np.save(index_dir / "sample_list.npy", np.array(sample_list_ints, dtype=np.int32))
+
+        with open(index_dir / "basin_lookup.json", "w") as f:
+            json.dump(basins, f)
+
+        with open(index_dir / "basin_index_map.json", "w") as f:
+            json.dump(basin_index_map, f)
+
+        print(f"✅ Saved {global_idx} indices to {index_dir}")
 
     def _load_and_normalize_basin(
         self,
@@ -583,43 +588,6 @@ class DynamicCacheManager:
             except Exception:
                 continue
         return loaded_indices
-
-    def _save_indices(self, subset_cache_dir: Path, basins: list, all_basin_indices: dict):
-        """Save the computed indices to disk."""
-        index_dir = subset_cache_dir / "_indices" / f"sequence={str(self.cfg.sequence_length)}"
-        index_dir.mkdir(exist_ok=True, parents=True)
-
-        out_list_path = index_dir / "sample_list.npy"
-        out_map_path = index_dir / "basin_index_map.json"
-        out_lookup_path = index_dir / "basin_lookup.json"
-
-        # Create basin -> int mapping
-        basin_to_int = {b: i for i, b in enumerate(basins)}
-
-        # Build flattened sample list and per-basin index map
-        sample_list_ints = []
-        basin_index_map = defaultdict(list)
-        global_idx = 0
-
-        for basin in basins:
-            if basin not in all_basin_indices:
-                continue
-            basin_int = basin_to_int[basin]
-            for d_int in all_basin_indices[basin]:
-                sample_list_ints.append([basin_int, d_int])
-                basin_index_map[basin].append(global_idx)
-                global_idx += 1
-
-        # Save files
-        with open(out_lookup_path, "w") as f:
-            json.dump(basins, f)
-
-        with open(out_map_path, "w") as f:
-            json.dump(basin_index_map, f)
-
-        np.save(out_list_path, np.array(sample_list_ints, dtype=np.int32))
-
-        print(f"  Saved {global_idx} samples to {subset_cache_dir}")
 
 
 # These are called by initialize_dataset_globals to do the actual I/O.
@@ -863,7 +831,6 @@ class CachedBasinGraphDataset(Dataset):
         self.target = self.features.target
         self.basin_lookup, self.sample_list, self.basin_index_map = self._load_indices()
 
-
     def _load_indices(self):
         subset_name = self.data_subset.name
         index_dir = self.cache_dir / "_indices" / f"sequence={str(self.cfg.sequence_length)}"
@@ -932,7 +899,7 @@ class CachedBasinGraphDataset(Dataset):
                 continue
 
             # Force deterministic sort (alphanumeric)
-            ordered_nodes = sorted(list(subG.nodes())) 
+            ordered_nodes = sorted(list(subG.nodes()))
             subbasin_map = {node: i for i, node in enumerate(ordered_nodes)}
 
             source_nodes, dest_nodes = [], []
@@ -943,7 +910,7 @@ class CachedBasinGraphDataset(Dataset):
             # Return BOTH the edges and the ordered node list to ensure safety
             graphs[basin_id] = {
                 "edges": np.array([source_nodes, dest_nodes], dtype=np.int32),
-                "nodes": ordered_nodes
+                "nodes": ordered_nodes,
             }
 
         missing_basins = set(self.basins) - set(graphs.keys())
@@ -965,7 +932,7 @@ class CachedBasinGraphDataset(Dataset):
         df = df[df.index.get_level_values("basin").isin(self.basins)]
 
         # Get the size of each basin (useful for graph packing later)
-        basin_subbasin_counts = df.groupby('basin').apply(len).to_dict()
+        basin_subbasin_counts = df.groupby("basin").apply(len).to_dict()
 
         df = df.droplevel("basin")
 
@@ -1057,9 +1024,7 @@ class CachedBasinGraphDataset(Dataset):
             )
             static = np.asarray(static_arr)
 
-        sample = GraphBatch(
-            dynamic=dynamic, graph_edges=edges, static=static, y=target
-        )
+        sample = GraphBatch(dynamic=dynamic, graph_edges=edges, static=static, y=target)
 
         return basin, subbasins, end_date, sample
 

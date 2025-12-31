@@ -327,11 +327,6 @@ class SpatioTemporalLSTMCell(eqx.Module):
 
         # The new state and a tuple of all traceable weights/gates
         new_state = (h_new, masked_c)
-        trace_data = {
-            'forward_w': fwd_w, 
-            'reverse_w': rev_w, 
-            'z_gate': z, 
-            'r_gate': r
-        }
+        trace_data = {"forward_w": fwd_w, "reverse_w": rev_w, "z_gate": z, "r_gate": r}
 
         return new_state, trace_data

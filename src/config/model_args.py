@@ -42,12 +42,14 @@ class SFGRNNArgs(BaseModelArgs):
     assim_sizes: dict[str, dict] = Field(default_factory=dict)
     use_obs_memory: bool = True
 
+
 class MCDALSTMArgs(BaseModelArgs):
     name: Literal["mc_da_lstm"]
     return_weights: bool = False
     supervised_attn: bool = False
     target: list[str] = None
     seq_length: int = None
+    num_substeps: int = Field(4, gt=0)
     dense_sizes: dict[str, int] = None
     sparse_sizes: dict[str, int] = None
     static_size: int = None
@@ -94,4 +96,6 @@ class MSAttnArgs(BaseModelArgs):
     active_source: dict[str, bool] = Field(default_factory=dict)
 
 
-ModelArgs: TypeAlias = SeqAttnArgs | StackArgs | GraphLSTMArgs | MSAttnArgs | STGATArgs | SFGRNNArgs | MCDALSTMArgs
+ModelArgs: TypeAlias = (
+    SeqAttnArgs | StackArgs | GraphLSTMArgs | MSAttnArgs | STGATArgs | SFGRNNArgs | MCDALSTMArgs
+)

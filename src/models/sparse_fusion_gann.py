@@ -335,8 +335,7 @@ class StackedGraphAttention(eqx.Module):
         *,
         key: PRNGKeyArray = None,
     ) -> tuple[Array, dict, Array, Array]:
-        
-        if len(self.layers)==0:
+        if len(self.layers) == 0:
             return x, {}, None, None
 
         keys = jax.random.split(key, self.k_hops) if key is not None else [None] * self.k_hops
@@ -436,8 +435,8 @@ class SpatioTemporalLSTMCell(eqx.Module):
         h_new = self.dropout(h_spatial, key=k2)
 
         new_state = (h_new, c_new)
-        spatial_trace['z_gate'] = z
-        spatial_trace['r_gate'] = r
+        spatial_trace["z_gate"] = z
+        spatial_trace["r_gate"] = r
 
         return new_state, spatial_trace
 
