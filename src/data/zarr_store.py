@@ -118,7 +118,7 @@ class ZarrBasinStore:
         return ds_write
 
     def compute_and_store_stats(
-        self, basins: str | list[str], var_names: str | list[str] = None, overwrite: bool = False
+        self, basins: str | list[str] = None, var_names: str | list[str] = None, overwrite: bool = False
     ):
         """
         Iterates through all basin Zarr groups to compute and store normalization statistics.
@@ -137,9 +137,20 @@ class ZarrBasinStore:
             for basin_path in tqdm(basin_paths, desc="Basins"):
                 ds = None  # initialize ds for the 'finally' block
                 try:
-                    # Open with Zarr to read existing attributes without loading the dataset
-                    z_group = zarr.open(str(basin_path), mode="r")
-                    existing_stats = z_group.attrs.get("normalization_stats", {})
+                    # Catch errors for non-Zarr directories (e.g., _cache).
+                    try:
+                        z_group = zarr.open(str(basin_path), mode="r")
+                        existing_stats = z_group.attrs.get("normalization_stats", {})
+                    except Exception:
+                        # Silently skip directories that are not valid Zarr groups
+                        continue
+
+                    # If specific vars requested, check overlap BEFORE opening xarray
+                    # This avoids metadata reads for fully completed basins.
+                    if var_names and not overwrite:
+                        missing_vars = [v for v in var_names if v not in existing_stats]
+                        if not missing_vars:
+                            continue
 
                     ds = xr.open_zarr(basin_path, consolidated=True)
                     all_numeric_vars = [v for v in ds.data_vars if ds[v].dtype.kind in "fi"]

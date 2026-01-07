@@ -38,6 +38,7 @@ class LatentMuskingumCunge(eqx.Module):
         # 2. Aggregate upstream inputs (H_t, i-1)
         senders, receivers = edges
 
+        @jax.checkpoint 
         def sub_step_fn(i, carry):
             curr_out_prev, curr_in_prev = carry  # These are from step i-1
 

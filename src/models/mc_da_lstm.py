@@ -239,15 +239,16 @@ class MCDALSTM(BaseModel):
         self.routing_init_mlp = eqx.nn.MLP(
             in_size=static_size,
             out_size=hidden_size,
-            width_size=2*hidden_size,
+            width_size=2 * hidden_size,
             depth=2,
-            key=keys.pop(0)
+            key=keys.pop(0),
         )
-        self.latent_mc = LatentMuskingumCunge(static_size, hidden_size, num_substeps, key=keys.pop(0))
+        self.latent_mc = LatentMuskingumCunge(
+            static_size, hidden_size, num_substeps, key=keys.pop(0)
+        )
 
         # Assimilation
         self.obs_fusion = ObservationFusionModule(hidden_size, key=keys.pop(0))
-        
 
     def add_assimilator(
         self,
@@ -280,32 +281,63 @@ class MCDALSTM(BaseModel):
             features = data.dynamic[name]
             emb_mlp = self.dense_embedders[name]
             dense_emb_list.append(jax.vmap(jax.vmap(emb_mlp))(features))
+        # Sum and Norm
         dense_emb = jnp.sum(jnp.stack(dense_emb_list), axis=0)
         dense_emb_norm = jax.vmap(jax.vmap(self.fusion_norm))(dense_emb)
 
         # 2. Sparse observation embedding
-        obs_emb = {}
+        obs_emb_seq = {}
         for name in self.source_registry.sources:
             features = data.dynamic[name]
             emb, mask = self.source_registry.embed(name, features, data.static)
-            obs_emb[name] = (emb, mask)
-        obs_memories = self._create_observational_memory(obs_emb, num_locations)
+            obs_emb_seq[name] = (emb, mask)
+        # obs_memories = self._create_observational_memory(obs_emb, num_locations)
 
+        # 3. LSTM
         loc_keys = jrandom.split(key, num_locations)
+        all_h = jax.vmap(self.ealstm, in_axes=(1, 0, 0), out_axes=1)(
+            dense_emb_norm, data.static, loc_keys
+        )
 
-        all_h = jax.vmap(self.ealstm, in_axes=(1, 0, 0), out_axes=1)(dense_emb_norm, data.static, loc_keys)
+        # 4. Routing
+        initial_H = jax.vmap(self.routing_init_mlp)(data.static)
+        init_obs_memory = {
+            name: (
+                jnp.zeros((num_locations, self.hidden_size)),  # emb
+                jnp.full((num_locations,), 1e6),  # staleness
+                jnp.zeros((num_locations,), dtype=jnp.bool_),  # seen
+            )
+            for name in obs_emb_seq.keys()
+        }
+        initial_state = (initial_H, initial_H, init_obs_memory)
+
 
         @jax.checkpoint
-        def route_one_timestep(state_prev, scan_slice, static, edges, node_mask, edge_mask):
-            H_prev_out, H_prev_in = state_prev
-            H_runoff_t, step_obs_memory = scan_slice
+        def route_one_timestep(carry, scan_slice, static, edges, node_mask, edge_mask):
+            H_prev_out, H_prev_in, current_obs_mem_state = carry
+            H_runoff_t, obs_emb_t_slice = scan_slice
 
+            # Update Observation Memory (Done inside the checkpoint!)
+            new_obs_mem_state = {}
+            for name, (emb_t, mask_t) in obs_emb_t_slice.items():
+                prev_emb, prev_stale, prev_seen = current_obs_mem_state[name]
+
+                # Update logic
+                new_emb = jnp.where(mask_t[:, jnp.newaxis], emb_t, prev_emb)
+                new_stale = jnp.where(mask_t, 0.0, prev_stale + 1.0)
+                new_seen = prev_seen | mask_t
+                new_obs_mem_state[name] = (new_emb, new_stale, new_seen)
+
+            # Routing
             H_routed, H_in_sum = self.latent_mc(
                 static, H_runoff_t, H_prev_out, H_prev_in, edges, node_mask, edge_mask
             )
-            H_fused, fusion_trace = self._fuse_observations(H_routed, step_obs_memory)
 
-            new_state = (H_fused, H_in_sum)
+            # Fusion (using the fresh memory state)
+            H_fused, fusion_trace = self._fuse_observations(H_routed, new_obs_mem_state)
+
+            # Pack carry
+            new_state = (H_fused, H_in_sum, new_obs_mem_state)
             return new_state, (H_fused, fusion_trace)
 
         partial_route = partial(
@@ -316,12 +348,9 @@ class MCDALSTM(BaseModel):
             edge_mask=data.edge_mask,
         )
 
-        # Initialize discharge Q and inflow I
-        initial_H = jax.vmap(self.routing_init_mlp)(data.static)
-        initial_state = (initial_H, initial_H)
-
+        scan_seq = (all_h, obs_emb_seq)
         _, (H_final_seq, fusion_trace) = jax.lax.scan(
-            partial_route, initial_state, (all_h, obs_memories)
+            partial_route, initial_state, scan_seq
         )
 
         # 3. Finally project to Discharge
