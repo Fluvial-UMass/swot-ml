@@ -118,7 +118,10 @@ class ZarrBasinStore:
         return ds_write
 
     def compute_and_store_stats(
-        self, basins: str | list[str] = None, var_names: str | list[str] = None, overwrite: bool = False
+        self,
+        basins: str | list[str] = None,
+        var_names: str | list[str] = None,
+        overwrite: bool = False,
     ):
         """
         Iterates through all basin Zarr groups to compute and store normalization statistics.
@@ -174,7 +177,7 @@ class ZarrBasinStore:
                     for var_name in vars_to_scale:
                         variable = ds[var_name].astype(np.float64)
                         valid_values = variable.where(variable.notnull())
-                        positive_values = valid_values.where(valid_values > 0)
+                        positive_values = valid_values.where(valid_values >= 0)
 
                         # Store the delayed computation objects
                         computations[var_name] = {

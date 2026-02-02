@@ -64,11 +64,11 @@ process_and_submit() {
 # Check if the argument is a directory
 if [ -d "$config_path" ]; then
   case $mode in
-    train|train_ensemble|grid_search|smac_optimize)
+    train|train-ensemble|grid-search|smac-optimize)
       yml_files=($(find "$config_path" -maxdepth 1 -type f -name '*.yml'))
       process_and_submit "${yml_files[@]}"
       ;;
-    test|attribute|predict)
+    continue-train|test|attribute|predict)
       subdirs=($(find "$config_path" -mindepth 1 -maxdepth 1 -type d -not -name '_*'))
       process_and_submit "${subdirs[@]}"
       ;;

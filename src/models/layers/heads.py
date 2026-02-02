@@ -65,7 +65,7 @@ class GMM(eqx.Module):
 
         # split output into mu, sigma and weights
         mu, s_latent, p_latent = jnp.split(h, 3, axis=-1)
-        sigma = jnp.clip(jnp.exp(s_latent), 1e-5, 1e2)
+        sigma = jax.nn.softplus(s_latent) + 1e-5
         pi = jax.nn.softmax(p_latent, axis=-1)
 
         return {"mu": mu, "sigma": sigma, "pi": pi}
@@ -116,78 +116,15 @@ class CMAL(eqx.Module):
         h = jax.nn.relu(self.fc1(x))
         h = self.fc2(h)
 
-        m_latent, b_latent, t_latent, p_latent = jnp.split(h, 2, axis=-1)
+        m_latent, b_latent, t_latent, p_latent = jnp.split(h, 4, axis=-1)
 
         # enforce properties on component parameters and weights:
         m = m_latent  # no restrictions (depending on setting m>0 might be useful)
         b = beta_softplus(b_latent, 2) + self._eps  # scale > 0 (softplus was working good in tests)
-        t = (1 - self._eps) * jax.nn.sigmoid(t_latent) + self._eps  # 0 > tau > 1
-        p = (1 - self._eps) * jax.nn.softmax(p_latent, dim=-1) + self._eps  # sum(pi) = 1 & pi > 0
+        t = (1 - self._eps) * jax.nn.sigmoid(t_latent) + self._eps  # 0 < tau < 1
+
+        p = jax.nn.softmax(p_latent, axis=-1)
+        p = jnp.clip(p, self._eps, 1.0)
+        p = p / jnp.sum(p, axis=-1, keepdims=True)
 
         return {"mu": m, "b": b, "tau": t, "pi": p}
-
-
-class UMAL(eqx.Module):
-    """Uncountable Mixture of Asymmetric Laplacians.
-
-    An implicit approximation to the mixture density network with Laplace distributions which does not require to
-    pre-specify the number of components. An additional hidden layer is used to provide the head more expressiveness.
-    General details about UMAL can be found in [#]_. A major difference between their implementation
-    and ours is the binding-function for the scale-parameter (b). The scale needs to be lower-bound. The original UMAL
-    implementation uses an elu-based binding. In our experiment however, this produced under-confident predictions
-    (too large variances). We therefore opted for a tailor-made binding-function that limits the scale from below and
-    above using a sigmoid. It is very likely that this needs to be adapted for non-normalized outputs.
-
-    Parameters
-    ----------
-    n_in : int
-        Number of input neurons.
-    n_out : int
-        Number of output neurons. Corresponds to 2 times the output-size, since the scale parameters are also predicted.
-    n_hidden : int
-        Size of the hidden layer.
-
-    References
-    ----------
-    .. [#] A. Brando, J. A. Rodriguez, J. Vitria, and A. R. Munoz: Modelling heterogeneous distributions
-        with an Uncountable Mixture of Asymmetric Laplacians. Advances in Neural Information Processing Systems,
-        pp. 8838-8848, 2019.
-    """
-
-    fc1: eqx.nn.Linear
-    fc2: eqx.nn.Linear
-    _eps: float
-
-    def __init__(self, latent_size: int, hidden_size: int, n_models: int, *, key: PRNGKeyArray):
-        k1, k2 = jax.random.split(key)
-        self.fc1 = eqx.nn.Linear(latent_size, hidden_size, key=k1)
-        self.fc2 = eqx.nn.Linear(hidden_size, n_models * 4, key=k2)
-        self._eps = 1e-5
-        self._upper_bound_scale = (
-            0.5  # this parameter found empirical by testing UMAL for a limited set of basins
-        )
-
-    def __call__(self, x: Array) -> dict[str, Array]:
-        """Perform a UMAL head forward pass.
-
-        Parameters
-        ----------
-        x : Array
-            Output of the previous model part. It provides the basic latent variables to compute the UMAL components.
-
-        Returns
-        -------
-        dict[str, Array]
-            Dictionary containing the means ('mu') and scale parameters ('b') to parametrize the asymmetric Laplacians.
-        """
-        h = jax.nn.relu(self.fc1(x))
-        h = self.fc2(h)
-
-        m_latent, b_latent = jnp.split(2, 4, axis=-1)
-
-        # enforce properties on component parameters and weights:
-        m = m_latent  # no restrictions (depending on setting m>0 might be useful)
-        b = (
-            self._upper_bound_scale * jax.nn.sigmoid(b_latent) + self._eps
-        )  # bind scale from two sides.
-        return {"mu": m, "b": b}

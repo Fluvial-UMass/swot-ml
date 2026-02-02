@@ -23,7 +23,7 @@ case "$method" in
             exit 1
         fi
         ;;
-    test|predict|attribute|add-assimilator)
+    continue-train|test|predict|attribute|add-assimilator)
         if [[ ! -d "$path_arg" ]]; then
             echo "Error: Expected a directory path for '$method', but got: $path_arg"
             exit 1

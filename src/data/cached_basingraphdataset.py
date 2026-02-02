@@ -45,9 +45,6 @@ class GraphBatch(NamedTuple):
         return jax_batch
 
 
-_LOG_PAD = 0.001
-
-
 def get_train_ds_stats(cfg: Config, *, dynamic: bool = True, static: bool = True) -> dict:
     print("Calculating training statistics for encoding and normalization...")
 
@@ -209,8 +206,7 @@ def _calculate_scale_from_data(cfg: Config, df: pd.DataFrame, encoding: dict):
             continue
         if var in cfg.log_norm_cols:
             scale[var]["log_norm"] = True
-            x = df[var] + _LOG_PAD
-            scale[var]["offset"] = np.nanmean(np.log(x))
+            scale[var]["offset"] = np.nanmean(np.log1p(df[var]))
         elif var in cfg.range_norm_cols:
             min_val = float(df[var].min())
             max_val = float(df[var].max())
@@ -452,7 +448,7 @@ class DynamicCacheManager:
             consolidated=True if (self.cfg.zarr_dir / basin_id / ".zmetadata").exists() else False,
         )
 
-        # Select time slice efficiently
+        # Select time slice
         ds = ds.sel(date=time_slice)
 
         # Find available columns
@@ -460,7 +456,8 @@ class DynamicCacheManager:
         ds = ds[list(available_columns)]
 
         # Apply encoding and normalization
-        ds, features = self._encode_data_optimized(ds, features, encoding)
+        ds = self._clip_data(ds)
+        ds, features = self._encode_data(ds, features, encoding)
         ds = _normalize_data(ds, scale)
 
         # Optimize chunking for the sequence length
@@ -473,7 +470,16 @@ class DynamicCacheManager:
 
         return ds
 
-    def _encode_data_optimized(self, ds: xr.Dataset, features: Features, encoding: dict):
+    def _clip_data(self, ds: xr.Dataset) -> xr.Dataset:
+        return ds.assign(
+            **{
+                feat: ds[feat].where((ds[feat] >= vmin) & (ds[feat] <= vmax))
+                for feat, (vmin, vmax) in self.cfg.clip_feature_range.items()
+                if feat in ds
+            }
+        )
+
+    def _encode_data(self, ds: xr.Dataset, features: Features, encoding: dict):
         """Optimized encoding without unnecessary conversions."""
 
         # Process categorical encodings
@@ -1091,8 +1097,10 @@ class CachedBasinGraphDataset(Dataset):
             raise ValueError(f"Cannot normalize an encoded column: {name}")
 
         if log_norm:
-            return np.log(x + _LOG_PAD) - offset
-        elif scale == 0:
+            # Resolve the module (np or jnp) from the input x
+            xp = jnp if isinstance(x, jnp.ndarray) else np
+            return xp.log1p(x) - offset 
+        elif scale != 0:
             return (x - offset) / scale
         else:
             return x - offset

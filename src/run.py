@@ -64,7 +64,7 @@ def train_from_config(cfg: Config, log_dir: Path | None = None):
         trainer = Trainer.load_last_checkpoint(log_dir)
         # Could fail to load if nothing was saved.
         if trainer is not None:
-            trainer.dataloader = dataloader
+            trainer.training_dl = dataloader
     if trainer is None:
         trainer = Trainer(cfg, dataloader, log_dir=log_dir)
 
@@ -490,6 +490,13 @@ def train_ensemble(config_path: Path, ensemble_seed: int):
     config_path = config_path.resolve()
     cfg, model, eval_dir = train_from_config_ensemble(config_path, ensemble_seed)
     eval_model(cfg, model, eval_dir)
+
+
+@app.command()
+def continue_train(run_dir: Path):
+    cfg = Config.from_file(run_dir / "config.json")
+    cfg, trainer = train_from_config(cfg, run_dir)
+    eval_model(cfg, trainer.model, trainer.log_dir)
 
 
 # @app.command()

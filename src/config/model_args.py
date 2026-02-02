@@ -57,6 +57,20 @@ class MCDALSTMArgs(BaseModelArgs):
     use_obs_memory: bool = True
 
 
+class LSTMGCNNArgs(BaseModelArgs):
+    name: Literal["lstm_gcnn"]
+    return_weights: bool = False
+    supervised_attn: bool = False
+    target: list[str] = None
+    seq_length: int = None
+    max_hops: int = Field(4, gt=0)
+    dense_sizes: dict[str, int] = None
+    sparse_sizes: dict[str, int] = None
+    static_size: int = None
+    assim_sizes: dict[str, dict] = Field(default_factory=dict)
+    use_obs_memory: bool = True
+
+
 class SeqAttnArgs(BaseModelArgs):
     name: Literal["lstm_mlp_attn", "flexible_hybrid"]
     num_layers: int = Field(..., gt=0)
@@ -97,5 +111,12 @@ class MSAttnArgs(BaseModelArgs):
 
 
 ModelArgs: TypeAlias = (
-    SeqAttnArgs | StackArgs | GraphLSTMArgs | MSAttnArgs | STGATArgs | SFGRNNArgs | MCDALSTMArgs
+    SeqAttnArgs
+    | StackArgs
+    | GraphLSTMArgs
+    | MSAttnArgs
+    | STGATArgs
+    | SFGRNNArgs
+    | MCDALSTMArgs
+    | LSTMGCNNArgs
 )

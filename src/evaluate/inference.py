@@ -236,6 +236,9 @@ def predict_to_parquet(
             #  Clean NaNs (unobserved subbasins)
             df = batch_df.dropna(how="any")
 
+            if df.empty:
+                continue
+
             # Write the batch DataFrame to the Parquet file
             table = pa.Table.from_pandas(df)
 
@@ -244,6 +247,13 @@ def predict_to_parquet(
                 writer = pq.ParquetWriter(output_path, table.schema)
 
             writer.write_table(table)
+
+    except RuntimeError as e:
+        if "DataLoader timed out" in str(e):
+            print("predict_to_parquet ended with a timeout in dataloader. Continuing.")
+            return  # Still runs the `finally` block
+        else:
+            raise e
 
     finally:
         # Ensure the writer is closed to finalize the file

@@ -61,13 +61,36 @@ class GraphPackingSampler(Sampler[list[int]]):
                 f"{oversized_basins=}"
             )
 
-        total_nodes = sum(s["nodes"] for s in self.samples)
-        self.estimated_len = (total_nodes // self.target_real_nodes) + 1
+        self._len = int(1e12) if self.infinite_shuffle else self._calculate_actual_len()
+
+    def _calculate_actual_len(self) -> int:
+        """Simulation of the __iter__ logic to determine the exact batch count."""
+        count = 0
+        # Use a list of node counts to simulate the deque
+        nodes = [s["nodes"] for s in self.samples]
+        # Note: If infinite_shuffle is False, we use the original order
+        dq = deque(nodes)
+        while dq:
+            current_nodes = dq.popleft()
+            while current_nodes < self.target_real_nodes:
+                remaining = self.target_real_nodes - current_nodes
+                best_fit_idx = -1
+                best_fit_val = 0
+                pool_size = min(self.candidate_pool_size, len(dq))
+                for i in range(pool_size):
+                    if best_fit_val < dq[i] <= remaining:
+                        best_fit_val = dq[i]
+                        best_fit_idx = i
+                if best_fit_idx != -1:
+                    current_nodes += dq[best_fit_idx]
+                    del dq[best_fit_idx]
+                else:
+                    break
+            count += 1
+        return count
 
     def __len__(self) -> int:
-        # This sampler is infinite, so __len__ is not well-defined.
-        # Returning a very large number can help with some utilities, but it's not strictly necessary.
-        return int(1e12) if self.infinite_shuffle else self.estimated_len
+        return self._len
 
     def __iter__(self) -> Iterator[list[int]]:
         # Yields a list of basin/date indices that will make up a batch
@@ -231,7 +254,7 @@ class CachedBasinGraphDataLoader(DataLoader):
         )
 
         threading = cfg.num_workers > 0
-        timeout = 900 if threading else 0
+        timeout = 0  # 900 if threading else 0
         persistent_workers = False
         # persistent_workers = True if threading else False
 

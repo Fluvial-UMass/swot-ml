@@ -10,7 +10,7 @@ from data import GraphBatch
 from .base_model import BaseModel
 from .layers.static_mlp import StaticMLP
 from .layers.ealstm import EALSTMCell
-from .layers.muskingum_cunge import LatentMuskingumCunge
+from .layers.graph_diffusion import DiffusionRouting
 
 
 class ObservationFusionModule(eqx.Module):
@@ -20,17 +20,21 @@ class ObservationFusionModule(eqx.Module):
     obs_query_proj: eqx.nn.Linear
     obs_key_proj: eqx.nn.Linear
     obs_value_proj: eqx.nn.Linear
+    null_key: jax.Array
+    null_value: jax.Array
     staleness_embedding: eqx.nn.MLP
     output_gate: eqx.nn.Linear
     norm: eqx.nn.LayerNorm
 
     def __init__(self, hidden_size: int, *, key: PRNGKeyArray):
-        keys = jax.random.split(key, 6)
+        keys = list(jrandom.split(key, 10))
         self.hidden_size = hidden_size
 
-        self.obs_query_proj = eqx.nn.Linear(hidden_size, hidden_size, key=keys[1])
-        self.obs_key_proj = eqx.nn.Linear(hidden_size, hidden_size, key=keys[2])
-        self.obs_value_proj = eqx.nn.Linear(hidden_size, hidden_size, key=keys[3])
+        self.obs_query_proj = eqx.nn.Linear(hidden_size, hidden_size, key=keys.pop(0))
+        self.obs_key_proj = eqx.nn.Linear(hidden_size, hidden_size, key=keys.pop(0))
+        self.obs_value_proj = eqx.nn.Linear(hidden_size, hidden_size, key=keys.pop(0))
+        self.null_key = jax.random.normal(keys.pop(0), (hidden_size,))
+        self.null_value = jax.random.normal(keys.pop(0), (hidden_size,))
 
         self.staleness_embedding = eqx.nn.MLP(
             in_size=1,
@@ -39,7 +43,7 @@ class ObservationFusionModule(eqx.Module):
             depth=2,
             key=keys[4],
         )
-        self.output_gate = eqx.nn.Linear(hidden_size * 2, hidden_size, key=keys[5])
+        self.output_gate = eqx.nn.Linear(hidden_size * 2, hidden_size, key=keys.pop(0))
 
         self.norm = eqx.nn.LayerNorm(hidden_size)
 
@@ -55,43 +59,62 @@ class ObservationFusionModule(eqx.Module):
         if num_sources == 0:
             return h, {"weights": None, "valid_obs": None, "gate": None}
 
-        # Real observational data
+        # Stack observations
         obs_stack = jnp.stack(obs_embeddings, axis=1)
         staleness_stack = jnp.stack(obs_staleness, axis=1)
         valid_stack = jnp.stack(obs_valid, axis=1)
 
+        # Staleness modulation
         log_staleness = jnp.log1p(staleness_stack[:, :, jnp.newaxis])
         staleness_emb = jax.vmap(jax.vmap(self.staleness_embedding))(log_staleness)
         modulated_obs = obs_stack + staleness_emb
 
-        # sparse attention
-        query = jax.vmap(self.obs_query_proj)(h)
-        keys = jax.vmap(jax.vmap(self.obs_key_proj))(modulated_obs)
+        # Projections for sparse attention
+        query = jax.vmap(self.obs_query_proj)(h)  # (L, H)
+        keys = jax.vmap(jax.vmap(self.obs_key_proj))(modulated_obs)  # (L, S, H)
         values = jax.vmap(jax.vmap(self.obs_value_proj))(modulated_obs)
+
+        # Append learned null slot
+        L = h.shape[0]
+        null_key = jnp.broadcast_to(self.null_key, (L, 1, self.hidden_size))
+        null_value = jnp.broadcast_to(self.null_value, (L, 1, self.hidden_size))
+
+        keys = jnp.concatenate([keys, null_key], axis=1)  # (L, S+1, H)
+        values = jnp.concatenate([values, null_value], axis=1)
+        # Concatenate ones since the null value is always 'valid' as key/value
+        valid_stack = jnp.concatenate([valid_stack, jnp.ones((L, 1), dtype=jnp.bool_)], axis=1)
 
         scale = jnp.sqrt(self.hidden_size)
         scores = jnp.sum(query[:, jnp.newaxis, :] * keys, axis=-1) / scale
 
-        # Mask invalid, leaving Null as the fallback
-        scores = jnp.where(valid_stack, scores, -1e9)
-        weights = jax.nn.softmax(scores, axis=-1)
+        # Mask by subtracting log-probability mass (gradient-safe)
+        scores = scores + jnp.where(valid_stack, 0.0, -5.0)
+        weights = jax.nn.softmax(scores, axis=-1)  # (L, S+1)
 
         fused_obs = jnp.einsum("ls,lsh->lh", weights, values)
 
         gate_input = jnp.concatenate([h, fused_obs], axis=-1)
         gate = jax.nn.sigmoid(jax.vmap(self.output_gate)(gate_input))
 
-        # Determine if any observation was valid
-        any_real_valid = jnp.any(valid_stack, axis=-1, keepdims=True)
+        # Weighted sum
+        fused_obs = jnp.einsum("ls,lsh->lh", weights, values)
 
-        # Zero out update if no valid observations exist
-        effective_gate = jnp.where(any_real_valid, gate, 0.0)
+        # Gated residual update
+        gate_input = jnp.concatenate([h, fused_obs], axis=-1)
+        gate = jax.nn.sigmoid(jax.vmap(self.output_gate)(gate_input))
 
-        # residual update
+        # Scale gate by presence of *any* real observation (gradient-safe)
+        any_real_valid = jnp.any(valid_stack[:, :-1], axis=-1, keepdims=True)
+        gate = gate * any_real_valid.astype(gate.dtype)
+
         update = jax.vmap(self.norm)(fused_obs)
-        h_new = h + (effective_gate * update)
+        h_new = h + gate * update
 
-        return h_new, {"weights": weights, "valid_obs": valid_stack, "gate": effective_gate}
+        return h_new, {
+            "weights": weights,
+            "valid_obs": valid_stack,
+            "gate": gate,
+        }
 
 
 class SourceEmbedderRegistry(eqx.Module):
@@ -145,7 +168,7 @@ class SourceEmbedderRegistry(eqx.Module):
         return list(self.embedders.keys())
 
 
-class MCDALSTM(BaseModel):
+class LSTMGCNN(BaseModel):
     hidden_size: int
     seq_length: int
     dense_sources: list[str]
@@ -162,14 +185,14 @@ class MCDALSTM(BaseModel):
     ealstm_cell: EALSTMCell
     obs_fusion: ObservationFusionModule
     routing_init_mlp: StaticMLP
-    latent_mc: LatentMuskingumCunge
+    routing: DiffusionRouting
 
     def __init__(
         self,
         *,
         target: list,
         seq_length: int,
-        num_substeps: int,
+        max_hops: int,
         dense_sizes: dict[str, int],
         sparse_sizes: dict[str, int],
         static_size: int,
@@ -242,9 +265,7 @@ class MCDALSTM(BaseModel):
             depth=2,
             key=keys.pop(0),
         )
-        self.latent_mc = LatentMuskingumCunge(
-            static_size, hidden_size, num_substeps, key=keys.pop(0)
-        )
+        self.routing = DiffusionRouting(static_size, hidden_size, max_hops, key=keys.pop(0))
 
         # Assimilation
         self.obs_fusion = ObservationFusionModule(hidden_size, key=keys.pop(0))
@@ -303,11 +324,11 @@ class MCDALSTM(BaseModel):
             for name in obs_emb_seq.keys()
         }
 
-        initial_state = (lstm_init, lstm_init, routing_init, routing_init, obs_memory_init)
+        initial_state = (lstm_init, lstm_init, routing_init, obs_memory_init)
 
         @jax.checkpoint
-        def one_timestep(carry, scan_slice, static, edges, node_mask, edge_mask):
-            h_prev, c_prev, H_prev_out, H_prev_in, current_obs_mem_state = carry
+        def one_timestep(carry, scan_slice, static, edges, node_mask):
+            h_prev, c_prev, H_prev, current_obs_mem_state = carry
             dense_emb_t_slice, obs_emb_t_slice = scan_slice
 
             if self.ealstm_cell.entity_aware:
@@ -322,9 +343,7 @@ class MCDALSTM(BaseModel):
             )
 
             # Routing
-            H_routed, H_in_sum = self.latent_mc(
-                static, h_new, H_prev_out, H_prev_in, edges, node_mask, edge_mask
-            )
+            H_new, routing_trace = self.routing(static, h_new, H_prev, edges, node_mask)
 
             # Update Observation Memory (Done inside the checkpoint!)
             new_obs_mem_state = {}
@@ -338,22 +357,23 @@ class MCDALSTM(BaseModel):
                 new_obs_mem_state[name] = (new_emb, new_stale, new_seen)
 
             # Fusion (using the fresh memory state)
-            H_fused, fusion_trace = self._fuse_observations(H_routed, new_obs_mem_state)
+            H_new, fusion_trace = self._fuse_observations(H_new, new_obs_mem_state)
 
-            # Pack carry
-            new_state = (h_new, c_new, H_fused, H_in_sum, new_obs_mem_state)
-            return new_state, (H_fused, fusion_trace)
+            # Pack carry tuple
+            new_state = (h_new, c_new, H_new, new_obs_mem_state)
 
-        closed_time_step = partial(
+            step_trace = {"routing": routing_trace, "fusion": fusion_trace}
+            return new_state, (H_new, step_trace)
+
+        closed_timestep = partial(
             one_timestep,
             static=data.static,
             edges=data.graph_edges,
             node_mask=data.node_mask,
-            edge_mask=data.edge_mask,
         )
 
         scan_seq = (dense_emb_norm, obs_emb_seq)
-        _, (H_final_seq, fusion_trace) = jax.lax.scan(closed_time_step, initial_state, scan_seq)
+        _, (H_final_seq, weight_trace) = jax.lax.scan(closed_timestep, initial_state, scan_seq)
 
         # 3. Finally project to Discharge
         # This head now learns to map the "assimilated latent state" to Q
@@ -361,16 +381,15 @@ class MCDALSTM(BaseModel):
 
         if not self.seq2seq:
             # original shape (time, locs, 1)
-            Q = Q[0, ...]
+            Q = Q[-1, ...]
 
         predictions = {self.target[0]: Q}
         if self.supervised_attn:
-            predictions["attention_weights"] = fusion_trace["weights"]
-            predictions["valid_obs"] = fusion_trace["valid_obs"]
+            predictions["attention_weights"] = weight_trace["fusion"]["weights"]
+            predictions["valid_obs"] = weight_trace["fusion"]["valid_obs"]
 
         if self.return_weights:
-            weights = {"fusion": fusion_trace}
-            return predictions, weights
+            return predictions, weight_trace
         else:
             return predictions
 

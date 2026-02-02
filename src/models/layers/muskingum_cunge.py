@@ -9,6 +9,7 @@ class LatentMuskingumCunge(eqx.Module):
 
     hidden_size: int
     parameter_generator: eqx.nn.MLP  # Maps static/state to C1, C2, C3
+    rms_norm: eqx.nn.RMSNorm
     num_substeps: int
 
     def __init__(self, static_size, hidden_size, num_substeps, key):
@@ -24,6 +25,8 @@ class LatentMuskingumCunge(eqx.Module):
             key=key,
         )
 
+        self.rms_norm = eqx.nn.RMSNorm(shape=hidden_size)
+
     def __call__(self, static, H_runoff, H_prev_out, H_prev_in, edges, node_mask, edge_mask):
         # 1. Generate coefficients based on physical properties
         # Shape: (num_locations, 3)
@@ -38,7 +41,7 @@ class LatentMuskingumCunge(eqx.Module):
         # 2. Aggregate upstream inputs (H_t, i-1)
         senders, receivers = edges
 
-        @jax.checkpoint 
+        @jax.checkpoint
         def sub_step_fn(i, carry):
             curr_out_prev, curr_in_prev = carry  # These are from step i-1
 
@@ -53,6 +56,8 @@ class LatentMuskingumCunge(eqx.Module):
             # At i=0, curr_in_prev is H_prev_in (from yesterday)
             # At i>0, curr_in_prev is I_t from the previous sub-step
             H_out_t = C1 * I_t + C2 * curr_in_prev + C3 * curr_out_prev
+
+            H_out_t = jax.vmap(self.rms_norm)(H_out_t)
 
             # Masking
             H_out_t = jnp.where(node_mask[:, jnp.newaxis], H_out_t, 0.0)

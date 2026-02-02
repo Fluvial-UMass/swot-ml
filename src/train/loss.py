@@ -89,7 +89,7 @@ def compute_loss(
             y_hat["valid_obs"],
             node_mask,
         )
-        losses + attn_loss_val
+        loss += attn_loss_val
 
     return loss
 

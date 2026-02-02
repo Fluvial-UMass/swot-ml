@@ -188,7 +188,9 @@ class ST_GATransformer(BaseModel):
                 assim_trace = {}
 
             new_state = (h_new, c_new)
-            accumulated_outputs = (h_new, *spatial_trace, assim_trace)
+
+            weights = {"spatial": spatial_trace, "assim": assim_trace}
+            accumulated_outputs = (h_new, weights)
             return new_state, accumulated_outputs
 
         # Initial states
@@ -211,7 +213,7 @@ class ST_GATransformer(BaseModel):
         final_state, accumulated = jax.lax.scan(partial_timestep, initial_state, scan_inputs)
 
         final_h, final_c = final_state
-        all_h, fwd_w, rev_w, z, r, assim = accumulated
+        all_h, weights = accumulated
 
         # Use states for predictions
         if self.seq2seq:
@@ -225,7 +227,6 @@ class ST_GATransformer(BaseModel):
 
         # With jax JIT, the returns have no impact on performance unless the model is compiled with this branch.
         if self.return_weights:
-            weights = {"fwd": fwd_w, "rev": rev_w, "z": z, "r": r, "assim": assim}
             return predictions, weights
         else:
             return predictions
