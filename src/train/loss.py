@@ -175,20 +175,21 @@ def gmm_nll(y: Array, y_hat: dict[str, Array], mask: Array, denorm_fn: Callable)
     """
     Calculates the average negative log-likelihood for a Gaussian Mixture Model (GMM).
     """
-    y_unsqueezed = jnp.expand_dims(y, axis=-1)  # Allow broadcasting to each error model
+    y_obs = jnp.expand_dims(y, axis=-1)  # Allow broadcasting to each error model
+    mu_hat = y_hat["mu"]
+    sigma_hat = y_hat["sigma"]
 
-    # Calculate the probability density of y for each Gaussian component.
-    one_over_sqrt_2pi = 1.0 / jnp.sqrt(2.0 * jnp.pi)
-    exponent = -0.5 * jnp.square((y_unsqueezed - y_hat["mu"]) / y_hat["sigma"])
-    pdf_values = one_over_sqrt_2pi * jnp.exp(exponent) / y_hat["sigma"]
+    # Log of the normal PDF for each component:
+    # log(pdf) = -log(sigma) - 0.5 * log(2*pi) - 0.5 * ((y - mu) / sigma)^2
+    log_2pi = jnp.log(2.0 * jnp.pi)
+    log_pdfs = -jnp.log(sigma_hat) - 0.5 * log_2pi - 0.5 * jnp.square((y_obs - mu_hat) / sigma_hat)
 
-    # Weight the PDFs by the mixture weights (pi) and sum them up
-    weighted_likelihoods = jnp.sum(y_hat["pi"] * pdf_values, axis=-1)
+    # Combine with log(pi) and use logsumexp over components
+    # log(sum(pi * pdf)) = logsumexp(log(pi) + log(pdf))
+    log_pi = jnp.log(y_hat["pi"] + 1e-9)  # eps for stability
+    log_weighted_likelihoods = jax.scipy.special.logsumexp(log_pi + log_pdfs, axis=-1)
 
-    # negative log likelihood
-    nll = -jnp.log(weighted_likelihoods + 1e-6)
-
-    return jnp.mean(nll, where=mask)
+    return -jnp.mean(log_weighted_likelihoods, where=mask)
 
 
 def attention_leakage_loss(attn_weights: Array, obs_mask: Array, node_mask: Array) -> Array:

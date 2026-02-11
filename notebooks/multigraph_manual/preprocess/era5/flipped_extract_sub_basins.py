@@ -302,9 +302,11 @@ if __name__ == "__main__":
     print("Preparing subbasin batches ...")
     # Query the store metadata and determine which still need processing
     store = BasinDataLake(args.save_dir)
-    status = store.get_processing_status(source='era5')
-    processed_subs = [] if status.empty else status.index.get_level_values('subbasin').unique()
-    to_process = subbasins[~subbasins.index.isin(processed_subs)]
+    
+    # status = store.get_processing_status(source='era5')
+    # processed_subs = [] if status.empty else status.index.get_level_values('subbasin').unique()
+    # to_process = subbasins[~subbasins.index.isin(processed_subs)]
+    to_process = subbasins
 
     # Precalculate all the batches we need to iterate over.
     all_batches = []

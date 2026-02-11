@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 
-def mosaic_scatter(results: pd.DataFrame, metrics: pd.DataFrame, title: str):
+def mosaic_scatter(results: pd.DataFrame, metrics: pd.DataFrame, title: str = ""):
     def hexbin_1to1(ax: plt.Axes, x: pd.Series, y: pd.Series, target: str):
         positive_mask = (x > 0) & (y > 0)
         x = x[positive_mask]

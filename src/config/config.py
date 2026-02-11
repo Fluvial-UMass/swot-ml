@@ -173,7 +173,7 @@ class Config(BaseModel):
     step_kwargs: StepKwargs
     early_stop_kwargs: EarlyStopKwargs = None
     optimizer_name: Literal["adam", "adamw"] = "adam"
-    weight_decay: float = Field(0.00001, gt=0.0, lt=1.0)
+    weight_decay: float = Field(0.01, gt=0.0, lt=1.0)
 
     # Meta
     parameter_search_grid: dict = Field(default_factory=dict)

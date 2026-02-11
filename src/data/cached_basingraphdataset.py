@@ -251,7 +251,7 @@ def config_hash(cfg: Config) -> str:
 class DynamicCacheManager:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.cache_dir = cfg.zarr_dir / "_cache" / config_hash(cfg)
+        self.cache_dir = cfg.zarr_dir / "_cache2" / config_hash(cfg)
         self.train_stats = None
         print(f"Caches will be stored at: {self.cache_dir}")
 
@@ -345,7 +345,7 @@ class DynamicCacheManager:
                 for basin_id in basins
             }
 
-            with tqdm(total=len(futures), desc=f"Indexing {subset.name}") as pbar:
+            with tqdm(total=len(futures), desc=f"Caching {subset.name}") as pbar:
                 for future in concurrent.futures.as_completed(futures):
                     basin_id = futures[future]
                     try:
@@ -1034,7 +1034,7 @@ class CachedBasinGraphDataset(Dataset):
 
         return basin, subbasins, end_date, sample
 
-    def denormalize(self, x: Array, name: str) -> Array:
+    def denormalize(self, x: Array, name: str, smearing_cf: float = 1) -> Array:
         """
         Denormalizes a feature or target by its name.
 
@@ -1050,7 +1050,9 @@ class CachedBasinGraphDataset(Dataset):
         log_norm = self.d_scale[name]["log_norm"]
 
         if log_norm:
-            return jnp.expm1(x * scale + offset)
+            log_space = x * scale + offset
+            return jnp.expm1(log_space) * smearing_cf
+
         else:
             return x * scale + offset
 
@@ -1099,7 +1101,7 @@ class CachedBasinGraphDataset(Dataset):
         if log_norm:
             # Resolve the module (np or jnp) from the input x
             xp = jnp if isinstance(x, jnp.ndarray) else np
-            return xp.log1p(x) - offset 
+            return (xp.log1p(x) - offset) / scale
         elif scale != 0:
             return (x - offset) / scale
         else:

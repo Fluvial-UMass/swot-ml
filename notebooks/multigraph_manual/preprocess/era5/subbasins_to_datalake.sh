@@ -2,7 +2,7 @@
 #SBATCH --job-name=extract_era5_to_datalake
 #SBATCH --output=%j.out
 #SBATCH -t 7-00:00:00
-#SBATCH -p cpu
+#SBATCH -p cpu,ceewater_cjgleason-cpu
 #SBATCH -q long
 #SBATCH -A pi_cjgleason_umass_edu
 #SBATCH -c 1
@@ -17,4 +17,6 @@ python /nas/cee-water/cjgleason/ted/swot-ml/notebooks/multigraph_manual/preproce
     --basin-file /nas/cee-water/cjgleason/ted/swot-ml/data/multigraph_manual/metadata/subbasins.parquet \
     --save-dir /nas/cee-water/cjgleason/ted/swot-ml/data/multigraph_manual/datalakes/training \
     --n-workers 32 \
-    --batch-size 16    
+    --batch-size 16 \
+    --start-date "2025-01-01" \
+    --end-date "2025-12-31"

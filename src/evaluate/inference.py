@@ -35,26 +35,41 @@ def _direct_values(
     return np.asarray(pred)  # np to detach from jax
 
 
-def _gmm_expected_values(
-    dist_pred: dict[str, Array],
-    node_mask: Array,
-    denorm_fn: Callable | None,
-    denorm_std_fn: Callable | None,
-) -> tuple[Array, Array]:
-    mu = np.asarray(dist_pred["mu"][node_mask])
-    sigma = np.asarray(dist_pred["sigma"][node_mask])
-    pi = np.asarray(dist_pred["pi"][node_mask])
+def _gmm_values(y_hat: dict[str, Array], node_mask: Array, scale: float, offset: float) -> Array:
+    """
+    Computes the unbiased arithmetic mean from the GMM components back to original units.
 
-    mu_exp = np.sum(pi * mu, axis=-1)
+    y_hat: dict from GMM head.
+    scale: dataset.d_scale['discharge']['scale']
+    offset: dataset.d_scale['discharge']['offset']
+    """
+    # 1. Transform component parameters from standardized log-space to natural log-space
+    mu_nat = y_hat["mu"][node_mask] * scale + offset
+    sigma_nat = y_hat["sigma"][node_mask] * scale
+    pi = y_hat["pi"][node_mask]
 
-    # Expected variance
-    var_exp = np.sum(pi * (sigma**2 + (mu - mu_exp[..., None]) ** 2), axis=-1)
-    std_exp = np.sqrt(var_exp)
+    # 2. Moments of individual log-normal components
+    # E[y+1] = exp(mu + 0.5 * sigma^2)
+    # Var[y+1] = [exp(sigma^2) - 1] * exp(2*mu + sigma^2)
+    comp_means = np.exp(mu_nat + 0.5 * np.square(sigma_nat))
+    comp_vars = (np.exp(np.square(sigma_nat)) - 1.0) * np.exp(2.0 * mu_nat + np.square(sigma_nat))
 
-    mu_exp_denorm = denorm_fn(mu_exp) if denorm_fn else mu_exp
-    std_exp_denorm = denorm_std_fn(mu_exp, std_exp) if denorm_fn else std_exp
+    # 3. Mixture Mean (Law of Total Expectation)
+    # Subtract 1.0 to return to y (discharge) from y+1 (log1p space)
+    mixture_mean_plus_1 = np.sum(pi * comp_means, axis=-1)
+    mixture_mean = mixture_mean_plus_1 - 1.0
 
-    return mu_exp, std_exp
+    # 4. Mixture Variance (Law of Total Variance)
+    # Var(Y) = E[Var(Y|Component)] + Var(E[Y|Component])
+    # Term 1: Mean of the variances
+    weighted_vars = np.sum(pi * comp_vars, axis=-1)
+    # Term 2: Variance of the means
+    weighted_mean_sq = np.sum(pi * np.square(comp_means), axis=-1)
+    var_of_means = weighted_mean_sq - np.square(mixture_mean_plus_1)
+
+    mixture_std = np.sqrt(np.maximum(weighted_vars + var_of_means, 0.0))
+
+    return mixture_mean, mixture_std
 
 
 def model_iterate(
@@ -94,10 +109,6 @@ def model_iterate(
     denorm_fns = {
         t: partial(dataloader.denormalize, name=t) if denormalize else None for t in model.target
     }
-    denorm_std_fns = {
-        t: partial(dataloader.denormalize_std, name=t) if denormalize else None
-        for t in model.target
-    }
 
     for basin, subbasin, date, batch in tqdm(dataloader, disable=quiet):
         batch = batch.to_jax()
@@ -106,13 +117,12 @@ def model_iterate(
         out_dict = {"basin": basin, "subbasin": subbasin, "date": date, "y_pred": {}}
         for target_name in model.target:
             denorm_fn = denorm_fns[target_name]
-            denorm_std_fn = denorm_std_fns[target_name]
             target_pred = y_pred[target_name]
             # Check the type of this target's head. Changes how we create predictions.
             if isinstance(model.head.get(target_name), GMM):
-                t_exp, t_std = _gmm_expected_values(
-                    target_pred, batch.node_mask, denorm_fn, denorm_std_fn
-                )
+                scale = dataloader.dataset.d_scale[target_name]["scale"]
+                offset = dataloader.dataset.d_scale[target_name]["offset"]
+                t_exp, t_std = _gmm_values(target_pred, batch.node_mask, scale, offset)
                 out_dict["y_pred"][target_name] = t_exp
                 out_dict["y_pred"][target_name + "_std"] = t_std
             else:

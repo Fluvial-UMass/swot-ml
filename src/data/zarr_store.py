@@ -13,11 +13,11 @@ import numpy as np
 import pandas as pd
 import dask.array as da
 from tqdm import tqdm
-from dask.distributed import Client
+from dask.distributed import Client, LocalCluster
 
 
 class ZarrBasinStore:
-    def __init__(self, store_path, start_date="1980-01-01", end_date="2024-12-31"):
+    def __init__(self, store_path, start_date="1980-01-01", end_date="2025-12-31"):
         self.store_path = Path(store_path)
         self.date_range = pd.date_range(start_date, end_date, freq="D").tz_localize(None)
 
@@ -122,6 +122,9 @@ class ZarrBasinStore:
         basins: str | list[str] = None,
         var_names: str | list[str] = None,
         overwrite: bool = False,
+        n_workers: int = 8,
+        memory_limit: str = 'auto' # or '8GB' for example
+
     ):
         """
         Iterates through all basin Zarr groups to compute and store normalization statistics.
@@ -134,7 +137,12 @@ class ZarrBasinStore:
         if basins:
             basin_paths = [p for p in basin_paths if p.stem in basins]
 
-        with Client() as client:
+        cluster = LocalCluster(
+            n_workers=n_workers,
+            threads_per_worker=1,
+            memory_limit=memory_limit
+        )
+        with Client(cluster) as client:
             print(f"Dask client started. Dashboard at: {client.dashboard_link}")
 
             for basin_path in tqdm(basin_paths, desc="Basins"):
@@ -170,53 +178,44 @@ class ZarrBasinStore:
                     # Go to next basin if no variables to process
                     if not vars_to_scale:
                         continue
-
-                    stats_dict = {}
-                    computations = {}
-                    # Prepare all Dask computations for the necessary variables
+                    
+                    all_computations = {}
                     for var_name in vars_to_scale:
-                        variable = ds[var_name].astype(np.float64)
-                        valid_values = variable.where(variable.notnull())
-                        positive_values = valid_values.where(valid_values >= 0)
+                        # Cast and mask once
+                        da = ds[var_name].astype(np.float64)
+                        # Define masks
+                        is_valid = da.notnull()
+                        pos_mask = da > 0
+                        da_pos = da.where(pos_mask)
+                        log_da_pos = np.log1p(da_pos)
 
-                        # Store the delayed computation objects
-                        computations[var_name] = {
-                            "count": valid_values.count(),
-                            "sum": valid_values.sum(),
-                            "sum_sq": (valid_values**2).sum(),
-                            "min": valid_values.min(),
-                            "max": valid_values.max(),
-                            "log_sum": np.log1p(positive_values).sum(),
-                            "log_sum_sq": (np.log1p(positive_values) ** 2).sum(),
-                            "positive_count": positive_values.count(),
+                        # Aggregate moments into the computation graph
+                        all_computations[var_name] = {
+                            "count": is_valid.sum(),
+                            "sum": da.sum(),
+                            "sum_sq": (da**2).sum(),
+                            "min": da.min(),
+                            "max": da.max(),
+                            "log_sum": log_da_pos.sum(),
+                            "log_sum_sq": (log_da_pos**2).sum(),
+                            "positive_count": pos_mask.sum(),
                         }
 
-                    # Trigger all computations in parallel
-                    results = client.compute(computations)
+                    # Single compute call for the entire basin
+                    # This maximizes parallelization across all variables and all chunks
+                    results = client.compute(all_computations)
                     processed_results = client.gather(results)
 
-                    # Process the computed results
-                    for var_name, stats in processed_results.items():
-                        count = stats["count"].item()
-                        if count == 0:
-                            continue
 
-                        stats_dict[var_name] = {
-                            "count": count,
-                            "sum": stats["sum"].item(),
-                            "sum_sq": stats["sum_sq"].item(),
-                            "min": stats["min"].item(),
-                            "max": stats["max"].item(),
-                            "log_sum": stats["log_sum"].item(),
-                            "log_sum_sq": stats["log_sum_sq"].item(),
-                            "positive_count": stats["positive_count"].item(),
-                        }
+                    # Convert NumPy scalars to Python primitives for Zarr metadata compatibility
+                    serializable_stats = {
+                        var_name: {stat_key: val.item() for stat_key, val in metrics.items()}
+                        for var_name, metrics in processed_results.items()
+                        if metrics["count"] > 0
+                    }
 
-                    if stats_dict:
-                        # Merge new stats with existing stats and write back
-                        existing_stats.update(stats_dict)
-
-                        # Re-open with zarr library to write attributes
+                    if serializable_stats:
+                        existing_stats.update(serializable_stats)
                         z_group_write = zarr.open(str(basin_path), mode="r+")
                         z_group_write.attrs["normalization_stats"] = existing_stats
 
@@ -246,6 +245,8 @@ class ZarrBasinStore:
 
         with xr.open_dataset(basin_path, engine="zarr", consolidated=True) as ds_ondisk:
             existing_vars = set(ds_ondisk.data_vars).union(set(ds_ondisk.coords))
+            # Capture existing attributes (normalization data)
+            existing_attrs = ds_ondisk.attrs.copy()
 
         new_vars = [v for v in data_df.columns if v not in existing_vars]
 
@@ -261,7 +262,9 @@ class ZarrBasinStore:
                 new_vars_dict[var_name] = (["date", "subbasin"], darr)
 
             dummy_ds = xr.Dataset(
-                data_vars=new_vars_dict, coords={"date": self.date_range, "subbasin": subbasin_list}
+                data_vars=new_vars_dict,
+                coords={"date": self.date_range, "subbasin": subbasin_list},
+                attrs=existing_attrs,  # Re-attach normalization data
             )
 
             # Append new variables. Dask handles the streaming write.

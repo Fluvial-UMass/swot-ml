@@ -622,7 +622,6 @@ def create_optimizer(cfg: Config):
         gradient_transforms.append(norm_clipper)
 
     schedule = create_lr_schedule(cfg)
-
     if cfg.optimizer_name == "adamw":
         optimizer = optax.adamw(learning_rate=schedule, weight_decay=cfg.weight_decay)
     else:
