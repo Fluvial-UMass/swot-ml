@@ -353,17 +353,18 @@ class MCDALSTM(BaseModel):
         )
 
         scan_seq = (dense_emb_norm, obs_emb_seq)
-        _, (H_final_seq, fusion_trace) = jax.lax.scan(closed_time_step, initial_state, scan_seq)
-
+        final_state, accumulated = jax.lax.scan(closed_time_step, initial_state, scan_seq)
+        final_h, final_c, final_H, final_H_in_sum, final_obs_mem_state = final_state
+        all_H, fusion_trace = accumulated
         # 3. Finally project to Discharge
-        # This head now learns to map the "assimilated latent state" to Q
-        Q = jax.vmap(jax.vmap(self.head["discharge"]))(H_final_seq)
 
-        if not self.seq2seq:
-            # original shape (time, locs, 1)
-            Q = Q[0, ...]
+        if self.seq2seq:
+            predictions = {
+                target: jax.vmap(jax.vmap(head))(all_H) for target, head in self.head.items()
+            }
+        else:
+            predictions = {target: jax.vmap(head)(final_H) for target, head in self.head.items()}
 
-        predictions = {self.target[0]: Q}
         if self.supervised_attn:
             predictions["attention_weights"] = fusion_trace["weights"]
             predictions["valid_obs"] = fusion_trace["valid_obs"]

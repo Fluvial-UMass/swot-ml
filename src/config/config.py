@@ -155,6 +155,10 @@ class Config(BaseModel):
     backend: Literal["cpu", "gpu", "tpu"] | None = None
     num_devices: int | None = Field(None, gt=0)
 
+    dataset_type: Literal["graph", "mcfli"] = "graph"
+    batch_size: int | None = Field(None, gt=0)
+    pad_size: int | None = Field(None, gt=0)
+
     # Model
     sequence_length: int
     model_args: ModelArgs = Field(discriminator="name")
@@ -217,6 +221,17 @@ class Config(BaseModel):
         return values
 
     # MODEL / AFTER
+    @model_validator(mode="after")
+    def validate_dataset_type(self):
+        # This should probably be refactored to have pydantic models for each dataset.
+        if self.dataset_type == "mcfli":
+            required_keys = ["batch_size", "pad_size"]
+            missing_keys = [k for k in required_keys if getattr(self, k) is None]
+            if any(missing_keys):
+                raise ValueError(f"incomplete config for MCFLIDataset. {missing_keys = }")
+
+        return self
+
     @model_validator(mode="after")
     def validate_log_intervals(self):
         """

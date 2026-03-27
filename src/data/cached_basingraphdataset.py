@@ -25,6 +25,8 @@ from config import Config, DataSubset, Features
 class GraphBatch(NamedTuple):
     dynamic: dict[str, Array]
     graph_edges: Array
+    inflow_indices: Array = None
+    inflow_mask: Array = None
     graph_idx: Array = None
     node_mask: Array = None
     edge_mask: Array = None
@@ -40,9 +42,16 @@ class GraphBatch(NamedTuple):
         return getattr(self, key)
 
     def to_jax(self):
-        """Convert all numpy arrays to jax arrays."""
-        jax_batch = jt_map(lambda x: jnp.asarray(x) if isinstance(x, np.ndarray) else x, self)
-        return jax_batch
+        """Convert all numpy arrays to jax arrays, skipping None values."""
+
+        def _to_jax_item(x):
+            if x is None:
+                return None
+            if isinstance(x, np.ndarray):
+                return jnp.asarray(x)
+            return x
+
+        return jt_map(_to_jax_item, self)
 
 
 def get_train_ds_stats(cfg: Config, *, dynamic: bool = True, static: bool = True) -> dict:
@@ -251,7 +260,7 @@ def config_hash(cfg: Config) -> str:
 class DynamicCacheManager:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.cache_dir = cfg.zarr_dir / "_cache2" / config_hash(cfg)
+        self.cache_dir = cfg.zarr_dir / "_cache4" / config_hash(cfg)
         self.train_stats = None
         print(f"Caches will be stored at: {self.cache_dir}")
 
@@ -596,7 +605,6 @@ class DynamicCacheManager:
         return loaded_indices
 
 
-# These are called by initialize_dataset_globals to do the actual I/O.
 def _get_basin_subbasin_dict(cfg: Config, subset: DataSubset):
     def read_file(fp) -> dict:
         df = pd.read_csv(fp, dtype=str)
@@ -914,10 +922,27 @@ class CachedBasinGraphDataset(Dataset):
                 dest_nodes.append(subbasin_map[dest])
 
             # Return BOTH the edges and the ordered node list to ensure safety
-            graphs[basin_id] = {
+            graph_entry = {
                 "edges": np.array([source_nodes, dest_nodes], dtype=np.int32),
                 "nodes": ordered_nodes,
             }
+
+            # Conditional Inflow Calculation
+            if self.cfg.model_args.name == "river_lstm":
+                num_nodes = len(ordered_nodes)
+                inflow_indices = np.full((num_nodes, 2), -1, dtype=np.int32)
+                inflow_count = np.zeros(num_nodes, dtype=np.int32)
+
+                for s, d in zip(source_nodes, dest_nodes):
+                    slot = inflow_count[d]
+                    if slot < 2:
+                        inflow_indices[d, slot] = s
+                        inflow_count[d] += 1
+
+                graph_entry["inflow_indices"] = inflow_indices
+                graph_entry["inflow_mask"] = inflow_indices != -1
+
+            graphs[basin_id] = graph_entry
 
         missing_basins = set(self.basins) - set(graphs.keys())
         if missing_basins:
@@ -1030,7 +1055,14 @@ class CachedBasinGraphDataset(Dataset):
             )
             static = np.asarray(static_arr)
 
-        sample = GraphBatch(dynamic=dynamic, graph_edges=edges, static=static, y=target)
+        sample = GraphBatch(
+            dynamic=dynamic,
+            graph_edges=edges,
+            static=static,
+            y=target,
+            inflow_indices=graph_data.get("inflow_indices"),
+            inflow_mask=graph_data.get("inflow_mask"),
+        )
 
         return basin, subbasins, end_date, sample
 

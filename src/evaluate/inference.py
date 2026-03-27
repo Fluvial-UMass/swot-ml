@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from scipy.special import logsumexp
 from jax.random import PRNGKey
 from jaxtyping import Array, PRNGKeyArray
 from tqdm import tqdm
@@ -43,31 +44,35 @@ def _gmm_values(y_hat: dict[str, Array], node_mask: Array, scale: float, offset:
     scale: dataset.d_scale['discharge']['scale']
     offset: dataset.d_scale['discharge']['offset']
     """
-    # 1. Transform component parameters from standardized log-space to natural log-space
+    # 1. Physical units in log-space
     mu_nat = y_hat["mu"][node_mask] * scale + offset
     sigma_nat = y_hat["sigma"][node_mask] * scale
-    pi = y_hat["pi"][node_mask]
+    log_pi = y_hat["log_pi"][node_mask]
 
-    # 2. Moments of individual log-normal components
-    # E[y+1] = exp(mu + 0.5 * sigma^2)
-    # Var[y+1] = [exp(sigma^2) - 1] * exp(2*mu + sigma^2)
-    comp_means = np.exp(mu_nat + 0.5 * np.square(sigma_nat))
-    comp_vars = (np.exp(np.square(sigma_nat)) - 1.0) * np.exp(2.0 * mu_nat + np.square(sigma_nat))
+    # 2. Log-Normal Moments in log-space
+    # E[X] = exp(mu + sigma^2 / 2) -> log(E[X]) = mu + sigma^2 / 2
+    log_comp_means = mu_nat + 0.5 * np.square(sigma_nat)
+    
+    # Log-Mixture Mean (Law of Total Expectation)
+    log_mixture_mean_plus_1 = logsumexp(log_pi + log_comp_means, axis=-1)
+    mixture_mean = np.exp(log_mixture_mean_plus_1) - 1.0
 
-    # 3. Mixture Mean (Law of Total Expectation)
-    # Subtract 1.0 to return to y (discharge) from y+1 (log1p space)
-    mixture_mean_plus_1 = np.sum(pi * comp_means, axis=-1)
-    mixture_mean = mixture_mean_plus_1 - 1.0
-
-    # 4. Mixture Variance (Law of Total Variance)
-    # Var(Y) = E[Var(Y|Component)] + Var(E[Y|Component])
-    # Term 1: Mean of the variances
-    weighted_vars = np.sum(pi * comp_vars, axis=-1)
-    # Term 2: Variance of the means
-    weighted_mean_sq = np.sum(pi * np.square(comp_means), axis=-1)
-    var_of_means = weighted_mean_sq - np.square(mixture_mean_plus_1)
-
-    mixture_std = np.sqrt(np.maximum(weighted_vars + var_of_means, 0.0))
+    # 3. Log-Mixture Variance (Law of Total Variance)
+    # log(Var_comp) = log(exp(sig^2)-1) + 2*mu + sig^2
+    # We use log1p(x) for log(exp(x)-1) stability
+    log_comp_vars = np.log(np.expm1(np.square(sigma_nat))) + 2.0 * mu_nat + np.square(sigma_nat)
+    
+    # Term 1: E[Var(Y|C)]
+    log_mean_of_vars = logsumexp(log_pi + log_comp_vars, axis=-1)
+    
+    # Term 2: Var(E[Y|C]) = E[E[Y|C]^2] - E[E[Y|C]]^2
+    log_mean_of_mu_sq = logsumexp(log_pi + 2.0 * log_comp_means, axis=-1)
+    
+    # Combine terms using the log-difference: log(A + (B - C))
+    term1 = np.exp(log_mean_of_vars)
+    term2 = np.exp(log_mean_of_mu_sq) - np.exp(2.0 * log_mixture_mean_plus_1)
+    
+    mixture_std = np.sqrt(np.maximum(term1 + term2, 1e-6))
 
     return mixture_mean, mixture_std
 

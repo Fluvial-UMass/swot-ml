@@ -280,6 +280,7 @@ class SpatioTemporalLSTMCell(eqx.Module):
         key: PRNGKeyArray,
     ):
         gat_key, lstm_key = jax.random.split(key)
+
         self.gat = MultiHeadStackedGAT(
             static_feature_size=static_feature_size,
             hidden_size=hidden_size,

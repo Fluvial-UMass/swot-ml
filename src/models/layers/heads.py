@@ -56,19 +56,26 @@ class GMM(eqx.Module):
     def __init__(self, latent_size: int, hidden_size: int, n_models: int, *, key: PRNGKeyArray):
         k1, k2 = jax.random.split(key)
         self.fc1 = eqx.nn.Linear(latent_size, hidden_size, key=k1)
+        # Use a small gain for the final layer to prevent initial explosion
         self.fc2 = eqx.nn.Linear(hidden_size, n_models * 3, key=k2)
-        self._eps = 1e-5
+
+        # Initialize weights closer to zero for a "flat" start
+        self.fc2 = eqx.tree_at(lambda l: l.weight, self.fc2, self.fc2.weight * 0.01)
+        self._eps = 1e-3
 
     def __call__(self, x: Array) -> dict[str, Array]:
         h = jax.nn.relu(self.fc1(x))
         h = self.fc2(h)
-
-        # split output into mu, sigma and weights
         mu, s_latent, p_latent = jnp.split(h, 3, axis=-1)
-        sigma = jax.nn.softplus(s_latent) + 1e-5
-        pi = jax.nn.softmax(p_latent, axis=-1)
 
-        return {"mu": mu, "sigma": sigma, "pi": pi}
+        # clipping to prevent e^(sigma^2) explosion
+        s_latent = jnp.clip(s_latent, -10.0, 4.0) 
+        
+        # Use softplus for a smooth, positive variance
+        sigma = jax.nn.softplus(s_latent) + self._eps
+        log_pi = jax.nn.log_softmax(p_latent, axis=-1)
+
+        return {"mu": mu, "sigma": sigma, "log_pi": log_pi}
 
 
 def beta_softplus(x: Array, beta: int = 1, thresh: int = 20):

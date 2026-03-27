@@ -195,6 +195,7 @@ class Trainer:
         self._cleanup_logger()
         self.log_dir = self._setup_logging(new_log_dir)
 
+
     def replace_model(self, model: models.BaseModel):
         self.model = model
         # Now recreate the optimizer and opt states
@@ -318,6 +319,9 @@ class Trainer:
 
     # Monitor gradients
     def check_grads(self, grads):
+        grad_norm = optax.global_norm(grads)
+        self.logger.info(f"\tGlobal norm of grads: {grad_norm:0.2f}")
+
         grad_norms = jtu.tree_map(jnp.linalg.norm, grads)
         grad_norms = jtu.tree_leaves_with_path(grad_norms)
 

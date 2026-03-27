@@ -76,35 +76,54 @@ def get_all_metrics(df: pd.DataFrame, disp: bool = False):
     dict
         A dictionary where keys are feature names and values are dictionaries of metrics.
     """
+    metric_fn_map = {
+        "R2": r2_score,
+        "r": calc_r,
+        'NSE': calc_nse,
+        "sigE": calc_sigE,
+        "rRMSE": calc_rrmse,
+        "MAPE": mean_absolute_percentage_error,
+        "nBias": calc_nbias,
+        "RE": calc_rel_err,
+        "RB": calc_rel_bias,
+        "Agreement": calc_agreement,
+    }
     metrics = {}
 
     for feature in df["obs"].columns:
-        y = df[("obs", feature)]
-        y_hat = df[("pred", feature)]
+        y_raw = df[("obs", feature)].to_numpy()
+        y_hat_raw = df[("pred", feature)].to_numpy()
 
-        kge_results = calc_kge(y, y_hat)
-        if isinstance(kge_results, tuple):
-            kge, corr, alpha, beta = kge_results
+        has_std = ("pred", f"{feature}_std") in df.columns
+        if has_std:
+            y_std_raw = df[("pred", f"{feature}_std")].to_numpy()
+            mask = (y_raw > log_pad) & (y_hat_raw > log_pad) & ~np.isnan(y_std_raw)
+            y_std = y_std_raw[mask]
         else:
-            kge = corr = alpha = beta = np.nan
+            mask = (y_raw > log_pad) & (y_hat_raw > log_pad)
 
-        metrics[feature] = {
-            "num_obs": np.sum(~np.isnan(y)),
-            "R2": mask_nan(r2_score)(y, y_hat),
-            "r": calc_r(y, y_hat),
-            "NSE": calc_nse(y, y_hat),
-            "KGE": kge,
-            "corr": corr,
-            "alpha": alpha,
-            "beta": beta,
-            "sigE": calc_sigE(y, y_hat),
-            "rRMSE": calc_rrmse(y, y_hat),
-            "MAPE": mask_nan(mean_absolute_percentage_error)(y, y_hat),
-            "nBias": calc_nbias(y, y_hat),
-            "RE": calc_rel_err(y, y_hat),
-            "RB": calc_rel_bias(y, y_hat),
-            "Agreement": calc_agreement(y, y_hat),
-        }
+        y = y_raw[mask]
+        y_hat = y_hat_raw[mask]
+        num_obs = np.sum(mask)
+
+        metrics[feature] = {"num_obs": num_obs}
+        if num_obs > 8:
+            metrics[feature].update({name: fn(y, y_hat) for name, fn in metric_fn_map.items()})
+            kge, corr, alpha, beta = calc_kge_comp(y, y_hat)
+            metrics[feature].update({"KGE": kge, "corr": corr, "alpha": alpha, "beta": beta})
+
+            if has_std:
+                metrics[feature].update({'nse_prob': calc_nse_prob(y, y_hat, y_std)})
+                metrics[feature].update({'MSESS': calc_msess(y, y_hat, y_std)})
+            else:
+                metrics[feature].update({'nse_prob':np.nan, 'MSESS':np.nan})
+
+        else:
+            metrics[feature].update({name: np.nan for name in metric_fn_map.keys()})
+            metrics[feature].update(
+                {"KGE": np.nan, "corr": np.nan, "alpha": np.nan, "beta": np.nan}
+            )
+            metrics[feature].update({'nse_prob':np.nan, 'MSESS':np.nan})
 
     if disp:
         metrics_str = "Bulk Metrics\n"
@@ -118,31 +137,10 @@ def get_all_metrics(df: pd.DataFrame, disp: bool = False):
     return metrics
 
 
-def mask_nan(func):
-    """Decorator to mask NaN values before applying a function.
-
-    The decorator masks NaN values in both `y` and `y_hat` and ensures there is more
-    than 1 valid measurement before applying the decorated function.
-    """
-
-    def wrapper(y, y_hat, *args, **kwargs):
-        mask = (y > log_pad) & (y_hat > log_pad)
-        if np.sum(mask) > 1:
-            y_masked = y[mask]
-            y_hat_masked = y_hat[mask]
-            return func(y_masked, y_hat_masked, *args, **kwargs)
-        else:
-            return np.nan
-
-    return wrapper
-
-
-@mask_nan
 def calc_r(y, y_hat):
     return spearmanr(y, y_hat).statistic
 
 
-@mask_nan
 def calc_nse(y, y_hat):
     denominator = ((y - y.mean()) ** 2).sum()
     numerator = ((y - y_hat) ** 2).sum()
@@ -152,15 +150,24 @@ def calc_nse(y, y_hat):
         return 1 - (numerator / denominator)
 
 
-@mask_nan
-def calc_kge(y, y_hat):
+def calc_nse_prob(y, y_hat, y_std):
+    expected_sq_error = np.square(y - y_hat) + np.square(y_std)
+    obs_variance = np.square(y - np.mean(y))
+    sum_expected_sq_error = np.sum(expected_sq_error)
+    sum_obs_variance = np.sum(obs_variance)
+    if sum_obs_variance == 0:
+        return np.nan
+    return 1 - (sum_expected_sq_error / sum_obs_variance)
+
+
+def calc_kge_comp(y, y_hat):
     corr = np.corrcoef(y, y_hat)[0, 1]
     mean_y = np.mean(y)
     mean_y_hat = np.mean(y_hat)
     std_y = np.std(y)
     std_y_hat = np.std(y_hat)
     if std_y == 0 or mean_y == 0:
-        return np.nan
+        kge = corr = alpha = beta = np.nan
     else:
         alpha = std_y_hat / std_y
         beta = mean_y_hat / mean_y
@@ -168,32 +175,39 @@ def calc_kge(y, y_hat):
 
     return kge, corr, alpha, beta
 
+def calc_msess(y, y_hat, y_std):
+    expected_sq_error = np.square(y - y_hat) + np.square(y_std)
+    obs_variance = np.square(y - np.mean(y))
+    
+    sum_expected_sq_error = np.sum(expected_sq_error)
+    baseline_expected_sq_error = 2 * np.sum(obs_variance)
+    
+    if baseline_expected_sq_error == 0:
+        return np.nan
+        
+    return 1 - (sum_expected_sq_error / baseline_expected_sq_error)
 
-@mask_nan
+
 def calc_sigE(y, y_hat):
     rel_err = (y_hat - y) / np.mean(y)
     rel_err = rel_err - np.mean(rel_err)  # debias
     return np.quantile(np.abs(rel_err), 0.67)
 
 
-@mask_nan
 def calc_nbias(y, y_hat):
     nBias = np.median((y_hat - y) / y)
     return nBias
 
 
-@mask_nan
 def calc_mae(y, y_hat):
     return np.mean(np.abs(y - y_hat))
 
 
-@mask_nan
 def calc_rel_err(y, y_hat):
     MdALQ = np.median(np.abs(np.log(y_hat / y)))
     return 100 * (np.exp(MdALQ) - 1)
 
 
-@mask_nan
 def calc_rel_bias(y, y_hat):
     MdLQ = np.median(np.log(y_hat / y))
     sign = np.sign(MdLQ)
@@ -201,12 +215,10 @@ def calc_rel_bias(y, y_hat):
     return 100 * sign * mag
 
 
-@mask_nan
 def calc_rmse(y, y_hat):
     return np.sqrt(np.mean((y - y_hat) ** 2))
 
 
-@mask_nan
 def calc_rrmse(y, y_hat):
     rmse = calc_rmse(y, y_hat)
     mean_y_hat = np.mean(y_hat)
@@ -216,14 +228,12 @@ def calc_rrmse(y, y_hat):
         return rmse / mean_y_hat * 100
 
 
-@mask_nan
 def calc_lnse(y, y_hat):
     log_y = np.log(y)
     log_yhat = np.log(y_hat)
     return calc_nse(log_y, log_yhat)
 
 
-@mask_nan
 def calc_agreement(y, y_hat):
     """https://www.nature.com/articles/srep19401"""
     corr = np.corrcoef(y, y_hat)[0, 1]

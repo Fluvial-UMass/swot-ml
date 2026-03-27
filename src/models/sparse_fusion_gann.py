@@ -373,7 +373,6 @@ class SpatioTemporalLSTMCell(eqx.Module):
 
     gat: StackedGraphAttention
     lstm_cell: eqx.nn.LSTMCell
-    dropout: eqx.nn.Dropout
 
     def __init__(
         self,
@@ -403,8 +402,6 @@ class SpatioTemporalLSTMCell(eqx.Module):
             key=lstm_key,
         )
 
-        self.dropout = eqx.nn.Dropout(dropout_p)
-
     def __call__(
         self,
         x_t: Array,
@@ -423,7 +420,7 @@ class SpatioTemporalLSTMCell(eqx.Module):
         h_temporal = h_temporal * node_mask[:, jnp.newaxis]
         c_new = c_new * node_mask[:, jnp.newaxis]
 
-        h_spatial, spatial_trace, z, r = self.gat(
+        h_new, spatial_trace, z, r = self.gat(
             h_temporal,
             node_features,
             edge_index=edge_index,
@@ -431,8 +428,6 @@ class SpatioTemporalLSTMCell(eqx.Module):
             edge_mask=edge_mask,
             key=k1,
         )
-
-        h_new = self.dropout(h_spatial, key=k2)
 
         new_state = (h_new, c_new)
         spatial_trace["z_gate"] = z
@@ -598,7 +593,7 @@ class SparseFusionGRNN(BaseModel):
     - Source-agnostic observation fusion via cross-attention
     - Modular source embedders for easy addition of new observation types
     """
-
+    backbone_leaves: list[str]
     hidden_size: int
     seq_length: int
     dense_sources: list[str]
@@ -614,6 +609,9 @@ class SparseFusionGRNN(BaseModel):
     source_registry: SourceEmbedderRegistry
     obs_fusion: ObservationFusionModule
     spat_temp_lstm: SpatioTemporalLSTMCell
+    dropout: eqx.nn.Dropout
+
+    
 
     def __init__(
         self,
@@ -641,6 +639,7 @@ class SparseFusionGRNN(BaseModel):
 
         super().__init__(hidden_size, target, head, key=keys.pop(0))
 
+        self.backbone_leaves = ['dense_embedders','fusion_norm','spat_temp_lstm','head']
         self.hidden_size = hidden_size
         self.seq_length = seq_length
         self.dense_sources = list(dense_sizes.keys())
@@ -650,6 +649,8 @@ class SparseFusionGRNN(BaseModel):
         self.return_weights = return_weights
         self.use_obs_memory = use_obs_memory
         self.staleness_threshold = staleness_threshold
+
+        self.dropout = eqx.nn.Dropout(dropout)
 
         # Dense embedders
         dense_keys = jrandom.split(keys.pop(0), len(self.dense_sources))
@@ -718,6 +719,8 @@ class SparseFusionGRNN(BaseModel):
         edge_mask = data.edge_mask
         graph_edges = data.graph_edges
 
+        drop_key1, drop_key2, scan_key = jrandom.split(key, 3)
+
         # 1. Dense embedding
         dense_emb_list = []
         for name in self.dense_sources:
@@ -726,6 +729,7 @@ class SparseFusionGRNN(BaseModel):
             dense_emb_list.append(jax.vmap(jax.vmap(emb_mlp))(features))
         dense_emb = jnp.sum(jnp.stack(dense_emb_list), axis=0)
         dense_emb_norm = jax.vmap(jax.vmap(self.fusion_norm))(dense_emb)
+        dense_emb_norm = self.dropout(dense_emb_norm, key=drop_key1)
 
         # 2. Sparse observation embedding
         obs_emb = {}
@@ -778,7 +782,7 @@ class SparseFusionGRNN(BaseModel):
             edge_mask=edge_mask,
         )
 
-        scan_keys = jrandom.split(key, self.seq_length)
+        scan_keys = jrandom.split(scan_key, self.seq_length)
         scan_inputs = (dense_emb_norm, obs_memories, scan_keys)
         final_state, accumulated = jax.lax.scan(partial_timestep, initial_state, scan_inputs)
 
@@ -787,10 +791,12 @@ class SparseFusionGRNN(BaseModel):
 
         # 5. Predictions
         if self.seq2seq:
+            all_h = self.dropout(all_h, key=drop_key2)
             predictions = {
                 target: jax.vmap(jax.vmap(head))(all_h) for target, head in self.head.items()
             }
         else:
+            final_h = self.dropout(final_h, key=drop_key2)
             predictions = {target: jax.vmap(head)(final_h) for target, head in self.head.items()}
 
         if self.supervised_attn:

@@ -10,6 +10,8 @@ from config.model_args import (
     SFGRNNArgs,
     MCDALSTMArgs,
     LSTMGCNNArgs,
+    RiverLSTMArgs,
+    RGCNArgs,
 )
 from data import CachedBasinGraphDataLoader, CachedBasinGraphDataset
 from models.base_model import BaseModel
@@ -20,6 +22,8 @@ from models.stacked_lstm import STACKED_LSTM
 from models.sparse_fusion_gann import SparseFusionGRNN
 from models.mc_da_lstm import MCDALSTM
 from models.lstm_gcnn import LSTMGCNN
+from models.river_lstm import RiverLSTM
+from models.rgcn import RGCN
 
 # Dictionary of valid model names and their constructors
 MODEL_MAP = {
@@ -30,6 +34,8 @@ MODEL_MAP = {
     "sf_grnn": SparseFusionGRNN,
     "mc_da_lstm": MCDALSTM,
     "lstm_gcnn": LSTMGCNN,
+    "river_lstm": RiverLSTM,
+    "rgcn": RGCN,
 }
 
 
@@ -69,7 +75,9 @@ def set_model_data_args(cfg: Config, dataset: CachedBasinGraphDataset):
         cfg.model_args.static_size = len(dataset.features.static)
         cfg.model_args.time_aware = cfg.time_gaps
 
-    elif isinstance(cfg.model_args, (STGATArgs, SFGRNNArgs, MCDALSTMArgs, LSTMGCNNArgs)):
+    elif isinstance(
+        cfg.model_args, (STGATArgs, SFGRNNArgs, MCDALSTMArgs, LSTMGCNNArgs, RiverLSTMArgs, RGCNArgs)
+    ):
         cfg.model_args.target = dataset.target
         cfg.model_args.seq_length = cfg.sequence_length
         cfg.model_args.dense_sizes = {

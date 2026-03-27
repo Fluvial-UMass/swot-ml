@@ -136,6 +136,45 @@ class GraphPackingSampler(Sampler[list[int]]):
                 break
 
 
+def pack_inflow_data(
+    samples: list[GraphBatch],
+    num_nodes_per_graph: list[int],
+    num_real_nodes: int,
+    num_padding_nodes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Offsets and pads inflow indices/masks for models requiring fixed-degree adjacency.
+    """
+    node_offset = 0
+    offset_inflow_list = []
+    inflow_mask_list = []
+
+    for i, sample in enumerate(samples):
+        valid_mask = sample.inflow_mask
+        # Offset valid indices; point invalid slots to -1 temporarily
+        current_inflow = np.where(valid_mask, sample.inflow_indices + node_offset, -1)
+
+        offset_inflow_list.append(current_inflow)
+        inflow_mask_list.append(valid_mask)
+        node_offset += num_nodes_per_graph[i]
+
+    unpadded_inflow = np.concatenate(offset_inflow_list, axis=0)
+    unpadded_inflow_mask = np.concatenate(inflow_mask_list, axis=0)
+
+    # Point all invalid/empty slots to the first padding node (num_real_nodes)
+    # This prevents OOB and ensures gather() hits a masked padding feature row
+    unpadded_inflow = np.where(unpadded_inflow_mask, unpadded_inflow, num_real_nodes)
+
+    padded_inflow = np.pad(
+        unpadded_inflow, ((0, num_padding_nodes), (0, 0)), constant_values=num_real_nodes
+    )
+    padded_inflow_mask = np.pad(
+        unpadded_inflow_mask, ((0, num_padding_nodes), (0, 0)), constant_values=False
+    )
+
+    return padded_inflow, padded_inflow_mask
+
+
 def padding_collate_fn(
     batch: list[tuple[str, list[str], np.datetime64, GraphBatch]], target_nodes_per_batch: int
 ) -> GraphBatch:
@@ -223,11 +262,21 @@ def padding_collate_fn(
         [np.ones(num_real_edges, dtype=np.bool_), np.zeros(num_padding_edges, dtype=np.bool_)]
     )
 
+    # Optional Inflow Packing
+    inflow_indices = None
+    inflow_mask = None
+    if samples[0].inflow_indices is not None:
+        inflow_indices, inflow_mask = pack_inflow_data(
+            samples, num_nodes_per_graph, num_real_nodes, num_padding_nodes
+        )
+
     # --- Step 5: Assemble Final Batch ---
     final_batch = GraphBatch(
         dynamic=padded_dynamic,
         static=padded_static,
         graph_edges=padded_edges,
+        inflow_indices=inflow_indices,
+        inflow_mask=inflow_mask,
         graph_idx=padded_graph_idx,
         node_mask=node_mask,
         edge_mask=edge_mask,

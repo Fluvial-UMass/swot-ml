@@ -141,7 +141,12 @@ def train_new_assimilator(run_or_state_dir: Path, assim_path: Path):
     trainer.replace_model(new_model)
 
     if assim_cfg.freeze_base:
-        trainer.freeze_components(["dense_embedders", "fusion_norm", "spat_temp_lstm"])
+        if getattr(new_model, 'backbone_leaves', None):
+            trainer.freeze_components(new_model.backbone_leaves)
+        elif 'get_backbone' in dir(new_model):
+            trainer.freeze_components(new_model.get_backbone())
+    else:
+        print("Assim was config'd to freeze base model but base not defined.")
 
     trainer.start_training()
 

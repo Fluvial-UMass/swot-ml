@@ -110,6 +110,31 @@ class MSAttnArgs(BaseModelArgs):
     active_source: dict[str, bool] = Field(default_factory=dict)
 
 
+class RiverLSTMArgs(BaseModelArgs):
+    name: Literal["river_lstm"]
+    k_hops: int = Field(..., gte=0)
+    return_weights: bool = False
+    target: list[str] = None
+    seq_length: int = None
+    dense_sizes: dict[str, int] = None
+    sparse_sizes: dict[str, int] = None
+    static_size: int = None
+    assim_sizes: dict[str, dict] = Field(default_factory=dict)
+    use_obs_memory: bool = True
+
+
+class RGCNArgs(BaseModelArgs):
+    name: Literal["rgcn"]
+    return_weights: bool = False
+    target: list[str] = None
+    seq_length: int = None
+    dense_sizes: dict[str, int] = None
+    sparse_sizes: dict[str, int] = None
+    static_size: int = None
+    assim_sizes: dict[str, dict] = Field(default_factory=dict)
+    use_obs_memory: bool = True
+
+
 ModelArgs: TypeAlias = (
     SeqAttnArgs
     | StackArgs
@@ -119,4 +144,6 @@ ModelArgs: TypeAlias = (
     | SFGRNNArgs
     | MCDALSTMArgs
     | LSTMGCNNArgs
+    | RiverLSTMArgs
+    | RGCNArgs
 )

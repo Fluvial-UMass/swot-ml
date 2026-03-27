@@ -8,12 +8,13 @@ warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 from pathlib import Path
 
 import zarr
+import dask
 import xarray as xr
 import numpy as np
 import pandas as pd
 import dask.array as da
 from tqdm import tqdm
-from dask.distributed import Client, LocalCluster
+from dask.distributed import Client, LocalCluster, as_completed
 
 
 class ZarrBasinStore:
@@ -123,13 +124,8 @@ class ZarrBasinStore:
         var_names: str | list[str] = None,
         overwrite: bool = False,
         n_workers: int = 8,
-        memory_limit: str = 'auto' # or '8GB' for example
-
+        memory_limit: str = "8GB",
     ):
-        """
-        Iterates through all basin Zarr groups to compute and store normalization statistics.
-        This is a standalone script to be run once after data is exported to Zarr.
-        """
         basins = validate_list_or_str(basins)
         var_names = validate_list_or_str(var_names)
         basin_paths = [p for p in self.store_path.iterdir() if p.is_dir()]
@@ -137,92 +133,92 @@ class ZarrBasinStore:
         if basins:
             basin_paths = [p for p in basin_paths if p.stem in basins]
 
-        cluster = LocalCluster(
-            n_workers=n_workers,
-            threads_per_worker=1,
-            memory_limit=memory_limit
-        )
+        cluster = LocalCluster(n_workers=n_workers, threads_per_worker=2, memory_limit=memory_limit)
+
         with Client(cluster) as client:
-            print(f"Dask client started. Dashboard at: {client.dashboard_link}")
+            print(f"Dask Dashboard: {client.dashboard_link}")
 
-            for basin_path in tqdm(basin_paths, desc="Basins"):
-                ds = None  # initialize ds for the 'finally' block
+            @dask.delayed
+            def get_basin_task(path, vars_to_compute):
+                """Returns a nested dictionary of lazy Dask computations."""
+                ds = xr.open_zarr(path, consolidated=True, chunks={})
+
+                # Intersection of requested and available variables
+                available_vars = [v for v in vars_to_compute if v in ds.data_vars]
+
+                computations = {}
+                for v in available_vars:
+                    da = ds[v].astype(np.float64)
+                    # Filter valid and positive values
+                    valid = da.where(da.notnull())
+                    pos = valid.where(valid >= 0)
+
+                    computations[v] = {
+                        "count": valid.count(),
+                        "sum": valid.sum(),
+                        "sum_sq": (valid**2).sum(),
+                        "min": valid.min(),
+                        "max": valid.max(),
+                        "log_sum": np.log1p(pos).sum(),
+                        "log_sum_sq": (np.log1p(pos) ** 2).sum(),
+                        "positive_count": pos.count(),
+                    }
+                return computations
+
+            # Step 1: Submit tasks
+            futures = []
+            path_map = {}
+
+            for p in basin_paths:
                 try:
-                    # Catch errors for non-Zarr directories (e.g., _cache).
+                    z_group = zarr.open(str(p), mode="r")
+                    existing = z_group.attrs.get("normalization_stats", {})
+                except Exception:
+                    continue
+
+                if var_names and not overwrite:
+                    vars_to_scale = [v for v in var_names if v not in existing]
+                else:
+                    with xr.open_zarr(p, consolidated=True) as temp_ds:
+                        all_vars = [v for v in temp_ds.data_vars if temp_ds[v].dtype.kind in "fi"]
+                        vars_to_scale = var_names if var_names else all_vars
+                    if not overwrite:
+                        vars_to_scale = [v for v in vars_to_scale if v not in existing]
+
+                if vars_to_scale:
+                    future = client.compute(get_basin_task(p, vars_to_scale))
+                    futures.append(future)
+                    path_map[future.key] = (p, existing)
+
+            # Step 2: Monitor and Eagerly Compute Nested Results
+            with tqdm(total=len(futures), desc="Processing Basins") as pbar:
+                for future in as_completed(futures):
+                    path, existing_stats = path_map[future.key]
                     try:
-                        z_group = zarr.open(str(basin_path), mode="r")
-                        existing_stats = z_group.attrs.get("normalization_stats", {})
-                    except Exception:
-                        # Silently skip directories that are not valid Zarr groups
-                        continue
+                        # 'raw_dict' is a dict of dicts of lazy Dask Arrays
+                        raw_dict = future.result()
 
-                    # If specific vars requested, check overlap BEFORE opening xarray
-                    # This avoids metadata reads for fully completed basins.
-                    if var_names and not overwrite:
-                        missing_vars = [v for v in var_names if v not in existing_stats]
-                        if not missing_vars:
-                            continue
+                        # Compute the entire nested dictionary into NumPy scalars in one go
+                        basin_results = client.gather(client.compute(raw_dict))
 
-                    ds = xr.open_zarr(basin_path, consolidated=True)
-                    all_numeric_vars = [v for v in ds.data_vars if ds[v].dtype.kind in "fi"]
-                    target_vars = var_names if var_names else all_numeric_vars
-
-                    # Determine which variables need stats computed
-                    if overwrite:
-                        # process all target variables
-                        vars_to_scale = target_vars
-                    else:
-                        # process only target variables that don't have existing stats
-                        vars_to_scale = [v for v in target_vars if v not in existing_stats]
-
-                    # Go to next basin if no variables to process
-                    if not vars_to_scale:
-                        continue
-                    
-                    all_computations = {}
-                    for var_name in vars_to_scale:
-                        # Cast and mask once
-                        da = ds[var_name].astype(np.float64)
-                        # Define masks
-                        is_valid = da.notnull()
-                        pos_mask = da > 0
-                        da_pos = da.where(pos_mask)
-                        log_da_pos = np.log1p(da_pos)
-
-                        # Aggregate moments into the computation graph
-                        all_computations[var_name] = {
-                            "count": is_valid.sum(),
-                            "sum": da.sum(),
-                            "sum_sq": (da**2).sum(),
-                            "min": da.min(),
-                            "max": da.max(),
-                            "log_sum": log_da_pos.sum(),
-                            "log_sum_sq": (log_da_pos**2).sum(),
-                            "positive_count": pos_mask.sum(),
+                        # Now 'val' is a NumPy scalar, so .item() works perfectly
+                        serializable = {
+                            v: {k: val.item() for k, val in metrics.items()}
+                            for v, metrics in basin_results.items()
+                            if metrics["count"] > 0
                         }
 
-                    # Single compute call for the entire basin
-                    # This maximizes parallelization across all variables and all chunks
-                    results = client.compute(all_computations)
-                    processed_results = client.gather(results)
+                        if serializable:
+                            existing_stats.update(serializable)
+                            z_group_write = zarr.open(str(path), mode="r+")
+                            z_group_write.attrs["normalization_stats"] = existing_stats
 
-
-                    # Convert NumPy scalars to Python primitives for Zarr metadata compatibility
-                    serializable_stats = {
-                        var_name: {stat_key: val.item() for stat_key, val in metrics.items()}
-                        for var_name, metrics in processed_results.items()
-                        if metrics["count"] > 0
-                    }
-
-                    if serializable_stats:
-                        existing_stats.update(serializable_stats)
-                        z_group_write = zarr.open(str(basin_path), mode="r+")
-                        z_group_write.attrs["normalization_stats"] = existing_stats
-
-                finally:
-                    # Ensure the xarray dataset is closed
-                    if ds is not None:
-                        ds.close()
+                    except Exception as e:
+                        print(f"Error in {path.stem}: {e}")
+                        raise e
+                    finally:
+                        pbar.set_postfix({'basin': path.stem})
+                        pbar.update(1)
 
     def init_basin_coords(self, basin_path, subbasin_list):
         """Initializes basin zarr with coordinates if needed."""

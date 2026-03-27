@@ -70,13 +70,22 @@ def compute_loss(
         # Handle GMM (dict output) vs Standard (Array output)
         if isinstance(y_hat_target, dict):
             expanded_mask = jnp.expand_dims(valid_mask, axis=-1)
-            masked_y_hat = {k: jnp.where(expanded_mask, v, 0) for k, v in y_hat_target.items()}
+            masked_y_hat = {
+                "mu": jnp.where(expanded_mask, y_hat_target["mu"], 0.0),
+                "sigma": jnp.where(expanded_mask, y_hat_target["sigma"], 1.0),  # sigma=1 is safe
+                "log_pi": jnp.where(
+                    expanded_mask, y_hat_target["log_pi"], 1.0 / y_hat_target["log_pi"].shape[-1]
+                ),  # uniform is safe
+            }
         else:
             masked_y_hat = jnp.where(valid_mask, y_hat_target[..., 0], 0)
 
         target_denorm_fn = partial(denorm_fn, name=target_name)
         loss = loss_fn(masked_y, masked_y_hat, valid_mask, target_denorm_fn)
-        loss = jnp.nan_to_num(loss, 0) * target_weights[target_name]
+
+        has_any_valid = jnp.any(valid_mask)
+        loss = jnp.where(has_any_valid, loss, 0.0)
+
         losses.append(loss)
 
     loss = jnp.mean(jnp.stack(losses))
@@ -172,33 +181,44 @@ def spin_up_nse_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
 
 
 def gmm_nll(y: Array, y_hat: dict[str, Array], mask: Array, denorm_fn: Callable) -> Array:
-    """
-    Calculates the average negative log-likelihood for a Gaussian Mixture Model (GMM).
-    """
-    y_obs = jnp.expand_dims(y, axis=-1)  # Allow broadcasting to each error model
-    mu_hat = y_hat["mu"]
-    sigma_hat = y_hat["sigma"]
+    y_obs = jnp.expand_dims(y, axis=-1)
+    mu, sigma, log_pi = y_hat["mu"], y_hat["sigma"], y_hat["log_pi"]
 
-    # Log of the normal PDF for each component:
-    # log(pdf) = -log(sigma) - 0.5 * log(2*pi) - 0.5 * ((y - mu) / sigma)^2
+    log_sigma = jnp.log(sigma)
     log_2pi = jnp.log(2.0 * jnp.pi)
-    log_pdfs = -jnp.log(sigma_hat) - 0.5 * log_2pi - 0.5 * jnp.square((y_obs - mu_hat) / sigma_hat)
 
-    # Combine with log(pi) and use logsumexp over components
-    # log(sum(pi * pdf)) = logsumexp(log(pi) + log(pdf))
-    log_pi = jnp.log(y_hat["pi"] + 1e-9)  # eps for stability
-    log_weighted_likelihoods = jax.scipy.special.logsumexp(log_pi + log_pdfs, axis=-1)
+    # Calculate z-score: (obs - pred) / std
+    scaled_diff = (y_obs - mu) / sigma
+    # Cap the squared residual to prevent a single outlier from exploding gradients
+    sq_diff = jnp.square(jnp.clip(scaled_diff, -20.0, 20.0))
 
-    return -jnp.mean(log_weighted_likelihoods, where=mask)
+    log_phi = -log_sigma - 0.5 * log_2pi - 0.5 * sq_diff
+    
+    # Numerical stability: logsumexp avoids pi * exp(log_phi) overflow
+    log_likelihood = jax.scipy.special.logsumexp(log_pi + log_phi, axis=-1)
+
+    return -jnp.sum(log_likelihood * mask) / (jnp.sum(mask) + 1e-8)
 
 
 def attention_leakage_loss(attn_weights: Array, obs_mask: Array, node_mask: Array) -> Array:
     """
-    Penalizes any attention weight assigned to masked (invalid) time steps.
-    Does NOT penalize the distribution over valid time steps our sources.
+    Penalizes attention to masked (invalid) time steps AND encourages
+    attention to valid time steps when they exist.
     """
+    # Original penalty: don't attend to null token when real data exists
     real_data_exists = jnp.any(obs_mask[..., :-1], axis=-1)
     null_attn_weights = attn_weights[..., -1]
-    penalty = null_attn_weights * real_data_exists
+    leakage_penalty = null_attn_weights * real_data_exists
 
-    return jnp.mean(penalty, where=real_data_exists)
+    # Sum of attention weights on valid time steps
+    valid_attn_weights = attn_weights[..., :-1]  # Exclude null token
+    valid_attn_sum = jnp.sum(valid_attn_weights * obs_mask[..., :-1], axis=-1)
+
+    # Penalize low attention to valid data (when valid data exists)
+    # Could use: 1 - valid_attn_sum to reward higher total attention on valid data
+    underutilization_penalty = (1.0 - valid_attn_sum) * real_data_exists
+
+    # Combine both penalties
+    total_penalty = leakage_penalty + underutilization_penalty
+
+    return jnp.mean(total_penalty, where=real_data_exists)

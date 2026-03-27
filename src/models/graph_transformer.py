@@ -20,16 +20,14 @@ class ST_GATransformer(BaseModel):
     seq_length: int
     dense_sources: list[str]
     sparse_sources: list[str]
-    static_size: int
     seq2seq: bool
     use_obs_memory: bool
     return_weights: bool
 
-    dense_embedders: dict[str, eqx.nn.MLP]
-    fusion_norm: eqx.nn.LayerNorm
+    static_embedder: eqx.nn.MLP
+    dense_embedder: eqx.nn.MLP
     sparse_embedders: dict[str, StaticMLP]
     sparse_gain_nets: dict[str, eqx.nn.MLP]
-    sparse_norms: dict[str, eqx.nn.LayerNorm]
     spat_temp_lstm: SpatioTemporalLSTMCell
 
     def __init__(
@@ -61,38 +59,49 @@ class ST_GATransformer(BaseModel):
         self.seq_length = seq_length
         self.dense_sources = list(dense_sizes.keys())
         self.sparse_sources = list(sparse_sizes.keys())
-        self.static_size = static_size
         self.seq2seq = seq2seq
         self.return_weights = return_weights
         self.use_obs_memory = use_obs_memory
 
-        # Create embedding networks for dynamic sources
-        dense_keys = jrandom.split(keys.pop(0), len(self.dense_sources))
-        self.dense_embedders = {}
-        for (name, size), k in zip(dense_sizes.items(), dense_keys):
-            self.dense_embedders[name] = eqx.nn.MLP(
-                in_size=size, out_size=hidden_size, width_size=hidden_size, depth=1, key=k
-            )
-        self.fusion_norm = eqx.nn.LayerNorm(hidden_size)
+        # Embedding network for static features
+        self.static_embedder = eqx.nn.MLP(
+            in_size = static_size,
+            out_size = hidden_size, 
+            width_size = 2 * hidden_size,
+            depth = 2,
+            key = keys.pop(0)
+        )
 
-        # Create embedding and assimilation networks for the sparse sources
+        # Embedding network for concatenated dense dynamic features
+        total_dense_size = sum(list(dense_sizes.values()))
+        self.dense_embedder = eqx.nn.MLP(
+            in_size = total_dense_size,
+            out_size = hidden_size, 
+            width_size = 2 * hidden_size,
+            depth = 2,
+            key = keys.pop(0)
+        )
+
+        # Embedding and assimilation networks for the sparse sources
         self.sparse_embedders = {}
         self.sparse_gain_nets = {}
-        self.sparse_norms = {}
         sparse_keys = jrandom.split(keys.pop(0), len(self.sparse_sources))
         for (name, in_size), k in zip(sparse_sizes.items(), sparse_keys):
             self.add_assimilator(name, in_size, assim_sizes.get(name, {}), key=k)
 
-        # The combined GAT-LSTM cell
+        # The combined graph attention LSTM cell
         self.spat_temp_lstm = SpatioTemporalLSTMCell(
             lstm_input_size=hidden_size,
-            static_feature_size=static_size,
+            static_feature_size=hidden_size,
             hidden_size=hidden_size,
             k_hops=k_hops,
             num_heads=num_heads,
             dropout_p=dropout,
             key=keys.pop(0),
         )
+
+    def get_backbone(self) -> list[str]:
+        return ['static_embedder','dense_embedder','spat_temp_lstm','head']
 
     def add_assimilator(
         self, name: str, n_features: int, size_args: dict = {}, *, key: PRNGKeyArray = None
@@ -108,7 +117,7 @@ class ST_GATransformer(BaseModel):
         embed_depth = size_args.get("embed_depth", 2)
         self.sparse_embedders[name] = StaticMLP(
             dynamic_in_size=n_features,
-            static_in_size=self.static_size,
+            static_in_size=self.hidden_size,
             out_size=self.hidden_size,
             width_size=embed_width,
             depth=embed_depth,
@@ -126,7 +135,7 @@ class ST_GATransformer(BaseModel):
             depth=gain_depth,
             key=k2,
         )
-        self.sparse_norms[name] = eqx.nn.LayerNorm(self.hidden_size)
+
 
     def __call__(self, data: GraphBatch, key: PRNGKeyArray) -> Array:
         num_locations = data.static.shape[0]  # including padding
@@ -134,47 +143,36 @@ class ST_GATransformer(BaseModel):
         edge_mask = data.edge_mask
         graph_edges = data.graph_edges
 
-        # --- 1. Data Embedding ---
-        dense_emb_list = []
-        for name in self.dense_sources:
-            features = data.dynamic[name]
-            # vmap over first two dimensions (time and location)
-            emb_mlp = self.dense_embedders[name]
-            dense_emb_list.append(jax.vmap(jax.vmap(emb_mlp))(features))
-        dense_emb = jnp.sum(jnp.stack(dense_emb_list), axis=0)
-        dense_emb_norm = jax.vmap(jax.vmap(self.fusion_norm))(dense_emb)
+        # Data Embedding
+        static_emb = jax.vmap(self.static_embedder)(data.static)
 
+        dense_feat = jnp.concat([data.dynamic[name] for name in self.dense_sources], axis=-1)
+        dense_emb = jax.vmap(jax.vmap(self.dense_embedder))(dense_feat)
+        
+        # Embed all sparse sources across the full time dimension up front.
+        # The memory tracking (staleness, has_been_seen) is handled inside
+        # the timestep scan via obs_emb_seq, so the carry is correct.
         obs_emb = {}
         for name in self.sparse_sources:
-            # Clean up nans in the dynamic data
             features = data.dynamic[name]
             obs_mask = ~jnp.any(jnp.isnan(features), axis=-1, keepdims=True)
             safe_features = jnp.nan_to_num(features)
-
             embedding_mlp = self.sparse_embedders[name]
-            emb_vectors = embedding_mlp(safe_features, data.static)
+            emb_vectors = embedding_mlp(safe_features, static_emb)
+            # Shape: (T, num_locations, hidden_size), (T, num_locations, 1)
+            obs_emb[name] = (emb_vectors, obs_mask)
 
-            # Mask the update: if data were NaN, the update vector becomes zero
-            masked_obs_emb = jnp.where(obs_mask, emb_vectors, 0.0)
-            obs_emb[name] = (masked_obs_emb, obs_mask)
-
-        # --- 2. Preprocess the observational memory ---
-        if len(self.sparse_sources) > 0:
-            obs_memories = self.create_observational_memory(obs_emb, num_locations)
-        else:
-            obs_memories = None
 
         # --- 2. Recurrent Processing Loop ---
         @jax.checkpoint
-        def process_one_timestep(
-            state_prev, scan_slice, static_data, graph_edges, node_mask, edge_mask
-        ):
-            dense_input, step_obs_memory, step_key = scan_slice
+        def process_one_timestep(carry, scan_slice, static_data, graph_edges, node_mask, edge_mask):
+            lstm_state, obs_memory = carry
+            dense_input, step_obs_emb, step_key = scan_slice
 
-            # Recurrent update
-            (h_new, c_new), (spatial_trace) = self.spat_temp_lstm(
+            # Temporal + spatial LSTM update
+            (h_new, c_new), spatial_trace = self.spat_temp_lstm(
                 dense_input,
-                state_prev,
+                lstm_state,
                 static_data,
                 graph_edges,
                 node_mask,
@@ -182,109 +180,106 @@ class ST_GATransformer(BaseModel):
                 key=step_key,
             )
 
-            if step_obs_memory is not None:
-                h_new, assim_trace = self.assimilate(h_new, step_obs_memory)
+            # Update observational memory inside the scan carry
+            # so staleness and has_been_seen accumulate correctly over time.
+            if step_obs_emb is not None:
+                obs_memory, h_new, assim_trace = self.step_obs_memory_and_assimilate(
+                    h_new, obs_memory, step_obs_emb
+                )
             else:
                 assim_trace = {}
 
-            new_state = (h_new, c_new)
-
+            new_carry = ((h_new, c_new), obs_memory)
             weights = {"spatial": spatial_trace, "assim": assim_trace}
             accumulated_outputs = (h_new, weights)
-            return new_state, accumulated_outputs
+
+            return new_carry, accumulated_outputs
 
         # Initial states
-        initial_h = jnp.zeros((num_locations, self.hidden_size))
-        initial_c = jnp.zeros((num_locations, self.hidden_size))
-        initial_state = (initial_h, initial_c)
+        initial_lstm = (
+            jnp.zeros((num_locations, self.hidden_size)),
+            jnp.zeros((num_locations, self.hidden_size)),
+        )
+        # obs_memory is now part of the scan carry, not pre-computed
+        initial_obs_memory = {
+            name: (
+                jnp.zeros((num_locations, self.hidden_size)),   # last_obs
+                jnp.ones((num_locations,)),                     # staleness
+                jnp.zeros((num_locations,), dtype=jnp.bool_),  # has_been_seen
+            )
+            for name in self.sparse_sources
+        }
+        initial_carry = (initial_lstm, initial_obs_memory)
 
-        # Closure of timestep fn with static data and masks.
         partial_timestep = partial(
             process_one_timestep,
-            static_data=data.static,
+            static_data=static_emb,
             graph_edges=graph_edges,
             node_mask=node_mask,
             edge_mask=edge_mask,
         )
 
-        # Scan over the time sequence
         scan_keys = jrandom.split(key, self.seq_length)
-        scan_inputs = (dense_emb_norm, obs_memories, scan_keys)
-        final_state, accumulated = jax.lax.scan(partial_timestep, initial_state, scan_inputs)
+        # obs_emb_seq has shape (time, nodes, features) 
+        scan_inputs = (dense_emb, obs_emb if self.sparse_sources else None, scan_keys)
+        final_carry, accumulated = jax.lax.scan(partial_timestep, initial_carry, scan_inputs)
 
-        final_h, final_c = final_state
+        (final_h, final_c), _ = final_carry
         all_h, weights = accumulated
 
-        # Use states for predictions
         if self.seq2seq:
-            # vmap over each time AND each location
             predictions = {
                 target: jax.vmap(jax.vmap(head))(all_h) for target, head in self.head.items()
             }
         else:
-            # vmap over each location using final state
             predictions = {target: jax.vmap(head)(final_h) for target, head in self.head.items()}
 
-        # With jax JIT, the returns have no impact on performance unless the model is compiled with this branch.
         if self.return_weights:
             return predictions, weights
         else:
             return predictions
 
-    def create_observational_memory(self, obs_emb, num_locations):
-        def memory_step(
-            prev_memory: dict[str, Array], updates_masks: dict[str, tuple[Array, Array]]
-        ):
-            """One step of obs memory tracking."""
-            new_memory = {}
-            for name, (update_emb_t, mask_t) in updates_masks.items():
-                prev_obs, prev_stale, prev_seen = prev_memory[name]
-
-                # Reset if new obs, otherwise carry forward + increment staleness
-                updated_obs = jnp.where(mask_t, update_emb_t, prev_obs)
-                updated_staleness = jnp.where(mask_t.squeeze(axis=-1), 0.0, prev_stale + 1.0)
-
-                # Update seen flag. Once true, it stays true.
-                has_been_seen = prev_seen | mask_t.squeeze(axis=-1)
-
-                new_memory[name] = (updated_obs, updated_staleness, has_been_seen)
-            return new_memory, new_memory  # carry + collect for whole sequence
-
-        initial_obs_memory = {
-            name: (
-                jnp.zeros((num_locations, self.hidden_size)),  # last_obs
-                jnp.ones((num_locations)) * 1e6,  # staleness
-                jnp.zeros((num_locations), dtype=jnp.bool_),  # has_been_observed
-            )
-            for name in self.sparse_sources
-        }
-        _, obs_memories = jax.lax.scan(memory_step, initial_obs_memory, obs_emb)
-
-        return obs_memories
-
-    def assimilate(self, h: Array, obs_memory: dict[str, tuple[Array, Array]]):
-        """Assimilate using observation memory with staleness tracking."""
+    def step_obs_memory_and_assimilate(
+        self,
+        h: Array,
+        obs_memory: dict[str, tuple[Array, Array, Array]],
+        step_obs_emb: dict[str, tuple[Array, Array]],
+    ) -> tuple[dict, Array, dict]:
+        """
+        Updates staleness and has_been_seen as a carry, then assimilates the updated memory into h.
+        """
+        new_memory = {}
         tracing_weights = {}
-        for name, (last_obs, staleness, has_been_seen) in obs_memory.items():
-            # Normalize observation embedding
-            update_emb = jax.vmap(self.sparse_norms[name])(last_obs)
-            nu = update_emb - h  # Innovation
+
+        for name in self.sparse_sources:
+            update_emb_t, mask_t = step_obs_emb[name]   # (num_loc, hidden), (num_loc, 1)
+            prev_obs, prev_stale, prev_seen = obs_memory[name]
+
+            # Update memory state
+            updated_obs = jnp.where(mask_t, update_emb_t, prev_obs)
+            updated_staleness = jnp.where(
+                mask_t.squeeze(axis=-1), 0.0, prev_stale + 1.0
+            )
+            has_been_seen = prev_seen | mask_t.squeeze(axis=-1)
+            new_memory[name] = (updated_obs, updated_staleness, has_been_seen)
+
+            # Assimilation
+            nu = updated_obs - h 
 
             if self.use_obs_memory:
-                gain_input = jnp.concatenate([update_emb, nu, staleness[:, jnp.newaxis]], axis=1)
-                gain = jax.nn.sigmoid(jax.vmap(self.sparse_gain_nets[name])(gain_input))
-                # Mask the gain only based on if there has been any valid observation yet.
-                # (memory padding is invalid until we have an observation)
+                gain_input = jnp.concatenate(
+                    [updated_obs, nu, updated_staleness[:, jnp.newaxis]], axis=1
+                )
+                gain = jax.vmap(self.sparse_gain_nets[name])(gain_input)
                 seen_mask = has_been_seen[:, jnp.newaxis]
                 masked_gain = jnp.where(seen_mask, gain, 0.0)
             else:
-                gain_input = jnp.concatenate([update_emb, nu], axis=1)
-                gain = jax.nn.sigmoid(jax.vmap(self.sparse_gain_nets[name])(gain_input))
-                # Mask the gain where we have stale observations
-                fresh_mask = staleness[:, jnp.newaxis] == 0
+                gain_input = jnp.concatenate([updated_obs, nu], axis=1)
+                gain = jax.vmap(self.sparse_gain_nets[name])(gain_input)
+                fresh_mask = updated_staleness[:, jnp.newaxis] == 0
                 masked_gain = jnp.where(fresh_mask, gain, 0.0)
 
             h = h + (masked_gain * nu)
             tracing_weights[name] = {"gain": masked_gain, "nu": nu}
 
-        return h, tracing_weights
+        return new_memory, h, tracing_weights
