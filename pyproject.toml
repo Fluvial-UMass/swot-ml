@@ -11,10 +11,9 @@ dependencies = [
     "deltalake>=1.1.4",
     "equinox>=0.12.2",
     "geopandas>=1.1.0",
-    "global-gauges",
     "h5netcdf>=1.6.4",
     "h5py>=3.14.0",
-    "jax[cuda12]<0.6.0",
+    "jax<0.6.0",
     "matplotlib>=3.10.3",
     "netcdf4>=1.7.2",
     "networkx>=3.5",
@@ -49,6 +48,11 @@ indent-width = 4
 
 [tool.ruff.lint.extend-per-file-ignores]
 "__init__.py" = ["F401"]
+
+[project.optional-dependencies]
+gpu = [
+  "jax-cuda12-plugin==0.5.3",
+]
 
 [dependency-groups]
 bayesian-opt = [

@@ -13,17 +13,13 @@ which can be fully automated using configuration files and or arguments to the m
 ### Environment
 To train and run these models on your machine, you can use [uv](https://docs.astral.sh/uv/getting-started/) to create a virtual environment and install dependencies from `pyproject.toml`. Open a terminal and navigate to the project directory.
 
-Create a new virtual environment (venv) with default name
+Create a new virtual environment based on the files
 ```sh
-uv venv
+uv sync
 ```
-Activate the environment (for mac/linux)
-```sh
-source .venv/bin/activate
-```
-Install the dependencies to your new venv in editable mode with dev packages
-```
-uv pip install -e .[dev]
+Or, with GPU support
+``sh
+uv sync --extra gpu
 ```
 
 JAX with CUDA support will be installed automatically from `pyproject.toml` but your system will still need the correct CUDA drivers.
