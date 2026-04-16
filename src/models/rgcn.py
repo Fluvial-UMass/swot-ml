@@ -42,12 +42,11 @@ class RGrNLSTMCell(eqx.Module):
         edge_weights: Array,
         num_nodes: int,
     ) -> tuple[Array, Array, Array]:
-        
         # Raw Messages (Spatial Projection)
         q_prev = jax.vmap(self.W_q)(h_prev)  # [NumNodes, Hidden]
 
         # Contextualize every edge using current sender and receiver states
-        h_senders = h_prev[senders]      # [NumEdges, Hidden]
+        h_senders = h_prev[senders]  # [NumEdges, Hidden]
         h_receivers = h_prev[receivers]  # [NumEdges, Hidden]
 
         edge_input = jnp.concatenate([h_senders, h_receivers], axis=-1)
@@ -116,7 +115,7 @@ class RGCN(BaseModel):
         # initializes linear head and target list
         super().__init__(hidden_size, target, head, key=keys.pop(0))
 
-        self.backbone_leaves = ['dense_embedders','fusion_norm','rgrn_lstm','head']
+        self.backbone_leaves = ["dense_embedders", "fusion_norm", "rgrn_lstm", "head"]
         self.hidden_size = hidden_size
         self.seq_length = seq_length
         self.dense_sources = tuple(dense_sizes.keys())

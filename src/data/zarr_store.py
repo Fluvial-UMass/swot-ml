@@ -217,7 +217,7 @@ class ZarrBasinStore:
                         print(f"Error in {path.stem}: {e}")
                         raise e
                     finally:
-                        pbar.set_postfix({'basin': path.stem})
+                        pbar.set_postfix({"basin": path.stem})
                         pbar.update(1)
 
     def init_basin_coords(self, basin_path, subbasin_list):

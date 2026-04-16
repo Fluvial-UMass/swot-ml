@@ -575,9 +575,12 @@ class SourceEmbedderRegistry(eqx.Module):
         safe_features = jnp.nan_to_num(features)
 
         raw_emb = self.embedders[name](safe_features, static)
-        normed_emb = jax.vmap(jax.vmap(self.norms[name]))(raw_emb)
+        
+        # Single vmap over spatial dimension N
+        normed_emb = jax.vmap(self.norms[name])(raw_emb)
 
-        masked_emb = jnp.where(obs_mask[:, :, jnp.newaxis], normed_emb, 0.0)
+        # Expand 1D mask (N,) to match (N, H)
+        masked_emb = jnp.where(obs_mask[:, jnp.newaxis], normed_emb, 0.0)
 
         return masked_emb, obs_mask
 
@@ -593,6 +596,7 @@ class SparseFusionGRNN(BaseModel):
     - Source-agnostic observation fusion via cross-attention
     - Modular source embedders for easy addition of new observation types
     """
+
     backbone_leaves: list[str]
     hidden_size: int
     seq_length: int
@@ -610,8 +614,6 @@ class SparseFusionGRNN(BaseModel):
     obs_fusion: ObservationFusionModule
     spat_temp_lstm: SpatioTemporalLSTMCell
     dropout: eqx.nn.Dropout
-
-    
 
     def __init__(
         self,
@@ -639,7 +641,7 @@ class SparseFusionGRNN(BaseModel):
 
         super().__init__(hidden_size, target, head, key=keys.pop(0))
 
-        self.backbone_leaves = ['dense_embedders','fusion_norm','spat_temp_lstm','head']
+        self.backbone_leaves = ["dense_embedders", "fusion_norm", "spat_temp_lstm", "head"]
         self.hidden_size = hidden_size
         self.seq_length = seq_length
         self.dense_sources = list(dense_sizes.keys())
@@ -731,29 +733,40 @@ class SparseFusionGRNN(BaseModel):
         dense_emb_norm = jax.vmap(jax.vmap(self.fusion_norm))(dense_emb)
         dense_emb_norm = self.dropout(dense_emb_norm, key=drop_key1)
 
-        # 2. Sparse observation embedding
-        obs_emb = {}
+        # 2. Sparse observation embedding (Time-distributed)
+        obs_embs_time = {}
         for name in self.source_registry.sources:
             features = data.dynamic[name]
-            emb, mask = self.source_registry.embed(name, features, data.static)
-            obs_emb[name] = (emb, mask)
+            # Vmap over the time dimension (axis 0)
+            emb, mask = jax.vmap(self.source_registry.embed, in_axes=(None, 0, None))(
+                name, features, data.static
+            )
+            obs_embs_time[name] = (emb, mask)
 
-        # 3. Observation memory
-        if len(self.source_registry.sources) > 0:
-            obs_memories = self._create_observational_memory(obs_emb, num_locations)
-        else:
-            obs_memories = None
+        # 3. Initialize recurrent state and global memory carry
+        init_global_memory = (
+            jnp.zeros((num_locations, self.hidden_size)),  # pooled_emb
+            jnp.full((num_locations,), 1e6),  # staleness
+            jnp.zeros((num_locations,), dtype=jnp.bool_),  # seen_mask
+        )
+
+        initial_h = jnp.zeros((num_locations, self.hidden_size))
+        initial_c = jnp.zeros((num_locations, self.hidden_size))
+        initial_state = (initial_h, initial_c, init_global_memory)
 
         # 4. Recurrent loop
         @jax.checkpoint
         def process_one_timestep(
             state_prev, scan_slice, static_data, graph_edges, node_mask, edge_mask
         ):
-            dense_input, step_obs_memory, step_key = scan_slice
+            h_prev, c_prev, memory_prev = state_prev
+            prev_emb, prev_stale, prev_seen = memory_prev
+            dense_input, step_obs, step_key = scan_slice
 
+            # LSTM step
             (h_new, c_new), spatial_trace = self.spat_temp_lstm(
                 dense_input,
-                state_prev,
+                (h_prev, c_prev),
                 static_data,
                 graph_edges,
                 node_mask,
@@ -761,18 +774,41 @@ class SparseFusionGRNN(BaseModel):
                 key=step_key,
             )
 
-            if step_obs_memory is not None:
-                h_new, fusion_trace = self._fuse_observations(h_new, step_obs_memory)
+            # Observation pooling and assim
+            if not step_obs:
+                memory_new = memory_prev
+                fusion_trace = {"gate": None, "valid_obs": None, "weights": None}
             else:
-                fusion_trace = {}
+                valid_embs = []
+                masks = []
+                for name, (emb_t, mask_t) in step_obs.items():
+                    valid_embs.append(jnp.where(mask_t[:, jnp.newaxis], emb_t, 0.0))
+                    masks.append(mask_t)
 
-            new_state = (h_new, c_new)
+                stacked_embs = jnp.stack(valid_embs)  # (S, N, H)
+                stacked_masks = jnp.stack(masks)  # (S, N)
+
+                # Sum across sources
+                sum_emb = jnp.sum(stacked_embs, axis=0)  # (N, H)
+
+                # Dynamic denominator for mean pooling
+                valid_count = jnp.sum(stacked_masks, axis=0)[:, jnp.newaxis]  # (N, 1)
+
+                # Mean pool, protecting against division by zero
+                pooled_step_emb = sum_emb / jnp.maximum(valid_count, 1.0)
+                any_valid_mask = jnp.any(stacked_masks, axis=0)
+
+                # 2. Update the SINGLE global memory state
+                new_emb = jnp.where(any_valid_mask[:, jnp.newaxis], pooled_step_emb, prev_emb)
+                new_stale = jnp.where(any_valid_mask, 0.0, prev_stale + 1.0)
+                new_seen = prev_seen | any_valid_mask
+
+                memory_new = (new_emb, new_stale, new_seen)
+                h_new, fusion_trace = self._fuse_global_memory(h_new, memory_new)
+
+            new_state = (h_new, c_new, memory_new)
             accumulated_outputs = (h_new, spatial_trace, fusion_trace)
             return new_state, accumulated_outputs
-
-        initial_h = jnp.zeros((num_locations, self.hidden_size))
-        initial_c = jnp.zeros((num_locations, self.hidden_size))
-        initial_state = (initial_h, initial_c)
 
         partial_timestep = partial(
             process_one_timestep,
@@ -783,13 +819,13 @@ class SparseFusionGRNN(BaseModel):
         )
 
         scan_keys = jrandom.split(scan_key, self.seq_length)
-        scan_inputs = (dense_emb_norm, obs_memories, scan_keys)
+        scan_inputs = (dense_emb_norm, obs_embs_time, scan_keys)
         final_state, accumulated = jax.lax.scan(partial_timestep, initial_state, scan_inputs)
 
-        final_h, final_c = final_state
+        final_h, final_c, final_memory = final_state
         all_h, spatial_trace, fusion_trace = accumulated
 
-        # 5. Predictions
+        # 5. Predictions (identical to original)
         if self.seq2seq:
             all_h = self.dropout(all_h, key=drop_key2)
             predictions = {
@@ -800,65 +836,46 @@ class SparseFusionGRNN(BaseModel):
             predictions = {target: jax.vmap(head)(final_h) for target, head in self.head.items()}
 
         if self.supervised_attn:
-            predictions["attention_weights"] = fusion_trace["weights"]
-            predictions["valid_obs"] = fusion_trace["valid_obs"]
+            predictions["attention_weights"] = fusion_trace.get("weights", None)
+            predictions["valid_obs"] = fusion_trace.get("valid_obs", None)
 
         if self.return_weights:
-            weights = {"spatial": spatial_trace, "fusion": fusion_trace}
-            return predictions, weights
-        else:
-            return predictions
+            return predictions, {"spatial": spatial_trace, "fusion": fusion_trace}
+        return predictions
 
-    def _create_observational_memory(
-        self,
-        obs_emb: dict[str, tuple[Array, Array]],
-        num_locations: int,
-    ):
-        def memory_step(prev_memory, current_obs):
-            new_memory = {}
-            for name, (emb_t, mask_t) in current_obs.items():
-                prev_emb, prev_stale, prev_seen = prev_memory[name]
-
-                new_emb = jnp.where(mask_t[:, jnp.newaxis], emb_t, prev_emb)
-                new_stale = jnp.where(mask_t, 0.0, prev_stale + 1.0)
-                new_seen = prev_seen | mask_t
-
-                new_memory[name] = (new_emb, new_stale, new_seen)
-
-            return new_memory, new_memory
-
-        init_memory = {
-            name: (
-                jnp.zeros((num_locations, self.hidden_size)),
-                jnp.full((num_locations,), 1e6),
-                jnp.zeros((num_locations,), dtype=jnp.bool_),
-            )
-            for name in obs_emb.keys()
-        }
-
-        _, memories = jax.lax.scan(memory_step, init_memory, obs_emb)
-        return memories
-
-    def _fuse_observations(
+    def _fuse_global_memory(
         self,
         h: Array,
-        obs_memory: dict[str, tuple[Array, Array, Array]],
+        global_memory: tuple[Array, Array, Array],
     ) -> tuple[Array, dict]:
-        obs_embeddings = []
-        obs_staleness = []
-        obs_valid = []
+        emb, staleness, has_been_seen = global_memory
 
-        for name, (last_emb, staleness, has_been_seen) in obs_memory.items():
-            obs_embeddings.append(last_emb)
-            obs_staleness.append(staleness)
+        if self.use_obs_memory:
+            valid = has_been_seen & (staleness < self.staleness_threshold)
+        else:
+            valid = staleness == 0
 
-            if self.use_obs_memory:
-                valid = has_been_seen & (staleness < self.staleness_threshold)
-            else:
-                valid = staleness == 0
+        # Modulate the pooled embedding with temporal decay
+        log_staleness = jnp.log1p(staleness[:, jnp.newaxis])
 
-            obs_valid.append(valid)
+        # The original staleness_embedding expects a feature dim of 1
+        staleness_emb = jax.vmap(self.obs_fusion.staleness_embedding)(log_staleness)
+        modulated_obs = emb + staleness_emb
 
-        h_new, fusion_info = self.obs_fusion(h, obs_embeddings, obs_staleness, obs_valid)
+        # Compute fusion gate directly against the hidden state
+        gate_input = jnp.concatenate([h, modulated_obs], axis=-1)
+        gate = jax.nn.sigmoid(jax.vmap(self.obs_fusion.output_gate)(gate_input))
+
+        # Suppress update if the global memory is stale or empty
+        effective_gate = jnp.where(valid[:, jnp.newaxis], gate, 0.0)
+
+        # Residual update
+        update = jax.vmap(self.obs_fusion.norm)(modulated_obs)
+        h_new = h + (effective_gate * update)
+
+        fusion_info = {
+            "gate": effective_gate,
+            "valid_obs": valid[:, jnp.newaxis],
+        }
 
         return h_new, fusion_info

@@ -52,7 +52,7 @@ def _gmm_values(y_hat: dict[str, Array], node_mask: Array, scale: float, offset:
     # 2. Log-Normal Moments in log-space
     # E[X] = exp(mu + sigma^2 / 2) -> log(E[X]) = mu + sigma^2 / 2
     log_comp_means = mu_nat + 0.5 * np.square(sigma_nat)
-    
+
     # Log-Mixture Mean (Law of Total Expectation)
     log_mixture_mean_plus_1 = logsumexp(log_pi + log_comp_means, axis=-1)
     mixture_mean = np.exp(log_mixture_mean_plus_1) - 1.0
@@ -61,17 +61,17 @@ def _gmm_values(y_hat: dict[str, Array], node_mask: Array, scale: float, offset:
     # log(Var_comp) = log(exp(sig^2)-1) + 2*mu + sig^2
     # We use log1p(x) for log(exp(x)-1) stability
     log_comp_vars = np.log(np.expm1(np.square(sigma_nat))) + 2.0 * mu_nat + np.square(sigma_nat)
-    
+
     # Term 1: E[Var(Y|C)]
     log_mean_of_vars = logsumexp(log_pi + log_comp_vars, axis=-1)
-    
+
     # Term 2: Var(E[Y|C]) = E[E[Y|C]^2] - E[E[Y|C]]^2
     log_mean_of_mu_sq = logsumexp(log_pi + 2.0 * log_comp_means, axis=-1)
-    
+
     # Combine terms using the log-difference: log(A + (B - C))
     term1 = np.exp(log_mean_of_vars)
     term2 = np.exp(log_mean_of_mu_sq) - np.exp(2.0 * log_mixture_mean_plus_1)
-    
+
     mixture_std = np.sqrt(np.maximum(term1 + term2, 1e-6))
 
     return mixture_mean, mixture_std

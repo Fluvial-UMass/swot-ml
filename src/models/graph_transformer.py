@@ -65,21 +65,21 @@ class ST_GATransformer(BaseModel):
 
         # Embedding network for static features
         self.static_embedder = eqx.nn.MLP(
-            in_size = static_size,
-            out_size = hidden_size, 
-            width_size = 2 * hidden_size,
-            depth = 2,
-            key = keys.pop(0)
+            in_size=static_size,
+            out_size=hidden_size,
+            width_size=2 * hidden_size,
+            depth=2,
+            key=keys.pop(0),
         )
 
         # Embedding network for concatenated dense dynamic features
         total_dense_size = sum(list(dense_sizes.values()))
         self.dense_embedder = eqx.nn.MLP(
-            in_size = total_dense_size,
-            out_size = hidden_size, 
-            width_size = 2 * hidden_size,
-            depth = 2,
-            key = keys.pop(0)
+            in_size=total_dense_size,
+            out_size=hidden_size,
+            width_size=2 * hidden_size,
+            depth=2,
+            key=keys.pop(0),
         )
 
         # Embedding and assimilation networks for the sparse sources
@@ -101,7 +101,7 @@ class ST_GATransformer(BaseModel):
         )
 
     def get_backbone(self) -> list[str]:
-        return ['static_embedder','dense_embedder','spat_temp_lstm','head']
+        return ["static_embedder", "dense_embedder", "spat_temp_lstm", "head"]
 
     def add_assimilator(
         self, name: str, n_features: int, size_args: dict = {}, *, key: PRNGKeyArray = None
@@ -136,7 +136,6 @@ class ST_GATransformer(BaseModel):
             key=k2,
         )
 
-
     def __call__(self, data: GraphBatch, key: PRNGKeyArray) -> Array:
         num_locations = data.static.shape[0]  # including padding
         node_mask = data.node_mask
@@ -148,7 +147,7 @@ class ST_GATransformer(BaseModel):
 
         dense_feat = jnp.concat([data.dynamic[name] for name in self.dense_sources], axis=-1)
         dense_emb = jax.vmap(jax.vmap(self.dense_embedder))(dense_feat)
-        
+
         # Embed all sparse sources across the full time dimension up front.
         # The memory tracking (staleness, has_been_seen) is handled inside
         # the timestep scan via obs_emb_seq, so the carry is correct.
@@ -161,7 +160,6 @@ class ST_GATransformer(BaseModel):
             emb_vectors = embedding_mlp(safe_features, static_emb)
             # Shape: (T, num_locations, hidden_size), (T, num_locations, 1)
             obs_emb[name] = (emb_vectors, obs_mask)
-
 
         # --- 2. Recurrent Processing Loop ---
         @jax.checkpoint
@@ -203,8 +201,8 @@ class ST_GATransformer(BaseModel):
         # obs_memory is now part of the scan carry, not pre-computed
         initial_obs_memory = {
             name: (
-                jnp.zeros((num_locations, self.hidden_size)),   # last_obs
-                jnp.ones((num_locations,)),                     # staleness
+                jnp.zeros((num_locations, self.hidden_size)),  # last_obs
+                jnp.ones((num_locations,)),  # staleness
                 jnp.zeros((num_locations,), dtype=jnp.bool_),  # has_been_seen
             )
             for name in self.sparse_sources
@@ -220,7 +218,7 @@ class ST_GATransformer(BaseModel):
         )
 
         scan_keys = jrandom.split(key, self.seq_length)
-        # obs_emb_seq has shape (time, nodes, features) 
+        # obs_emb_seq has shape (time, nodes, features)
         scan_inputs = (dense_emb, obs_emb if self.sparse_sources else None, scan_keys)
         final_carry, accumulated = jax.lax.scan(partial_timestep, initial_carry, scan_inputs)
 
@@ -252,19 +250,17 @@ class ST_GATransformer(BaseModel):
         tracing_weights = {}
 
         for name in self.sparse_sources:
-            update_emb_t, mask_t = step_obs_emb[name]   # (num_loc, hidden), (num_loc, 1)
+            update_emb_t, mask_t = step_obs_emb[name]  # (num_loc, hidden), (num_loc, 1)
             prev_obs, prev_stale, prev_seen = obs_memory[name]
 
             # Update memory state
             updated_obs = jnp.where(mask_t, update_emb_t, prev_obs)
-            updated_staleness = jnp.where(
-                mask_t.squeeze(axis=-1), 0.0, prev_stale + 1.0
-            )
+            updated_staleness = jnp.where(mask_t.squeeze(axis=-1), 0.0, prev_stale + 1.0)
             has_been_seen = prev_seen | mask_t.squeeze(axis=-1)
             new_memory[name] = (updated_obs, updated_staleness, has_been_seen)
 
             # Assimilation
-            nu = updated_obs - h 
+            nu = updated_obs - h
 
             if self.use_obs_memory:
                 gain_input = jnp.concatenate(

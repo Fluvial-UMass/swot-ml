@@ -195,7 +195,6 @@ class Trainer:
         self._cleanup_logger()
         self.log_dir = self._setup_logging(new_log_dir)
 
-
     def replace_model(self, model: models.BaseModel):
         self.model = model
         # Now recreate the optimizer and opt states
@@ -351,6 +350,7 @@ class Trainer:
             self.validation_dl, disable=self.cfg.quiet, desc=f"Validating Step:{self.step:06d}"
         )
         for _, _, _, batch in pbar:
+            
             loss = compute_loss(
                 self.model,
                 None,
@@ -360,6 +360,9 @@ class Trainer:
                 **self.cfg.step_kwargs.model_dump(),
             )
             losses.append(loss)
+
+            if len(losses) >= self.cfg.max_validation_steps: 
+                break
 
         v_loss = np.mean(losses)
         self.logger.info(f"Step: {self.step:06d}, Validation Loss: {v_loss:.4f}")

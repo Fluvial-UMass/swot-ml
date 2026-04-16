@@ -56,20 +56,28 @@ def train_from_config(cfg: Config, log_dir: Path | None = None):
     """
     manager = DynamicCacheManager(cfg)
     cache_dir = manager.create_cache("train")
-    dataset = CachedBasinGraphDataset(cfg, cache_dir, "train")
-    dataloader = CachedBasinGraphDataLoader(cfg, dataset)
+    train_dataset = CachedBasinGraphDataset(cfg, cache_dir, "train")
+    train_dataloader = CachedBasinGraphDataLoader(cfg, train_dataset)
+
+    if cfg.validate_every_n_steps is not None:
+        val_dataset = CachedBasinGraphDataset(cfg, cache_dir, "validate")
+        val_dataloader = CachedBasinGraphDataLoader(cfg, val_dataset)
+    else:
+        val_dataloader = None
 
     trainer = None
     if log_dir and log_dir.is_dir():
         trainer = Trainer.load_last_checkpoint(log_dir)
         # Could fail to load if nothing was saved.
         if trainer is not None:
-            trainer.training_dl = dataloader
+            trainer.training_dl = train_dataloader
+            trainer.validation_dl = val_dataloader
     if trainer is None:
-        trainer = Trainer(cfg, dataloader, log_dir=log_dir)
+        trainer = Trainer(cfg, train_dataloader, val_dataloader, log_dir=log_dir)
 
     trainer.start_training()
-    cleanup_dl(dataloader)
+    cleanup_dl(train_dataloader)
+    cleanup_dl(val_dataloader)
 
     return cfg, trainer
 
@@ -141,9 +149,9 @@ def train_new_assimilator(run_or_state_dir: Path, assim_path: Path):
     trainer.replace_model(new_model)
 
     if assim_cfg.freeze_base:
-        if getattr(new_model, 'backbone_leaves', None):
+        if getattr(new_model, "backbone_leaves", None):
             trainer.freeze_components(new_model.backbone_leaves)
-        elif 'get_backbone' in dir(new_model):
+        elif "get_backbone" in dir(new_model):
             trainer.freeze_components(new_model.get_backbone())
     else:
         print("Assim was config'd to freeze base model but base not defined.")

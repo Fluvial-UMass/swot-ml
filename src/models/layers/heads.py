@@ -69,8 +69,8 @@ class GMM(eqx.Module):
         mu, s_latent, p_latent = jnp.split(h, 3, axis=-1)
 
         # clipping to prevent e^(sigma^2) explosion
-        s_latent = jnp.clip(s_latent, -10.0, 4.0) 
-        
+        s_latent = jnp.clip(s_latent, -10.0, 4.0)
+
         # Use softplus for a smooth, positive variance
         sigma = jax.nn.softplus(s_latent) + self._eps
         log_pi = jax.nn.log_softmax(p_latent, axis=-1)

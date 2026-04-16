@@ -169,6 +169,7 @@ class Config(BaseModel):
     log_every_n_steps: int = Field(..., gt=0)
     log_every_n_minutes: int | None = Field(None, gt=0)
     validate_every_n_steps: int | None = Field(None, gt=0)
+    max_validation_steps: int | None = Field(None, gt=0)
 
     warmup_steps: int = Field(0, ge=0)
     initial_lr: float = Field(..., gt=0, lt=1.0)

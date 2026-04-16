@@ -1,0 +1,196 @@
+{
+    "data_root": "/nas/cee-water/cjgleason/ted/swot-ml/data/owen_reservoirs/Columbia",
+    "zarr_dir": "/nas/cee-water/cjgleason/ted/swot-ml/data/owen_reservoirs/Columbia/zarr_store",
+    "attributes_file": "/nas/cee-water/cjgleason/ted/swot-ml/data/owen_reservoirs/Columbia/attributes/static_4km2.parquet",
+    "train_basin_file": "/nas/cee-water/cjgleason/ted/swot-ml/data/owen_reservoirs/Columbia/basin_lists/Columbia/4km2/train.csv",
+    "test_basin_file": "/nas/cee-water/cjgleason/ted/swot-ml/data/owen_reservoirs/Columbia/basin_lists/Columbia/4km2/test.csv",
+    "graph_network_file": "/nas/cee-water/cjgleason/ted/swot-ml/data/owen_reservoirs/Columbia/metadata/graphs_4km2.json",
+    "features": {
+        "dynamic": {
+            "era5": [
+                "ssrd_mean",
+                "strd_mean",
+                "ro_mean",
+                "sro_mean",
+                "e_mean",
+                "tp_mean",
+                "sp_mean",
+                "d2m_mean",
+                "t2m_mean",
+                "fal_mean"
+            ]
+        },
+        "static": [
+            "dis_m3_pyr",
+            "dis_m3_pmn",
+            "dis_m3_pmx",
+            "run_mm_syr",
+            "inu_pc_smn",
+            "inu_pc_smx",
+            "inu_pc_slt",
+            "lka_pc_sse",
+            "dor_pc_pva",
+            "ria_ha_ssu",
+            "riv_tc_ssu",
+            "gwt_cm_sav",
+            "ele_mt_sav",
+            "ele_mt_smn",
+            "ele_mt_smx",
+            "slp_dg_sav",
+            "sgr_dk_sav",
+            "clz_cl_smj",
+            "cls_cl_smj",
+            "tmp_dc_syr",
+            "tmp_dc_smn",
+            "tmp_dc_smx",
+            "pre_mm_syr",
+            "pet_mm_syr",
+            "aet_mm_syr",
+            "ari_ix_sav",
+            "snw_pc_syr",
+            "snw_pc_smx",
+            "glc_cl_smj",
+            "pnv_cl_smj",
+            "wet_cl_smj",
+            "wet_pc_sg1",
+            "wet_pc_sg2",
+            "for_pc_sse",
+            "crp_pc_sse",
+            "pst_pc_sse",
+            "ire_pc_sse",
+            "gla_pc_sse",
+            "prm_pc_sse",
+            "pac_pc_sse",
+            "tbi_cl_smj",
+            "tec_cl_smj",
+            "fmh_cl_smj",
+            "fec_cl_smj",
+            "cly_pc_sav",
+            "slt_pc_sav",
+            "snd_pc_sav",
+            "soc_th_sav",
+            "swc_pc_syr",
+            "lit_cl_smj",
+            "kar_pc_sse",
+            "ero_kh_sav",
+            "pop_ct_ssu",
+            "ppd_pk_sav",
+            "urb_pc_sse",
+            "nli_ix_sav",
+            "rdd_mk_sav",
+            "hft_ix_s93",
+            "hft_ix_s09",
+            "gad_id_smj",
+            "gdp_ud_sav",
+            "gdp_ud_ssu",
+            "hdi_ix_sav"
+        ],
+        "target": [
+            "discharge",
+            "dv_SWOTAE"
+        ]
+    },
+    "time_gaps": {
+        "era5": false
+    },
+    "precomp_scaling": true,
+    "dynamic_encoding": {
+        "categorical": {},
+        "bitmask": {}
+    },
+    "static_encoding": {
+        "categorical": {
+            "clz_cl_smj": [],
+            "cls_cl_smj": [],
+            "glc_cl_smj": [],
+            "pnv_cl_smj": [],
+            "wet_cl_smj": [],
+            "tbi_cl_smj": [],
+            "tec_cl_smj": [],
+            "fmh_cl_smj": [],
+            "fec_cl_smj": [],
+            "lit_cl_smj": []
+        },
+        "bitmask": {}
+    },
+    "log_norm_cols": [
+        "discharge",
+        "dv_SWOTAE"
+    ],
+    "no_norm_cols": [],
+    "range_norm_cols": [],
+    "in_memory": false,
+    "train_date_range": [
+        "2023-01-01T00:00:00",
+        "2025-12-31T00:00:00"
+    ],
+    "validate_date_range": [
+        "2023-01-01T00:00:00",
+        "2025-12-31T00:00:00"
+    ],
+    "test_date_range": [
+        "2023-01-01T00:00:00",
+        "2025-12-31T00:00:00"
+    ],
+    "clip_feature_range": {
+        "discharge": [
+            1.0,
+            null
+        ]
+    },
+    "value_filters": [],
+    "exclude_target_from_index": [],
+    "data_subset": "train",
+    "target_nodes_per_batch": 17261,
+    "candidate_pool_size": 10,
+    "shuffle": true,
+    "num_workers": 0,
+    "pin_memory": false,
+    "drop_last": true,
+    "dataset_type": "graph",
+    "sequence_length": 90,
+    "model_args": {
+        "hidden_size": 64,
+        "dropout": 0.3,
+        "head": "gmm",
+        "seq2seq": false,
+        "seed": 0,
+        "name": "sf_grnn",
+        "k_hops": 3,
+        "num_heads": 2,
+        "return_weights": false,
+        "supervised_attn": false,
+        "target": [
+            "discharge",
+            "dv_SWOTAE"
+        ],
+        "seq_length": 90,
+        "dense_sizes": {
+            "era5": 10
+        },
+        "sparse_sizes": {},
+        "static_size": 132,
+        "assim_sizes": {},
+        "use_obs_memory": true
+    },
+    "max_training_steps": 50000,
+    "max_training_hours": 336,
+    "log_every_n_steps": 200,
+    "validate_every_n_steps": 200,
+    "max_validation_steps": 100,
+    "warmup_steps": 0,
+    "initial_lr": 0.00005,
+    "final_lr": 0.00005,
+    "step_kwargs": {
+        "loss_name": "gmm_nll",
+        "target_weights": {
+            "discharge": 1.0,
+            "dv_SWOTAE": 1.0
+        }
+    },
+    "optimizer_name": "adam",
+    "weight_decay": 0.01,
+    "parameter_search_grid": {},
+    "quiet": false,
+    "log": true
+}

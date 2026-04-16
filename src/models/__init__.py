@@ -38,7 +38,6 @@ MODEL_MAP = {
     "rgcn": RGCN,
 }
 
-
 def make(cfg: Config, dl: CachedBasinGraphDataLoader = None):
     """Creates a model based on the provided configuration.
 

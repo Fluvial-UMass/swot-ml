@@ -44,7 +44,7 @@ class GraphPackingSampler(Sampler[list[int]]):
 
         self.samples = []
         for basin, indices in self.basin_index_map.items():
-            node_count = self.basin_node_counts.get(basin)
+            node_count = self.basin_node_counts.get(basin, 0)
             for index in indices:
                 self.samples.append({"index": index, "nodes": node_count})
 

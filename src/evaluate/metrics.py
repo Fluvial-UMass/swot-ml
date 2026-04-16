@@ -79,7 +79,7 @@ def get_all_metrics(df: pd.DataFrame, disp: bool = False):
     metric_fn_map = {
         "R2": r2_score,
         "r": calc_r,
-        'NSE': calc_nse,
+        "NSE": calc_nse,
         "sigE": calc_sigE,
         "rRMSE": calc_rrmse,
         "MAPE": mean_absolute_percentage_error,
@@ -113,17 +113,17 @@ def get_all_metrics(df: pd.DataFrame, disp: bool = False):
             metrics[feature].update({"KGE": kge, "corr": corr, "alpha": alpha, "beta": beta})
 
             if has_std:
-                metrics[feature].update({'nse_prob': calc_nse_prob(y, y_hat, y_std)})
-                metrics[feature].update({'MSESS': calc_msess(y, y_hat, y_std)})
+                metrics[feature].update({"nse_prob": calc_nse_prob(y, y_hat, y_std)})
+                metrics[feature].update({"MSESS": calc_msess(y, y_hat, y_std)})
             else:
-                metrics[feature].update({'nse_prob':np.nan, 'MSESS':np.nan})
+                metrics[feature].update({"nse_prob": np.nan, "MSESS": np.nan})
 
         else:
             metrics[feature].update({name: np.nan for name in metric_fn_map.keys()})
             metrics[feature].update(
                 {"KGE": np.nan, "corr": np.nan, "alpha": np.nan, "beta": np.nan}
             )
-            metrics[feature].update({'nse_prob':np.nan, 'MSESS':np.nan})
+            metrics[feature].update({"nse_prob": np.nan, "MSESS": np.nan})
 
     if disp:
         metrics_str = "Bulk Metrics\n"
@@ -175,16 +175,17 @@ def calc_kge_comp(y, y_hat):
 
     return kge, corr, alpha, beta
 
+
 def calc_msess(y, y_hat, y_std):
     expected_sq_error = np.square(y - y_hat) + np.square(y_std)
     obs_variance = np.square(y - np.mean(y))
-    
+
     sum_expected_sq_error = np.sum(expected_sq_error)
     baseline_expected_sq_error = 2 * np.sum(obs_variance)
-    
+
     if baseline_expected_sq_error == 0:
         return np.nan
-        
+
     return 1 - (sum_expected_sq_error / baseline_expected_sq_error)
 
 

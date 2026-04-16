@@ -193,7 +193,7 @@ def gmm_nll(y: Array, y_hat: dict[str, Array], mask: Array, denorm_fn: Callable)
     sq_diff = jnp.square(jnp.clip(scaled_diff, -20.0, 20.0))
 
     log_phi = -log_sigma - 0.5 * log_2pi - 0.5 * sq_diff
-    
+
     # Numerical stability: logsumexp avoids pi * exp(log_phi) overflow
     log_likelihood = jax.scipy.special.logsumexp(log_pi + log_phi, axis=-1)
 
